@@ -279,6 +279,7 @@ export class StreamZDatabase {
   private db: SqliteDatabaseSync;
   private tursoUrl: string | null;
   private tursoAuthToken: string | null;
+  private hydrationPromise: Promise<void> | null = null;
   /**
    * In-memory session cache (tokenHashHex -> { userId, expiresAt })
    * Eliminates repetitive `SELECT user_id, expires_at FROM sessions` DB reads on every API call.
@@ -320,88 +321,24 @@ export class StreamZDatabase {
     this.initPragmasAndSchema();
 
     if (targetPath !== ':memory:') {
-      this.seedDefaultAccountsIfEmpty();
-      this.hydrateFromTursoCloud();
-    }
-  }
-
-  private seedDefaultAccountsIfEmpty(): void {
-    try {
-      const countRow = this.db
-        .prepare('SELECT COUNT(*) AS c FROM users')
-        .get() as { c: number } | undefined;
-      if ((countRow?.c ?? 0) > 0) return;
-
-      const initialUsers = [
-        {
-          id: 4,
-          email: 'admin@streamz.com',
-          display_name: 'StreamZ Admin',
-          avatar_color: '#E11D48',
-          role: 'admin',
-          password_hash:
-            'scrypt$2370d7f5549359852a59e86eb2057a9d$99ed9df2b25ad4781af03fd752b8e7346d99f7761488f9f579c9921cb38669a9',
-          streaming_cfg: '',
-          created_at: '2026-10-23 12:34:39',
-        },
-        {
-          id: 5,
-          email: 'tanishq25@gmail.com',
-          display_name: 'Tanishq Dahiya',
-          avatar_color: '#2563EB',
-          role: 'user',
-          password_hash:
-            'scrypt$0af89ce34ad65efbc86aebc286e201c8$1b26ad7def6b6c61e7d4ade8f1342d0147f26539028612243ec0d0052bcebbc8',
-          streaming_cfg: '',
-          created_at: '2026-10-23 12:41:07',
-        },
-        {
-          id: 6,
-          email: 'alok.mishraa.dev@gmail.com',
-          display_name: 'Alok Mishra',
-          avatar_color: '#2563EB',
-          role: 'user',
-          password_hash:
-            'scrypt$ff1862203d72de76f8f5ca07bc983c29$874091675ae963e757755067b02b09c13f6d314f5e069c87b726c1458676c34b',
-          streaming_cfg: '',
-          created_at: '2026-10-23 17:12:15',
-        },
-      ];
-
-      const insertStmt = this.db.prepare(`
-        INSERT OR IGNORE INTO users (
-          id, email, display_name, avatar_color, role, password_hash, pwd_salt, pwd_hash, streaming_cfg, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-
-      for (const u of initialUsers) {
-        const [, saltHex, hashHex] = u.password_hash.split('$');
-        const saltBuf = Buffer.from(saltHex, 'hex');
-        const hashBuf = Buffer.from(hashHex, 'hex');
-        insertStmt.run(
-          u.id,
-          u.email,
-          u.display_name,
-          u.avatar_color,
-          u.role,
-          u.password_hash,
-          saltBuf,
-          hashBuf,
-          u.streaming_cfg,
-          u.created_at,
-        );
-      }
-    } catch {
-      // Ignore seed error
+      void this.ensureHydratedFromTursoCloud();
     }
   }
 
   /**
-   * Pulls existing users, providers, watch history, and watchlist from Turso Cloud on startup
-   * so ephemeral cloud containers (like Render Free) automatically restore all user state.
+   * Dynamically pulls existing users, sessions, providers, watch history, and watchlist
+   * from Turso Cloud (`TURSO_DATABASE_URL` + `TURSO_AUTH_TOKEN`) on startup
+   * so ephemeral cloud containers (like Render Free) automatically restore all user state
+   * with zero hardcoded credentials in source code.
    */
-  private hydrateFromTursoCloud(): void {
-    if (!this.tursoUrl || !this.tursoAuthToken) return;
+  public ensureHydratedFromTursoCloud(): Promise<void> {
+    if (!this.tursoUrl || !this.tursoAuthToken) {
+      return Promise.resolve();
+    }
+    if (this.hydrationPromise) {
+      return this.hydrationPromise;
+    }
+
     const httpEndpoint = this.tursoUrl
       .replace(/^libsql:\/\//i, 'https://')
       .replace(/\/+$/, '');
@@ -421,7 +358,7 @@ export class StreamZDatabase {
     }));
     requests.push({ type: 'close' });
 
-    fetch(`${httpEndpoint}/v2/pipeline`, {
+    this.hydrationPromise = fetch(`${httpEndpoint}/v2/pipeline`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${this.tursoAuthToken}`,
@@ -568,6 +505,8 @@ export class StreamZDatabase {
       .catch(() => {
         // Ignore cloud hydration network errors
       });
+
+    return this.hydrationPromise;
   }
 
   /**

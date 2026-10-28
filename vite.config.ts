@@ -719,6 +719,7 @@ export function registerStreamzApiMiddlewares(
         return;
       }
 
+      await activeDb().ensureHydratedFromTursoCloud();
       const result = activeDb().loginUser({
         email: cleanEmail,
         password: body.password || '',
