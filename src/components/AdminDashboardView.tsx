@@ -20,6 +20,7 @@ import {
   Users,
   X,
 } from 'lucide-react';
+import { buildApiUrl } from '../addons/stremioProtocol';
 import type {
   AdminUserSummary,
   DbProviderRecord,
@@ -154,7 +155,7 @@ export const ChangePasswordModal: React.FC<ChangePasswordModalProps> = ({
 
     setSubmitting(true);
     try {
-      const resp = await fetch('/api/auth/change-password', {
+      const resp = await fetch(buildApiUrl('/api/auth/change-password'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -388,7 +389,7 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
   const loadAdminData = useCallback(async () => {
     setLoading(true);
     try {
-      const resp = await fetch('/api/admin/users', {
+      const resp = await fetch(buildApiUrl('/api/admin/users'), {
         headers: { Authorization: `Bearer ${authToken}` },
       });
       const data = (await resp.json()) as {
@@ -458,7 +459,7 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
 
     setCreatingUser(true);
     try {
-      const resp = await fetch('/api/admin/users', {
+      const resp = await fetch(buildApiUrl('/api/admin/users'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -530,7 +531,7 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
 
     setRowSaving(true);
     try {
-      const resp = await fetch('/api/admin/users', {
+      const resp = await fetch(buildApiUrl('/api/admin/users'), {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
@@ -592,7 +593,7 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
 
     setRowSaving(true);
     try {
-      const resp = await fetch('/api/admin/users', {
+      const resp = await fetch(buildApiUrl('/api/admin/users'), {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
@@ -634,7 +635,7 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
   ) => {
     setRowSaving(true);
     try {
-      const resp = await fetch('/api/admin/user-providers', {
+      const resp = await fetch(buildApiUrl('/api/admin/user-providers'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -674,7 +675,7 @@ export const AdminDashboardView: React.FC<AdminDashboardViewProps> = ({
     setGlobalBanner(null);
     setRowSaving(true);
     try {
-      const resp = await fetch(`/api/admin/users?id=${targetUser.id}`, {
+      const resp = await fetch(buildApiUrl(`/api/admin/users?id=${targetUser.id}`), {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${authToken}` },
       });

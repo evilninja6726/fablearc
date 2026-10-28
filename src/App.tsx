@@ -33,6 +33,7 @@ import {
 } from 'lucide-react';
 import {
   addonSupportsResource,
+  buildApiUrl,
   buildStreamingCatalogsManifestUrl,
   CommunityAddonDirectoryEntry,
   DEFAULT_BOOTSTRAP_MANIFEST_URLS,
@@ -570,7 +571,7 @@ export const App: React.FC = () => {
   const persistWatchlistToDb = useCallback(
     (nextWatchlist: StremioMediaItem[]) => {
       if (!authToken || !currentUser) return;
-      fetch('/api/user/watchlist', {
+      fetch(buildApiUrl('/api/user/watchlist'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -602,7 +603,7 @@ export const App: React.FC = () => {
         nextCfg.netflixTop10Country ? '1' : '0',
         nextCfg.netflixTop10CountryCode,
       ].join(':');
-      fetch('/api/user/providers', {
+      fetch(buildApiUrl('/api/user/providers'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -621,7 +622,7 @@ export const App: React.FC = () => {
     (entry: WatchProgressEntry | null) => {
       if (!authToken || !currentUser || !entry || entry.positionSec <= 1) return;
       lastDbProgressSyncMsRef.current = Date.now();
-      fetch('/api/user/watch-history', {
+      fetch(buildApiUrl('/api/user/watch-history'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -739,7 +740,7 @@ export const App: React.FC = () => {
   useEffect(() => {
     if (!authToken) return;
     let cancelled = false;
-    fetch('/api/user/state', {
+    fetch(buildApiUrl('/api/user/state'), {
       headers: { Authorization: `Bearer ${authToken}` },
     })
       .then(async (resp) => {
@@ -769,7 +770,7 @@ export const App: React.FC = () => {
 
   const handleLogout = useCallback(() => {
     if (authToken) {
-      fetch('/api/auth/logout', {
+      fetch(buildApiUrl('/api/auth/logout'), {
         method: 'POST',
         headers: { Authorization: `Bearer ${authToken}` },
       }).catch(() => {});
@@ -805,10 +806,25 @@ export const App: React.FC = () => {
     [currentUser],
   );
 
-  // Automatically bootstrap default addons ONLY when the user's addon list is empty.
-  // Never overwrites or reverts existing addons that the user has edited or customized!
+  // Automatically bootstrap default addons (or heal any missing default addons from an interrupted startup)
+  // while preserving all existing user-configured addons and their enabled state.
   useEffect(() => {
-    if (addons.length > 0) return;
+    const missingDefaultUrls = DEFAULT_BOOTSTRAP_MANIFEST_URLS.filter((defaultUrl) => {
+      try {
+        const defaultHost = new URL(defaultUrl).hostname.toLowerCase();
+        return !addons.some((existing) => {
+          try {
+            return new URL(existing.manifestUrl).hostname.toLowerCase() === defaultHost;
+          } catch {
+            return false;
+          }
+        });
+      } catch {
+        return false;
+      }
+    });
+
+    if (missingDefaultUrls.length === 0) return;
 
     let cancelled = false;
 
@@ -817,7 +833,7 @@ export const App: React.FC = () => {
       const fetchedAddons: InstalledAddon[] = [];
 
       await Promise.allSettled(
-        DEFAULT_BOOTSTRAP_MANIFEST_URLS.map(async (url) => {
+        missingDefaultUrls.map(async (url) => {
           const { manifestUrl, manifest } = await fetchStremioManifest(url);
           fetchedAddons.push({
             manifestUrl,
@@ -829,16 +845,18 @@ export const App: React.FC = () => {
       );
 
       if (!cancelled && fetchedAddons.length > 0) {
-        const merged: InstalledAddon[] = [];
-        for (const next of fetchedAddons) {
-          if (!merged.some((existing) => existing.manifest.id === next.manifest.id)) {
-            merged.push(next);
+        setAddons((prev) => {
+          const merged = [...prev];
+          for (const next of fetchedAddons) {
+            if (!merged.some((existing) => existing.manifest.id === next.manifest.id)) {
+              merged.push(next);
+            }
           }
-        }
-        setAddons((prev) => (prev.length > 0 ? prev : merged));
-        if (authToken && currentUser && merged.length > 0) {
-          persistProvidersToDb(merged);
-        }
+          if (authToken && currentUser && merged.length > 0) {
+            persistProvidersToDb(merged);
+          }
+          return merged;
+        });
       }
       if (!cancelled) {
         setBootstrappingAddons(false);
@@ -850,7 +868,7 @@ export const App: React.FC = () => {
     return () => {
       cancelled = true;
     };
-  }, [addons.length]);
+  }, [addons.length, authToken, currentUser]);
 
   // Load all catalogs from enabled addons
   const loadAllAddonCatalogs = useCallback(async () => {

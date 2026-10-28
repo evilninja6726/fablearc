@@ -530,6 +530,10 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       return;
     }
 
+    const isM3u8 =
+      activeStream.isHls || activeStream.url.toLowerCase().includes('.m3u8');
+    setUseFfmpegAudioEngine(!isM3u8);
+
     let cancelled = false;
     setProbingAudio(true);
     setProbedAudioTracks([]);
@@ -1044,6 +1048,12 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
               }}
               onError={() => {
                 setIsBuffering(true);
+                if (useFfmpegAudioEngine) {
+                  // Automatically fall back to direct native/HLS browser playback if FFmpeg remux fails
+                  setUseFfmpegAudioEngine(false);
+                } else {
+                  switchToNextStream('Stream unavailable');
+                }
               }}
               onLoadedMetadata={(e) => {
                 const dur = e.currentTarget.duration;

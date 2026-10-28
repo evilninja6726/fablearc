@@ -565,8 +565,9 @@ export async function resolveAddonInputUrl(rawInput: string): Promise<string> {
     // 1. Try local Vite dev/preview server resolver first if available
     try {
       const authToken = getClientAuthToken();
+      const backendOrigin = getCloudBackendOrigin();
       const localResp = await fetch(
-        `/api/resolve-stremio-addon?slug=${encodeURIComponent(addonSlug)}`,
+        `${backendOrigin}/api/resolve-stremio-addon?slug=${encodeURIComponent(addonSlug)}`,
         {
           headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
         },
@@ -886,6 +887,10 @@ export function getCloudBackendOrigin(): string {
     return 'https://fablearc-backend.onrender.com';
   }
   return '';
+}
+
+export function buildApiUrl(path: string): string {
+  return `${getCloudBackendOrigin()}${path}`;
 }
 
 async function cachedJsonFetch<T = unknown>(

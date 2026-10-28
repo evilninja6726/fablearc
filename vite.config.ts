@@ -510,6 +510,19 @@ export function registerStreamzApiMiddlewares(
   const authLimiter = customRateLimiter || new SlidingWindowRateLimiter(5, 60_000);
   const activeUserFfmpegStreams = new Map<number, Set<ChildProcess>>();
 
+  const resolveUserIdWithCloudSync = async (
+    token?: string | null,
+  ): Promise<number | null> => {
+    if (!token) return null;
+    await activeDb().ensureHydratedFromTursoCloud();
+    let uid = activeDb().resolveUserIdFromToken(token);
+    if (!uid) {
+      await activeDb().ensureHydratedFromTursoCloud(true);
+      uid = activeDb().resolveUserIdFromToken(token);
+    }
+    return uid;
+  };
+
   // Wrap every registered API route with CORS & OPTIONS preflight handling for trusted frontend origins
   const middlewares: MiddlewareContainer = {
     use(route, handler) {
@@ -553,10 +566,7 @@ export function registerStreamzApiMiddlewares(
     }
     try {
       const token = extractBearerToken(req);
-      if (token) {
-        await activeDb().ensureHydratedFromTursoCloud();
-      }
-      const callerId = activeDb().resolveUserIdFromToken(token);
+      const callerId = await resolveUserIdWithCloudSync(token);
       if (!callerId || !activeDb().isUserAdmin(callerId)) {
         sendJson(res, 403, {
           error: 'Only an administrator can create new user accounts.',
@@ -591,10 +601,7 @@ export function registerStreamzApiMiddlewares(
       return;
     }
     const token = extractBearerToken(req);
-    if (token) {
-      await activeDb().ensureHydratedFromTursoCloud();
-    }
-    const userId = activeDb().resolveUserIdFromToken(token);
+    const userId = await resolveUserIdWithCloudSync(token);
     if (!userId) {
       sendJson(res, 401, { error: 'Unauthorized' });
       return;
@@ -636,10 +643,7 @@ export function registerStreamzApiMiddlewares(
 
   middlewares.use('/api/admin/users', async (req, res) => {
     const token = extractBearerToken(req);
-    if (token) {
-      await activeDb().ensureHydratedFromTursoCloud();
-    }
-    const adminId = activeDb().resolveUserIdFromToken(token);
+    const adminId = await resolveUserIdWithCloudSync(token);
     if (!adminId) {
       sendJson(res, 401, { error: 'Unauthorized: Please sign in.' });
       return;
@@ -738,10 +742,7 @@ export function registerStreamzApiMiddlewares(
       return;
     }
     const token = extractBearerToken(req);
-    if (token) {
-      await activeDb().ensureHydratedFromTursoCloud();
-    }
-    const adminId = activeDb().resolveUserIdFromToken(token);
+    const adminId = await resolveUserIdWithCloudSync(token);
     if (!adminId) {
       sendJson(res, 401, { error: 'Unauthorized: Please sign in.' });
       return;
@@ -799,10 +800,19 @@ export function registerStreamzApiMiddlewares(
       }
 
       await activeDb().ensureHydratedFromTursoCloud();
-      const result = activeDb().loginUser({
-        email: cleanEmail,
-        password: body.password || '',
-      });
+      let result: ReturnType<StreamZDatabase['loginUser']>;
+      try {
+        result = activeDb().loginUser({
+          email: cleanEmail,
+          password: body.password || '',
+        });
+      } catch {
+        await activeDb().ensureHydratedFromTursoCloud(true);
+        result = activeDb().loginUser({
+          email: cleanEmail,
+          password: body.password || '',
+        });
+      }
       authLimiter.reset(rateKey);
       sendJson(res, 200, result, {
         'Set-Cookie': `streamz_session=${encodeURIComponent(result.token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000`,
@@ -833,9 +843,8 @@ export function registerStreamzApiMiddlewares(
 
   middlewares.use('/api/user/state', async (req, res) => {
     try {
-      await activeDb().ensureHydratedFromTursoCloud();
       const token = extractBearerToken(req);
-      const userId = activeDb().resolveUserIdFromToken(token);
+      const userId = await resolveUserIdWithCloudSync(token);
       if (!userId) {
         sendJson(res, 401, { error: 'Unauthorized' });
         return;
@@ -855,10 +864,7 @@ export function registerStreamzApiMiddlewares(
       return;
     }
     const token = extractBearerToken(req);
-    if (token) {
-      await activeDb().ensureHydratedFromTursoCloud();
-    }
-    const userId = activeDb().resolveUserIdFromToken(token);
+    const userId = await resolveUserIdWithCloudSync(token);
     if (!userId) {
       sendJson(res, 401, { error: 'Unauthorized' });
       return;
@@ -887,10 +893,7 @@ export function registerStreamzApiMiddlewares(
       return;
     }
     const token = extractBearerToken(req);
-    if (token) {
-      await activeDb().ensureHydratedFromTursoCloud();
-    }
-    const userId = activeDb().resolveUserIdFromToken(token);
+    const userId = await resolveUserIdWithCloudSync(token);
     if (!userId) {
       sendJson(res, 401, { error: 'Unauthorized' });
       return;
@@ -923,10 +926,7 @@ export function registerStreamzApiMiddlewares(
       return;
     }
     const token = extractBearerToken(req);
-    if (token) {
-      await activeDb().ensureHydratedFromTursoCloud();
-    }
-    const userId = activeDb().resolveUserIdFromToken(token);
+    const userId = await resolveUserIdWithCloudSync(token);
     if (!userId) {
       sendJson(res, 401, { error: 'Unauthorized' });
       return;
@@ -948,10 +948,7 @@ export function registerStreamzApiMiddlewares(
   // Protected Admin-Only DB Diagnostics Endpoint
   middlewares.use('/api/db/diagnostics', async (req, res) => {
     const token = extractBearerToken(req);
-    if (token) {
-      await activeDb().ensureHydratedFromTursoCloud();
-    }
-    const callerId = activeDb().resolveUserIdFromToken(token);
+    const callerId = await resolveUserIdWithCloudSync(token);
     if (!callerId) {
       sendJson(res, 401, { error: 'Unauthorized: Sign in required.' });
       return;
@@ -974,10 +971,7 @@ export function registerStreamzApiMiddlewares(
   middlewares.use('/api/resolve-stremio-addon', async (req, res) => {
     const urlObj = new URL(req.url || '', 'http://localhost');
     const token = extractBearerToken(req, urlObj);
-    if (token) {
-      await activeDb().ensureHydratedFromTursoCloud();
-    }
-    const userId = activeDb().resolveUserIdFromToken(token);
+    const userId = await resolveUserIdWithCloudSync(token);
     if (!userId) {
       sendJson(res, 401, { error: 'Authentication required to resolve addons.' });
       return;
@@ -1030,10 +1024,7 @@ export function registerStreamzApiMiddlewares(
       const urlObj = new URL(req.url || '', 'http://localhost');
       const targetUrl = (urlObj.searchParams.get('url') || '').trim();
       const token = extractBearerToken(req, urlObj);
-      if (token) {
-        await activeDb().ensureHydratedFromTursoCloud();
-      }
-      const userId = token ? activeDb().resolveUserIdFromToken(token) : null;
+      const userId = await resolveUserIdWithCloudSync(token);
 
       const policy = evaluateStremioProxyUrlPolicy(targetUrl, Boolean(userId));
       if (!policy.allowed) {
@@ -1075,10 +1066,7 @@ export function registerStreamzApiMiddlewares(
     try {
       const urlObj = new URL(req.url || '', 'http://localhost');
       const token = extractBearerToken(req, urlObj);
-      if (token) {
-        await activeDb().ensureHydratedFromTursoCloud();
-      }
-      const userId = activeDb().resolveUserIdFromToken(token);
+      const userId = await resolveUserIdWithCloudSync(token);
       if (!userId) {
         sendJson(res, 401, { error: 'Authentication required to probe media streams.' });
         return;
@@ -1153,10 +1141,7 @@ export function registerStreamzApiMiddlewares(
     try {
       const urlObj = new URL(req.url || '', 'http://localhost');
       const token = extractBearerToken(req, urlObj);
-      if (token) {
-        await activeDb().ensureHydratedFromTursoCloud();
-      }
-      const userId = activeDb().resolveUserIdFromToken(token);
+      const userId = await resolveUserIdWithCloudSync(token);
       if (!userId) {
         sendJson(res, 401, { error: 'Authentication required to stream media.' });
         return;

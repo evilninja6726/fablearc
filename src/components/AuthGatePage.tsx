@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { ArrowRight, Lock, Mail, Moon, ShieldCheck, Sun, X } from 'lucide-react';
 import { PopcornBrandLogo } from './PlatformLogoEmblem';
+import { buildApiUrl } from '../addons/stremioProtocol';
 import type { UserStatePayload } from '../server/streamzDb';
 
 interface AuthGatePageProps {
@@ -133,7 +134,7 @@ export const AuthGatePage: React.FC<AuthGatePageProps> = ({
     setLoading(true);
 
     try {
-      const resp = await fetch('/api/auth/login', {
+      const resp = await fetch(buildApiUrl('/api/auth/login'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

@@ -355,6 +355,7 @@ export class StreamZDatabase {
   private tursoUrl: string | null;
   private tursoAuthToken: string | null;
   private hydrationPromise: Promise<void> | null = null;
+  private lastHydratedAtMs = 0;
   /**
    * In-memory session cache (tokenHashHex -> { userId, expiresAt })
    * Eliminates repetitive `SELECT user_id, expires_at FROM sessions` DB reads on every API call.
@@ -406,12 +407,20 @@ export class StreamZDatabase {
    * so ephemeral cloud containers (like Render Free) automatically restore all user state
    * with zero hardcoded credentials in source code.
    */
-  public ensureHydratedFromTursoCloud(): Promise<void> {
+  public ensureHydratedFromTursoCloud(force = false): Promise<void> {
     if (!this.tursoUrl || !this.tursoAuthToken) {
       return Promise.resolve();
     }
     if (this.hydrationPromise) {
       return this.hydrationPromise;
+    }
+    const now = Date.now();
+    if (
+      this.lastHydratedAtMs > 0 &&
+      ((!force && now - this.lastHydratedAtMs < 15_000) ||
+        (force && now - this.lastHydratedAtMs < 1_500))
+    ) {
+      return Promise.resolve();
     }
 
     const httpEndpoint = this.tursoUrl
@@ -638,12 +647,16 @@ export class StreamZDatabase {
           }
 
           this.db.exec('COMMIT');
+          this.lastHydratedAtMs = Date.now();
         } catch {
           this.db.exec('ROLLBACK');
         }
       })
       .catch(() => {
         // Ignore cloud hydration network errors
+      })
+      .finally(() => {
+        this.hydrationPromise = null;
       });
 
     return this.hydrationPromise;
@@ -1453,10 +1466,37 @@ export class StreamZDatabase {
       );
 
     const newUserId = Number(insertResult.lastInsertRowid);
-    this.replicateToTursoCloud(
-      'INSERT OR REPLACE INTO users (id, email, display_name, avatar_color, role, password_hash, streaming_cfg, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-      [newUserId, cleanEmail, cleanName, avatarColor, role, passwordHashText, '', nowDateTime],
-    );
+    const adminProviders = this.db
+      .prepare(
+        'SELECT provider_id, enabled, sort_order FROM user_providers WHERE user_id = ? ORDER BY sort_order ASC',
+      )
+      .all(adminUserId) as Array<{
+      provider_id: number;
+      enabled: number;
+      sort_order: number;
+    }>;
+
+    const tursoStmts: Array<{ sql: string; args?: Array<string | number | null> }> = [
+      {
+        sql: 'INSERT OR REPLACE INTO users (id, email, display_name, avatar_color, role, password_hash, streaming_cfg, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        args: [newUserId, cleanEmail, cleanName, avatarColor, role, passwordHashText, '', nowDateTime],
+      },
+    ];
+
+    if (adminProviders.length > 0) {
+      const copyStmt = this.db.prepare(
+        'INSERT OR IGNORE INTO user_providers (user_id, provider_id, enabled, sort_order) VALUES (?, ?, ?, ?)',
+      );
+      for (const ap of adminProviders) {
+        copyStmt.run(newUserId, ap.provider_id, ap.enabled, ap.sort_order);
+        tursoStmts.push({
+          sql: 'INSERT OR IGNORE INTO user_providers (user_id, provider_id, enabled, sort_order) VALUES (?, ?, ?, ?)',
+          args: [newUserId, ap.provider_id, ap.enabled, ap.sort_order],
+        });
+      }
+    }
+
+    this.replicateBatchToTursoCloud(tursoStmts);
 
     const createdList = this.adminListUsers(adminUserId);
     const found = createdList.find((u) => u.id === newUserId);
@@ -1929,6 +1969,8 @@ export class StreamZDatabase {
       background: entry.background,
     });
 
+    const posInt = Math.max(0, Math.floor(entry.positionSec));
+    const durInt = Math.max(0, Math.floor(entry.durationSec));
     this.db
       .prepare(
         `INSERT INTO user_watch_history_v2 (
@@ -1946,10 +1988,57 @@ export class StreamZDatabase {
         mediaRef,
         entry.episodeId ?? null,
         entry.episodeLabel ?? null,
-        Math.max(0, Math.floor(entry.positionSec)),
-        Math.max(0, Math.floor(entry.durationSec)),
+        posInt,
+        durInt,
         nowDateTime,
       );
+
+    const catRow = this.db
+      .prepare(
+        'SELECT id, media_id, media_type, title, poster, background, rating_bp, release_info FROM media_catalog WHERE id = ?',
+      )
+      .get(mediaRef) as
+      | {
+          id: number;
+          media_id: string;
+          media_type: number;
+          title: string;
+          poster: string | null;
+          background: string | null;
+          rating_bp: number | null;
+          release_info: string | null;
+        }
+      | undefined;
+
+    const tursoStmts: Array<{ sql: string; args?: Array<string | number | null> }> = [];
+    if (catRow) {
+      tursoStmts.push({
+        sql: 'INSERT OR REPLACE INTO media_catalog (id, media_id, media_type, title, poster, background, rating_bp, release_info) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        args: [
+          catRow.id,
+          catRow.media_id,
+          catRow.media_type,
+          catRow.title,
+          catRow.poster,
+          catRow.background,
+          catRow.rating_bp,
+          catRow.release_info,
+        ],
+      });
+    }
+    tursoStmts.push({
+      sql: 'INSERT OR REPLACE INTO user_watch_history_v2 (user_id, media_ref, episode_id, episode_label, pos_sec, dur_sec, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      args: [
+        userId,
+        mediaRef,
+        entry.episodeId ?? null,
+        entry.episodeLabel ?? null,
+        posInt,
+        durInt,
+        nowDateTime,
+      ],
+    });
+    this.replicateBatchToTursoCloud(tursoStmts);
   }
 
   public deleteWatchHistoryItem(userId: number, mediaId: string): void {
@@ -1962,12 +2051,20 @@ export class StreamZDatabase {
         'DELETE FROM user_watch_history_v2 WHERE user_id = ? AND media_ref = ?',
       )
       .run(userId, row.id);
+    this.replicateToTursoCloud(
+      'DELETE FROM user_watch_history_v2 WHERE user_id = ? AND media_ref = ?',
+      [userId, row.id],
+    );
   }
 
   public clearWatchHistory(userId: number): void {
     this.db
       .prepare('DELETE FROM user_watch_history_v2 WHERE user_id = ?')
       .run(userId);
+    this.replicateToTursoCloud(
+      'DELETE FROM user_watch_history_v2 WHERE user_id = ?',
+      [userId],
+    );
   }
 
   public syncUserWatchlist(userId: number, items: DbWatchlistRecord[]): void {
@@ -1982,6 +2079,9 @@ export class StreamZDatabase {
           user_id, media_ref, added_at
         ) VALUES (?, ?, ?)
       `);
+      const tursoStmts: Array<{ sql: string; args?: Array<string | number | null> }> = [
+        { sql: 'DELETE FROM user_watchlist_v2 WHERE user_id = ?', args: [userId] },
+      ];
       items.forEach((item, idx) => {
         const mediaRef = this.upsertMediaCatalogEntry({
           mediaId: item.id,
@@ -1991,9 +2091,46 @@ export class StreamZDatabase {
           imdbRating: item.imdbRating,
           releaseInfo: item.releaseInfo,
         });
-        insertStmt.run(userId, mediaRef, formatHumanDateTime(nowEpoch - idx));
+        const addedAt = formatHumanDateTime(nowEpoch - idx);
+        insertStmt.run(userId, mediaRef, addedAt);
+        const catRow = this.db
+          .prepare(
+            'SELECT id, media_id, media_type, title, poster, background, rating_bp, release_info FROM media_catalog WHERE id = ?',
+          )
+          .get(mediaRef) as
+          | {
+              id: number;
+              media_id: string;
+              media_type: number;
+              title: string;
+              poster: string | null;
+              background: string | null;
+              rating_bp: number | null;
+              release_info: string | null;
+            }
+          | undefined;
+        if (catRow) {
+          tursoStmts.push({
+            sql: 'INSERT OR REPLACE INTO media_catalog (id, media_id, media_type, title, poster, background, rating_bp, release_info) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            args: [
+              catRow.id,
+              catRow.media_id,
+              catRow.media_type,
+              catRow.title,
+              catRow.poster,
+              catRow.background,
+              catRow.rating_bp,
+              catRow.release_info,
+            ],
+          });
+        }
+        tursoStmts.push({
+          sql: 'INSERT OR REPLACE INTO user_watchlist_v2 (user_id, media_ref, added_at) VALUES (?, ?, ?)',
+          args: [userId, mediaRef, addedAt],
+        });
       });
       this.db.exec('COMMIT');
+      this.replicateBatchToTursoCloud(tursoStmts);
     } catch (err) {
       this.db.exec('ROLLBACK');
       throw err;
