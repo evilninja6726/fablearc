@@ -479,6 +479,10 @@ export class StreamZDatabase {
 
         this.db.exec('BEGIN IMMEDIATE TRANSACTION');
         try {
+          const validUserIds = new Set<number>();
+          const validProviderIds = new Set<number>();
+          const validCatalogIds = new Set<number>();
+
           const userStmt = this.db.prepare(`
             INSERT OR REPLACE INTO users (
               id, email, display_name, avatar_color, role, password_hash, pwd_salt, pwd_hash, streaming_cfg, created_at
@@ -488,18 +492,24 @@ export class StreamZDatabase {
             const pwdHashStr = String(u[5] || '');
             const parts = pwdHashStr.split('$');
             if (parts.length !== 3) continue;
-            userStmt.run(
-              Number(u[0]),
-              String(u[1]),
-              String(u[2]),
-              String(u[3] || '#E11D48'),
-              String(u[4] || 'user'),
-              pwdHashStr,
-              Buffer.from(parts[1], 'hex'),
-              Buffer.from(parts[2], 'hex'),
-              String(u[6] || ''),
-              formatHumanDateTime(u[7] as string | number),
-            );
+            const uid = Number(u[0]);
+            try {
+              userStmt.run(
+                uid,
+                String(u[1]),
+                String(u[2]),
+                String(u[3] || '#E11D48'),
+                String(u[4] || 'user'),
+                pwdHashStr,
+                Buffer.from(parts[1], 'hex'),
+                Buffer.from(parts[2], 'hex'),
+                String(u[6] || ''),
+                formatHumanDateTime(u[7] as string | number),
+              );
+              validUserIds.add(uid);
+            } catch {
+              // Skip malformed user row without aborting hydration
+            }
           }
 
           const provStmt = this.db.prepare(`
@@ -507,12 +517,18 @@ export class StreamZDatabase {
             VALUES (?, ?, ?, ?)
           `);
           for (const p of cloudProviders) {
-            provStmt.run(
-              Number(p[0]),
-              String(p[1]),
-              String(p[2]),
-              formatHumanDateTime(p[3] as string | number),
-            );
+            const pid = Number(p[0]);
+            try {
+              provStmt.run(
+                pid,
+                String(p[1]),
+                String(p[2]),
+                formatHumanDateTime(p[3] as string | number),
+              );
+              validProviderIds.add(pid);
+            } catch {
+              // Skip malformed provider row
+            }
           }
 
           const upStmt = this.db.prepare(`
@@ -520,13 +536,20 @@ export class StreamZDatabase {
             VALUES (?, ?, ?, ?, ?)
           `);
           for (const up of cloudUserProviders) {
-            upStmt.run(
-              Number(up[0]),
-              Number(up[1]),
-              Number(up[2] ?? 1),
-              Number(up[3] ?? 0),
-              up[4] !== null ? String(up[4]) : null,
-            );
+            const uid = Number(up[0]);
+            const pid = Number(up[1]);
+            if (!validUserIds.has(uid) || !validProviderIds.has(pid)) continue;
+            try {
+              upStmt.run(
+                uid,
+                pid,
+                Number(up[2] ?? 1),
+                Number(up[3] ?? 0),
+                up[4] !== null ? String(up[4]) : null,
+              );
+            } catch {
+              // Skip orphaned user_providers row
+            }
           }
 
           const catStmt = this.db.prepare(`
@@ -534,16 +557,22 @@ export class StreamZDatabase {
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
           `);
           for (const c of cloudCatalog) {
-            catStmt.run(
-              Number(c[0]),
-              String(c[1]),
-              Number(c[2] ?? 0),
-              String(c[3]),
-              c[4] !== null ? String(c[4]) : null,
-              c[5] !== null ? String(c[5]) : null,
-              c[6] !== null ? Number(c[6]) : null,
-              c[7] !== null ? String(c[7]) : null,
-            );
+            const cid = Number(c[0]);
+            try {
+              catStmt.run(
+                cid,
+                String(c[1]),
+                Number(c[2] ?? 0),
+                String(c[3]),
+                c[4] !== null ? String(c[4]) : null,
+                c[5] !== null ? String(c[5]) : null,
+                c[6] !== null ? Number(c[6]) : null,
+                c[7] !== null ? String(c[7]) : null,
+              );
+              validCatalogIds.add(cid);
+            } catch {
+              // Skip malformed catalog row
+            }
           }
 
           const histStmt = this.db.prepare(`
@@ -551,15 +580,22 @@ export class StreamZDatabase {
             VALUES (?, ?, ?, ?, ?, ?, ?)
           `);
           for (const h of cloudHistory) {
-            histStmt.run(
-              Number(h[0]),
-              Number(h[1]),
-              h[2] !== null ? String(h[2]) : null,
-              h[3] !== null ? String(h[3]) : null,
-              Number(h[4] ?? 0),
-              Number(h[5] ?? 0),
-              formatHumanDateTime(h[6] as string | number),
-            );
+            const uid = Number(h[0]);
+            const cid = Number(h[1]);
+            if (!validUserIds.has(uid) || !validCatalogIds.has(cid)) continue;
+            try {
+              histStmt.run(
+                uid,
+                cid,
+                h[2] !== null ? String(h[2]) : null,
+                h[3] !== null ? String(h[3]) : null,
+                Number(h[4] ?? 0),
+                Number(h[5] ?? 0),
+                formatHumanDateTime(h[6] as string | number),
+              );
+            } catch {
+              // Skip orphaned watch history row
+            }
           }
 
           const wlStmt = this.db.prepare(`
@@ -567,11 +603,18 @@ export class StreamZDatabase {
             VALUES (?, ?, ?)
           `);
           for (const w of cloudWatchlist) {
-            wlStmt.run(
-              Number(w[0]),
-              Number(w[1]),
-              formatHumanDateTime(w[2] as string | number),
-            );
+            const uid = Number(w[0]);
+            const cid = Number(w[1]);
+            if (!validUserIds.has(uid) || !validCatalogIds.has(cid)) continue;
+            try {
+              wlStmt.run(
+                uid,
+                cid,
+                formatHumanDateTime(w[2] as string | number),
+              );
+            } catch {
+              // Skip orphaned watchlist row
+            }
           }
 
           const sessStmt = this.db.prepare(`
@@ -579,14 +622,19 @@ export class StreamZDatabase {
             VALUES (?, ?, ?)
           `);
           for (const s of cloudSessions) {
-            const hexHash = String(s[0] || '');
-            if (!/^[0-9a-f]{64}$/i.test(hexHash)) continue;
+            const hexHash = String(s[0] || '').toLowerCase();
+            const uid = Number(s[1]);
+            if (!/^[0-9a-f]{64}$/i.test(hexHash) || !validUserIds.has(uid)) continue;
             const expStr = formatHumanDateTime(s[2] as string | number);
-            sessStmt.run(Buffer.from(hexHash, 'hex'), Number(s[1]), expStr);
-            this.sessionCache.set(hexHash.toLowerCase(), {
-              userId: Number(s[1]),
-              expiresAt: expStr,
-            });
+            try {
+              sessStmt.run(Buffer.from(hexHash, 'hex'), uid, expStr);
+              this.sessionCache.set(hexHash, {
+                userId: uid,
+                expiresAt: expStr,
+              });
+            } catch {
+              // Skip orphaned session row
+            }
           }
 
           this.db.exec('COMMIT');
@@ -1550,6 +1598,7 @@ export class StreamZDatabase {
     }
     this.replicateBatchToTursoCloud([
       { sql: 'DELETE FROM users WHERE id = ?', args: [targetUserId] },
+      { sql: 'DELETE FROM sessions WHERE user_id = ?', args: [targetUserId] },
       { sql: 'DELETE FROM user_providers WHERE user_id = ?', args: [targetUserId] },
       { sql: 'DELETE FROM user_watch_history_v2 WHERE user_id = ?', args: [targetUserId] },
       { sql: 'DELETE FROM user_watchlist_v2 WHERE user_id = ?', args: [targetUserId] },

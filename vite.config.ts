@@ -313,7 +313,14 @@ export async function unwrapMediaStreamUrl(initialUrl: string): Promise<string> 
 async function safeUpstreamJsonFetch(targetUrl: string): Promise<unknown> {
   let currentUrl = targetUrl;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 11000);
+  const timer = setTimeout(() => controller.abort(), 28000);
+
+  const emptyGracefulFallback = (url: string): unknown | null => {
+    if (url.includes('/subtitles/')) return { subtitles: [] };
+    if (url.includes('/stream/')) return { streams: [] };
+    if (url.includes('/meta/')) return { meta: null };
+    return null;
+  };
 
   try {
     for (let hop = 0; hop < 4; hop++) {
@@ -323,7 +330,8 @@ async function safeUpstreamJsonFetch(targetUrl: string): Promise<unknown> {
       const upstream = await fetch(currentUrl, {
         headers: {
           Accept: 'application/json',
-          'User-Agent': 'StreamZ/2.0 (High-Speed Cache Proxy)',
+          'User-Agent':
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
         },
         redirect: 'manual',
         signal: controller.signal,
@@ -342,12 +350,36 @@ async function safeUpstreamJsonFetch(targetUrl: string): Promise<unknown> {
         continue;
       }
 
+      if (upstream.status === 404 && currentUrl.endsWith('/stremio/manifest.json')) {
+        const rootManifestUrl = currentUrl.replace(
+          /\/stremio\/manifest\.json$/i,
+          '/manifest.json',
+        );
+        if (isSafePublicUrl(rootManifestUrl, false)) {
+          currentUrl = rootManifestUrl;
+          continue;
+        }
+      }
+
       if (!upstream.ok) {
+        const fallback = emptyGracefulFallback(currentUrl);
+        if (fallback !== null) {
+          return fallback;
+        }
         throw new Error(`Upstream HTTP ${upstream.status}`);
       }
       return await upstream.json();
     }
     throw new Error('Too many upstream redirects');
+  } catch (err) {
+    if (err instanceof Error && err.message.startsWith('Blocked unsafe')) {
+      throw err;
+    }
+    const fallback = emptyGracefulFallback(currentUrl);
+    if (fallback !== null) {
+      return fallback;
+    }
+    throw err;
   } finally {
     clearTimeout(timer);
   }
@@ -470,13 +502,48 @@ export interface MiddlewareContainer {
 const MAX_ACTIVE_STREAMS_PER_USER = 2;
 
 export function registerStreamzApiMiddlewares(
-  middlewares: MiddlewareContainer,
+  rawMiddlewares: MiddlewareContainer,
   customDb?: StreamZDatabase,
   customRateLimiter?: SlidingWindowRateLimiter,
 ): void {
   const activeDb = () => customDb || getDb();
   const authLimiter = customRateLimiter || new SlidingWindowRateLimiter(5, 60_000);
   const activeUserFfmpegStreams = new Map<number, Set<ChildProcess>>();
+
+  // Wrap every registered API route with CORS & OPTIONS preflight handling for trusted frontend origins
+  const middlewares: MiddlewareContainer = {
+    use(route, handler) {
+      rawMiddlewares.use(route, (req, res, next) => {
+        const reqOrigin = req.headers.origin;
+        const configuredOrigin = (process.env.FRONTEND_ORIGIN || '').trim();
+        if (
+          typeof reqOrigin === 'string' &&
+          (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(reqOrigin) ||
+            /^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(reqOrigin) ||
+            /^https:\/\/[a-z0-9-]+\.hf\.space$/i.test(reqOrigin) ||
+            /^https:\/\/[a-z0-9-]+\.up\.railway\.app$/i.test(reqOrigin) ||
+            /^https:\/\/[a-z0-9-]+\.onrender\.com$/i.test(reqOrigin) ||
+            reqOrigin.includes('ngrok-free.dev') ||
+            (configuredOrigin && reqOrigin === configuredOrigin))
+        ) {
+          res.setHeader('Access-Control-Allow-Origin', reqOrigin);
+          res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+          res.setHeader(
+            'Access-Control-Allow-Headers',
+            'Content-Type, Authorization, Range, Accept',
+          );
+          res.setHeader('Access-Control-Allow-Credentials', 'true');
+          res.setHeader('Vary', 'Origin');
+        }
+        if (req.method === 'OPTIONS') {
+          res.statusCode = 204;
+          res.end();
+          return;
+        }
+        return handler(req, res, next);
+      });
+    },
+  };
 
   // 0. Commercial-Grade SQLite WAL User Auth, Password Change & Admin RBAC Endpoints
   middlewares.use('/api/auth/register', async (req, res) => {
@@ -486,6 +553,9 @@ export function registerStreamzApiMiddlewares(
     }
     try {
       const token = extractBearerToken(req);
+      if (token) {
+        await activeDb().ensureHydratedFromTursoCloud();
+      }
       const callerId = activeDb().resolveUserIdFromToken(token);
       if (!callerId || !activeDb().isUserAdmin(callerId)) {
         sendJson(res, 403, {
@@ -521,6 +591,9 @@ export function registerStreamzApiMiddlewares(
       return;
     }
     const token = extractBearerToken(req);
+    if (token) {
+      await activeDb().ensureHydratedFromTursoCloud();
+    }
     const userId = activeDb().resolveUserIdFromToken(token);
     if (!userId) {
       sendJson(res, 401, { error: 'Unauthorized' });
@@ -563,6 +636,9 @@ export function registerStreamzApiMiddlewares(
 
   middlewares.use('/api/admin/users', async (req, res) => {
     const token = extractBearerToken(req);
+    if (token) {
+      await activeDb().ensureHydratedFromTursoCloud();
+    }
     const adminId = activeDb().resolveUserIdFromToken(token);
     if (!adminId) {
       sendJson(res, 401, { error: 'Unauthorized: Please sign in.' });
@@ -662,6 +738,9 @@ export function registerStreamzApiMiddlewares(
       return;
     }
     const token = extractBearerToken(req);
+    if (token) {
+      await activeDb().ensureHydratedFromTursoCloud();
+    }
     const adminId = activeDb().resolveUserIdFromToken(token);
     if (!adminId) {
       sendJson(res, 401, { error: 'Unauthorized: Please sign in.' });
@@ -739,6 +818,7 @@ export function registerStreamzApiMiddlewares(
   middlewares.use('/api/auth/logout', async (req, res) => {
     const token = extractBearerToken(req);
     if (token) {
+      await activeDb().ensureHydratedFromTursoCloud();
       activeDb().revokeSession(token);
     }
     sendJson(
@@ -775,6 +855,9 @@ export function registerStreamzApiMiddlewares(
       return;
     }
     const token = extractBearerToken(req);
+    if (token) {
+      await activeDb().ensureHydratedFromTursoCloud();
+    }
     const userId = activeDb().resolveUserIdFromToken(token);
     if (!userId) {
       sendJson(res, 401, { error: 'Unauthorized' });
@@ -804,6 +887,9 @@ export function registerStreamzApiMiddlewares(
       return;
     }
     const token = extractBearerToken(req);
+    if (token) {
+      await activeDb().ensureHydratedFromTursoCloud();
+    }
     const userId = activeDb().resolveUserIdFromToken(token);
     if (!userId) {
       sendJson(res, 401, { error: 'Unauthorized' });
@@ -837,6 +923,9 @@ export function registerStreamzApiMiddlewares(
       return;
     }
     const token = extractBearerToken(req);
+    if (token) {
+      await activeDb().ensureHydratedFromTursoCloud();
+    }
     const userId = activeDb().resolveUserIdFromToken(token);
     if (!userId) {
       sendJson(res, 401, { error: 'Unauthorized' });
@@ -857,8 +946,11 @@ export function registerStreamzApiMiddlewares(
   });
 
   // Protected Admin-Only DB Diagnostics Endpoint
-  middlewares.use('/api/db/diagnostics', (req, res) => {
+  middlewares.use('/api/db/diagnostics', async (req, res) => {
     const token = extractBearerToken(req);
+    if (token) {
+      await activeDb().ensureHydratedFromTursoCloud();
+    }
     const callerId = activeDb().resolveUserIdFromToken(token);
     if (!callerId) {
       sendJson(res, 401, { error: 'Unauthorized: Sign in required.' });
@@ -882,6 +974,9 @@ export function registerStreamzApiMiddlewares(
   middlewares.use('/api/resolve-stremio-addon', async (req, res) => {
     const urlObj = new URL(req.url || '', 'http://localhost');
     const token = extractBearerToken(req, urlObj);
+    if (token) {
+      await activeDb().ensureHydratedFromTursoCloud();
+    }
     const userId = activeDb().resolveUserIdFromToken(token);
     if (!userId) {
       sendJson(res, 401, { error: 'Authentication required to resolve addons.' });
@@ -980,6 +1075,9 @@ export function registerStreamzApiMiddlewares(
     try {
       const urlObj = new URL(req.url || '', 'http://localhost');
       const token = extractBearerToken(req, urlObj);
+      if (token) {
+        await activeDb().ensureHydratedFromTursoCloud();
+      }
       const userId = activeDb().resolveUserIdFromToken(token);
       if (!userId) {
         sendJson(res, 401, { error: 'Authentication required to probe media streams.' });
@@ -1055,6 +1153,9 @@ export function registerStreamzApiMiddlewares(
     try {
       const urlObj = new URL(req.url || '', 'http://localhost');
       const token = extractBearerToken(req, urlObj);
+      if (token) {
+        await activeDb().ensureHydratedFromTursoCloud();
+      }
       const userId = activeDb().resolveUserIdFromToken(token);
       if (!userId) {
         sendJson(res, 401, { error: 'Authentication required to stream media.' });

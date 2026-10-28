@@ -157,7 +157,9 @@ export function isDiscordOrPromoSpam(text: string): boolean {
     lower.includes('you must login') ||
     lower.includes('authentication is missing') ||
     lower.includes('/signin.mp4') ||
-    lower.includes('configure addon')
+    lower.includes('configure addon') ||
+    lower.includes('webBLOCKS') ||
+    /\.(apk|exe|msi|dmg|bat|sh)(\?|$|\|)/i.test(lower)
   );
 }
 
@@ -868,6 +870,24 @@ const CLIENT_JSON_CACHE = new Map<string, ClientCacheEntry>();
 const CLIENT_INFLIGHT = new Map<string, Promise<unknown>>();
 const MAX_CLIENT_CACHE_ENTRIES = 600;
 
+export function getCloudBackendOrigin(): string {
+  const envOrigin = (
+    ((import.meta as unknown as { env?: Record<string, string> }).env
+      ?.VITE_BACKEND_ORIGIN || '')
+  )
+    .trim()
+    .replace(/\/+$/, '');
+  if (envOrigin) return envOrigin;
+  if (
+    typeof window !== 'undefined' &&
+    window.location?.hostname?.endsWith('.vercel.app') &&
+    !(globalThis as Record<string, unknown>).__vitest_worker__
+  ) {
+    return 'https://fablearc-backend.onrender.com';
+  }
+  return '';
+}
+
 async function cachedJsonFetch<T = unknown>(
   url: string,
   ttlMs: number,
@@ -896,8 +916,9 @@ async function cachedJsonFetch<T = unknown>(
     if (useServerProxy) {
       try {
         const authToken = getClientAuthToken();
+        const backendOrigin = getCloudBackendOrigin();
         const proxyResp = await fetch(
-          `/api/stremio-proxy?url=${encodeURIComponent(url)}`,
+          `${backendOrigin}/api/stremio-proxy?url=${encodeURIComponent(url)}`,
           {
             method: 'GET',
             headers: {
@@ -1439,12 +1460,16 @@ export async function probeMediaStream(
   try {
     const authToken = explicitToken ?? getClientAuthToken();
     const tokenQuery = authToken ? `&token=${encodeURIComponent(authToken)}` : '';
-    const resp = await fetch(`/api/media-probe?url=${encodeURIComponent(streamUrl)}${tokenQuery}`, {
-      headers: {
-        Accept: 'application/json',
-        ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+    const backendOrigin = getCloudBackendOrigin();
+    const resp = await fetch(
+      `${backendOrigin}/api/media-probe?url=${encodeURIComponent(streamUrl)}${tokenQuery}`,
+      {
+        headers: {
+          Accept: 'application/json',
+          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+        },
       },
-    });
+    );
     if (!resp.ok) return null;
     const data = (await resp.json()) as MediaProbeResponse;
     if (!data || !Array.isArray(data.audioTracks)) return null;
@@ -1466,13 +1491,8 @@ export function buildTranscodedStreamUrl(
   const roundedStart = Math.max(0, Math.floor(startSec));
   const authToken = explicitToken ?? getClientAuthToken();
   const tokenParam = authToken ? `&token=${encodeURIComponent(authToken)}` : '';
-  const envBackendOrigin = (
-    ((import.meta as unknown as { env?: Record<string, string> }).env
-      ?.VITE_BACKEND_ORIGIN || '')
-  )
-    .trim()
-    .replace(/\/+$/, '');
-  return `${envBackendOrigin}/api/media-stream?url=${encodeURIComponent(streamUrl)}&audioTrack=${audioTrackIndex}&start=${roundedStart}${tokenParam}`;
+  const backendOrigin = getCloudBackendOrigin();
+  return `${backendOrigin}/api/media-stream?url=${encodeURIComponent(streamUrl)}&audioTrack=${audioTrackIndex}&start=${roundedStart}${tokenParam}`;
 }
 
 /**
