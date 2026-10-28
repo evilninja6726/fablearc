@@ -1155,13 +1155,14 @@ export function registerStreamzApiMiddlewares(
       res.setHeader('Cache-Control', 'no-store');
       res.setHeader('X-Content-Type-Options', 'nosniff');
 
-      // Restrict CORS to trusted frontend origins (localhost, Vercel, Railway, Render, or configured FRONTEND_ORIGIN)
+      // Restrict CORS to trusted frontend origins (localhost, Vercel, Hugging Face, Railway, Render, or configured FRONTEND_ORIGIN)
       const reqOrigin = req.headers.origin;
       const configuredOrigin = (process.env.FRONTEND_ORIGIN || '').trim();
       if (
         typeof reqOrigin === 'string' &&
         (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(reqOrigin) ||
           /^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(reqOrigin) ||
+          /^https:\/\/[a-z0-9-]+\.hf\.space$/i.test(reqOrigin) ||
           /^https:\/\/[a-z0-9-]+\.up\.railway\.app$/i.test(reqOrigin) ||
           /^https:\/\/[a-z0-9-]+\.onrender\.com$/i.test(reqOrigin) ||
           reqOrigin.includes('ngrok-free.dev') ||

@@ -1,4 +1,13 @@
-# streamZ — Hardened Open-Source Desktop & Web Media Center
+---
+title: FABLEARC
+emoji: 🎬
+colorFrom: blue
+colorTo: cyan
+sdk: docker
+app_port: 7860
+---
+
+# FABLEARC — Hardened Open-Source Desktop & Web Media Center
 
 `streamZ` is a clean-room, security-hardened media center and private screening room built after reverse-engineering and auditing [`NuvioMedia/NuvioDesktop`](https://github.com/NuvioMedia/NuvioDesktop) with **REA (`rea-agents@6.7.0`)** and the **`security-review`** & **`frontend-design`** skills.
 

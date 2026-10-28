@@ -10,13 +10,13 @@ RUN npm install
 COPY . .
 RUN npm run build
 
-# Persistent directory for SQLite WAL database
-RUN mkdir -p /app/data
+# Persistent directory for SQLite WAL database (writable by Hugging Face Spaces uid=1000)
+RUN mkdir -p /app/data && chmod -R 777 /app/data
 ENV NODE_ENV=production
-ENV PORT=8080
+ENV PORT=7860
 ENV STREAMZ_DB_PATH=/app/data/streamz_commercial.sqlite
 
-EXPOSE 8080
+EXPOSE 7860
 
 # Starts Vite Production Preview Server with all /api/* and FFmpeg middlewares mounted
-CMD ["npx", "vite", "preview", "--host", "0.0.0.0"]
+CMD ["npx", "vite", "preview", "--host", "0.0.0.0", "--port", "7860"]
