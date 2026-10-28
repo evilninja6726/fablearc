@@ -809,6 +809,7 @@ export function registerStreamzApiMiddlewares(
     token?: string | null,
   ): Promise<number | null> => {
     if (!token) return null;
+    await activeDb().ensureHydratedFromTursoCloud();
     let uid = activeDb().resolveUserIdFromToken(token);
     if (uid) return uid;
     await activeDb().ensureHydratedFromTursoCloud(true);
@@ -1107,6 +1108,19 @@ export function registerStreamzApiMiddlewares(
         });
       }
       authLimiter.reset(rateKey);
+      // Single-device enforcement: terminate any active FFmpeg streams from the user's previous device/session
+      const uid = result.state.user.id;
+      const existingStreams = activeUserFfmpegStreams.get(uid);
+      if (existingStreams) {
+        for (const proc of existingStreams) {
+          try {
+            proc.kill('SIGKILL');
+          } catch {
+            // Ignore already-dead process
+          }
+        }
+        existingStreams.clear();
+      }
       sendJson(res, 200, result, {
         'Set-Cookie': `streamz_session=${encodeURIComponent(result.token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000`,
       });

@@ -768,13 +768,7 @@ export const App: React.FC = () => {
     };
   }, []);
 
-  const handleLogout = useCallback(() => {
-    if (authToken) {
-      fetch(buildApiUrl('/api/auth/logout'), {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${authToken}` },
-      }).catch(() => {});
-    }
+  const clearClientSessionState = useCallback(() => {
     try {
       localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
     } catch {}
@@ -788,7 +782,67 @@ export const App: React.FC = () => {
     setDossierItem(null);
     setPlayingSession(null);
     setAuthModalOpen(true);
-  }, [authToken]);
+  }, []);
+
+  const handleLogout = useCallback(() => {
+    if (authToken) {
+      fetch(buildApiUrl('/api/auth/logout'), {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${authToken}` },
+      }).catch(() => {});
+    }
+    clearClientSessionState();
+  }, [authToken, clearClientSessionState]);
+
+  // Single-device session enforcement: automatically log out this system if the user signs in on another device
+  useEffect(() => {
+    if (!authToken) return;
+    let cancelled = false;
+
+    const verifyActiveSession = () => {
+      if (cancelled) return;
+      fetch(buildApiUrl('/api/user/state'), {
+        headers: { Authorization: `Bearer ${authToken}` },
+      })
+        .then((resp) => {
+          if (resp.status === 401 && !cancelled) {
+            clearClientSessionState();
+          }
+        })
+        .catch(() => {
+          // Ignore transient network errors
+        });
+    };
+
+    const intervalId = window.setInterval(verifyActiveSession, 10_000);
+    const onFocus = () => verifyActiveSession();
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        verifyActiveSession();
+      }
+    };
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === AUTH_TOKEN_STORAGE_KEY && e.newValue !== authToken) {
+        if (!e.newValue) {
+          clearClientSessionState();
+        } else {
+          setAuthToken(e.newValue);
+        }
+      }
+    };
+
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    window.addEventListener('storage', onStorage);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      window.removeEventListener('storage', onStorage);
+    };
+  }, [authToken, clearClientSessionState]);
 
   const handleNavigateSection = useCallback(
     (targetNav: NavSection) => {

@@ -357,10 +357,13 @@ export class StreamZDatabase {
   private hydrationPromise: Promise<void> | null = null;
   private lastHydratedAtMs = 0;
   /**
-   * In-memory session cache (tokenHashHex -> { userId, expiresAt })
+   * In-memory session cache (tokenHashHex -> { userId, expiresAt, createdAtMs })
    * Eliminates repetitive `SELECT user_id, expires_at FROM sessions` DB reads on every API call.
    */
-  private sessionCache = new Map<string, { userId: number; expiresAt: string }>();
+  private sessionCache = new Map<
+    string,
+    { userId: number; expiresAt: string; createdAtMs?: number }
+  >();
 
   constructor(dbFilePath?: string) {
     const targetPath =
@@ -626,6 +629,7 @@ export class StreamZDatabase {
             }
           }
 
+          const validCloudSessionHashes = new Set<string>();
           const sessStmt = this.db.prepare(`
             INSERT OR REPLACE INTO sessions (token_hash, user_id, expires_at)
             VALUES (?, ?, ?)
@@ -634,6 +638,7 @@ export class StreamZDatabase {
             const hexHash = String(s[0] || '').toLowerCase();
             const uid = Number(s[1]);
             if (!/^[0-9a-f]{64}$/i.test(hexHash) || !validUserIds.has(uid)) continue;
+            validCloudSessionHashes.add(hexHash);
             const expStr = formatHumanDateTime(s[2] as string | number);
             try {
               sessStmt.run(Buffer.from(hexHash, 'hex'), uid, expStr);
@@ -643,6 +648,26 @@ export class StreamZDatabase {
               });
             } catch {
               // Skip orphaned session row
+            }
+          }
+
+          // Prune any local sessions that were revoked in Turso Cloud (e.g. single-device login on another host),
+          // while preserving brand-new local sessions (< 10s old) whose async cloud replication may still be in flight.
+          const nowMs = Date.now();
+          for (const [hexHash, cached] of this.sessionCache.entries()) {
+            if (
+              validUserIds.has(cached.userId) &&
+              !validCloudSessionHashes.has(hexHash) &&
+              (!cached.createdAtMs || nowMs - cached.createdAtMs > 10_000)
+            ) {
+              this.sessionCache.delete(hexHash);
+              try {
+                this.db
+                  .prepare('DELETE FROM sessions WHERE token_hash = ?')
+                  .run(Buffer.from(hexHash, 'hex'));
+              } catch {
+                // Ignore delete error
+              }
             }
           }
 
@@ -1652,6 +1677,14 @@ export class StreamZDatabase {
       Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 30,
     ); // 30 days
 
+    // Single-device login enforcement: revoke all previous sessions for this user before issuing the new token
+    this.db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
+    for (const [key, val] of this.sessionCache.entries()) {
+      if (val.userId === userId) {
+        this.sessionCache.delete(key);
+      }
+    }
+
     this.db
       .prepare(
         'INSERT OR REPLACE INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)',
@@ -1662,11 +1695,18 @@ export class StreamZDatabase {
     this.sessionCache.set(hashHex, {
       userId,
       expiresAt: expiresAtDateTime,
+      createdAtMs: Date.now(),
     });
-    this.replicateToTursoCloud(
-      'INSERT OR REPLACE INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)',
-      [hashHex, userId, expiresAtDateTime],
-    );
+    this.replicateBatchToTursoCloud([
+      {
+        sql: 'DELETE FROM sessions WHERE user_id = ?',
+        args: [userId],
+      },
+      {
+        sql: 'INSERT OR REPLACE INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)',
+        args: [hashHex, userId, expiresAtDateTime],
+      },
+    ]);
 
     return rawToken;
   }

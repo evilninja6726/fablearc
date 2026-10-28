@@ -243,28 +243,33 @@ describe('Strix-Style E2E & Security Audit Suite', () => {
       role: 'user',
     });
 
-    // Simulate a second session (e.g. another browser or stolen token)
+    // Primary session (`user.token`) works initially
+    const initialCheck = await fetch(`${ctx.baseUrl}/api/user/state`, {
+      headers: { Authorization: `Bearer ${user.token}` },
+    });
+    expect(initialCheck.status).toBe(200);
+
+    // Simulate logging in on a second system: single-device enforcement immediately revokes `user.token`!
     const secondLogin = ctx.db.loginUser({
       email: 'alice@streamz.com',
       password: 'AlicePassword1!',
     });
 
-    // Both tokens work initially
     const check1 = await fetch(`${ctx.baseUrl}/api/user/state`, {
       headers: { Authorization: `Bearer ${user.token}` },
     });
     const check2 = await fetch(`${ctx.baseUrl}/api/user/state`, {
       headers: { Authorization: `Bearer ${secondLogin.token}` },
     });
-    expect(check1.status).toBe(200);
+    expect(check1.status).toBe(401);
     expect(check2.status).toBe(200);
 
-    // Alice changes her password using her primary token (`user.token`)
+    // Alice changes her password using her active token (`secondLogin.token`)
     const pwdChangeResp = await fetch(`${ctx.baseUrl}/api/auth/change-password`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${user.token}`,
+        Authorization: `Bearer ${secondLogin.token}`,
       },
       body: JSON.stringify({
         currentPassword: 'AlicePassword1!',
@@ -273,15 +278,9 @@ describe('Strix-Style E2E & Security Audit Suite', () => {
     });
     expect(pwdChangeResp.status).toBe(200);
 
-    // `secondLogin.token` is immediately revoked in both SQLite and in-memory sessionCache!
-    const compromisedCheck = await fetch(`${ctx.baseUrl}/api/user/state`, {
-      headers: { Authorization: `Bearer ${secondLogin.token}` },
-    });
-    expect(compromisedCheck.status).toBe(401);
-
-    // Alice's active session (`user.token`) remains valid
+    // Alice's active session (`secondLogin.token`) remains valid after her own password change
     const activeCheck = await fetch(`${ctx.baseUrl}/api/user/state`, {
-      headers: { Authorization: `Bearer ${user.token}` },
+      headers: { Authorization: `Bearer ${secondLogin.token}` },
     });
     expect(activeCheck.status).toBe(200);
 
@@ -300,7 +299,7 @@ describe('Strix-Style E2E & Security Audit Suite', () => {
     expect(adminResetResp.status).toBe(200);
 
     const afterAdminReset = await fetch(`${ctx.baseUrl}/api/user/state`, {
-      headers: { Authorization: `Bearer ${user.token}` },
+      headers: { Authorization: `Bearer ${secondLogin.token}` },
     });
     expect(afterAdminReset.status).toBe(401);
   });
