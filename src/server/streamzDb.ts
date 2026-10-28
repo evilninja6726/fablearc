@@ -6,17 +6,92 @@ import path from 'node:path';
 const requireNode = createRequire(import.meta.url);
 type SqliteDatabaseSync = import('node:sqlite').DatabaseSync;
 
-function loadDatabaseSyncConstructor(): typeof import('node:sqlite').DatabaseSync {
-  try {
-    const mod = requireNode('node:sqlite') as typeof import('node:sqlite');
-    if (mod && typeof mod.DatabaseSync === 'function') {
-      return mod.DatabaseSync;
-    }
-  } catch {
-    // Fallback for Node < 22.5 (e.g. Render / Vercel Node 20 runtime)
+function normalizeWasmArgs(args: unknown[]): unknown[] {
+  if (args.length === 1 && Array.isArray(args[0])) {
+    return args[0];
   }
-  const betterSqlite3 = requireNode('better-sqlite3') as typeof import('node:sqlite').DatabaseSync;
-  return betterSqlite3;
+  return args.map((val) => {
+    if (val === undefined) return null;
+    if (Buffer.isBuffer(val)) {
+      return new Uint8Array(val.buffer, val.byteOffset, val.byteLength);
+    }
+    return val;
+  });
+}
+
+function createWasmDatabaseSyncCtor(): typeof import('node:sqlite').DatabaseSync {
+  const { Database: WasmDatabase } = requireNode('node-sqlite3-wasm') as {
+    Database: new (path: string) => {
+      exec: (sql: string) => void;
+      prepare: (sql: string) => {
+        run: (values?: unknown[]) => { changes: number; lastInsertRowid: number };
+        get: (values?: unknown[]) => unknown;
+        all: (values?: unknown[]) => unknown[];
+        finalize: () => void;
+      };
+      close: () => void;
+    };
+  };
+
+  return class WasmDatabaseSyncAdapter {
+    private wasmDb: InstanceType<typeof WasmDatabase>;
+    constructor(filePath: string) {
+      // On cloud containers (Render / Vercel), use in-memory SQLite backed by Turso Cloud
+      // to avoid container overlayfs file lock / WAL mmap issues.
+      const isCloudContainer = Boolean(process.env.RENDER || process.env.VERCEL);
+      this.wasmDb = new WasmDatabase(isCloudContainer ? ':memory:' : filePath);
+    }
+    exec(sql: string): void {
+      this.wasmDb.exec(sql);
+    }
+    prepare(sql: string) {
+      const wasmDb = this.wasmDb;
+      return {
+        run: (...args: unknown[]) => {
+          const stmt = wasmDb.prepare(sql);
+          try {
+            return stmt.run(normalizeWasmArgs(args));
+          } finally {
+            stmt.finalize();
+          }
+        },
+        get: (...args: unknown[]) => {
+          const stmt = wasmDb.prepare(sql);
+          try {
+            const res = stmt.get(normalizeWasmArgs(args));
+            return res === null ? undefined : res;
+          } finally {
+            stmt.finalize();
+          }
+        },
+        all: (...args: unknown[]) => {
+          const stmt = wasmDb.prepare(sql);
+          try {
+            return stmt.all(normalizeWasmArgs(args));
+          } finally {
+            stmt.finalize();
+          }
+        },
+      };
+    }
+    close(): void {
+      this.wasmDb.close();
+    }
+  } as unknown as typeof import('node:sqlite').DatabaseSync;
+}
+
+function loadDatabaseSyncConstructor(): typeof import('node:sqlite').DatabaseSync {
+  if (!process.env.RENDER && !process.env.VERCEL && !process.env.FORCE_WASM_SQLITE) {
+    try {
+      const mod = requireNode('node:sqlite') as typeof import('node:sqlite');
+      if (mod && typeof mod.DatabaseSync === 'function') {
+        return mod.DatabaseSync;
+      }
+    } catch {
+      // Fallback to pure WebAssembly SQLite on Node < 22.5
+    }
+  }
+  return createWasmDatabaseSyncCtor();
 }
 
 export type UserRole = 'admin' | 'user';
@@ -350,6 +425,7 @@ export class StreamZDatabase {
       'SELECT id, media_id, media_type, title, poster, background, rating_bp, release_info FROM media_catalog',
       'SELECT user_id, media_ref, episode_id, episode_label, pos_sec, dur_sec, updated_at FROM user_watch_history_v2',
       'SELECT user_id, media_ref, added_at FROM user_watchlist_v2',
+      'SELECT token_hash, user_id, expires_at FROM sessions',
     ];
 
     const requests: Array<Record<string, unknown>> = queries.map((sql) => ({
@@ -399,6 +475,7 @@ export class StreamZDatabase {
         const cloudCatalog = extractRows(3);
         const cloudHistory = extractRows(4);
         const cloudWatchlist = extractRows(5);
+        const cloudSessions = extractRows(6);
 
         this.db.exec('BEGIN IMMEDIATE TRANSACTION');
         try {
@@ -495,6 +572,21 @@ export class StreamZDatabase {
               Number(w[1]),
               formatHumanDateTime(w[2] as string | number),
             );
+          }
+
+          const sessStmt = this.db.prepare(`
+            INSERT OR REPLACE INTO sessions (token_hash, user_id, expires_at)
+            VALUES (?, ?, ?)
+          `);
+          for (const s of cloudSessions) {
+            const hexHash = String(s[0] || '');
+            if (!/^[0-9a-f]{64}$/i.test(hexHash)) continue;
+            const expStr = formatHumanDateTime(s[2] as string | number);
+            sessStmt.run(Buffer.from(hexHash, 'hex'), Number(s[1]), expStr);
+            this.sessionCache.set(hexHash.toLowerCase(), {
+              userId: Number(s[1]),
+              expiresAt: expStr,
+            });
           }
 
           this.db.exec('COMMIT');
@@ -1477,18 +1569,25 @@ export class StreamZDatabase {
       )
       .run(tokenHash, userId, expiresAtDateTime);
 
-    this.sessionCache.set(tokenHash.toString('hex'), {
+    const hashHex = tokenHash.toString('hex');
+    this.sessionCache.set(hashHex, {
       userId,
       expiresAt: expiresAtDateTime,
     });
+    this.replicateToTursoCloud(
+      'INSERT OR REPLACE INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)',
+      [hashHex, userId, expiresAtDateTime],
+    );
 
     return rawToken;
   }
 
   public revokeSession(token: string): void {
     const tokenHash = hashSessionToken(token);
-    this.sessionCache.delete(tokenHash.toString('hex'));
+    const hashHex = tokenHash.toString('hex');
+    this.sessionCache.delete(hashHex);
     this.db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(tokenHash);
+    this.replicateToTursoCloud('DELETE FROM sessions WHERE token_hash = ?', [hashHex]);
   }
 
   /**
@@ -1499,12 +1598,17 @@ export class StreamZDatabase {
     const retainHash = retainToken ? hashSessionToken(retainToken) : null;
     const retainHex = retainHash ? retainHash.toString('hex') : null;
 
-    if (retainHash) {
+    if (retainHash && retainHex) {
       this.db
         .prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash != ?')
         .run(userId, retainHash);
+      this.replicateToTursoCloud(
+        'DELETE FROM sessions WHERE user_id = ? AND token_hash != ?',
+        [userId, retainHex],
+      );
     } else {
       this.db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
+      this.replicateToTursoCloud('DELETE FROM sessions WHERE user_id = ?', [userId]);
     }
 
     for (const [key, val] of this.sessionCache.entries()) {

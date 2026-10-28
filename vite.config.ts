@@ -752,13 +752,14 @@ export function registerStreamzApiMiddlewares(
   });
 
   middlewares.use('/api/user/state', async (req, res) => {
-    const token = extractBearerToken(req);
-    const userId = activeDb().resolveUserIdFromToken(token);
-    if (!userId) {
-      sendJson(res, 401, { error: 'Unauthorized' });
-      return;
-    }
     try {
+      await activeDb().ensureHydratedFromTursoCloud();
+      const token = extractBearerToken(req);
+      const userId = activeDb().resolveUserIdFromToken(token);
+      if (!userId) {
+        sendJson(res, 401, { error: 'Unauthorized' });
+        return;
+      }
       const state = activeDb().getUserState(userId);
       sendJson(res, 200, state);
     } catch (err) {
@@ -934,7 +935,10 @@ export function registerStreamzApiMiddlewares(
       const urlObj = new URL(req.url || '', 'http://localhost');
       const targetUrl = (urlObj.searchParams.get('url') || '').trim();
       const token = extractBearerToken(req, urlObj);
-      const userId = activeDb().resolveUserIdFromToken(token);
+      if (token) {
+        await activeDb().ensureHydratedFromTursoCloud();
+      }
+      const userId = token ? activeDb().resolveUserIdFromToken(token) : null;
 
       const policy = evaluateStremioProxyUrlPolicy(targetUrl, Boolean(userId));
       if (!policy.allowed) {

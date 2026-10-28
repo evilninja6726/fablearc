@@ -142,11 +142,29 @@ export const AuthGatePage: React.FC<AuthGatePageProps> = ({
         }),
       });
 
-      const data = (await resp.json()) as {
+      const rawText = await resp.text();
+      let data: {
         token?: string;
         state?: UserStatePayload;
         error?: string;
-      };
+      } = {};
+      if (rawText.trim()) {
+        try {
+          data = JSON.parse(rawText) as typeof data;
+        } catch {
+          throw new Error(
+            resp.status >= 500
+              ? 'Backend server is waking up. Please try again in a few seconds.'
+              : 'Unable to sign in right now. Please try again.',
+          );
+        }
+      } else if (!resp.ok) {
+        throw new Error(
+          resp.status >= 500
+            ? 'Backend server is waking up. Please try again in a few seconds.'
+            : 'Invalid email or password.',
+        );
+      }
 
       if (!resp.ok || !data.token || !data.state) {
         throw new Error(data.error || 'Invalid email or password.');

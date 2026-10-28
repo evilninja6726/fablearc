@@ -1,8 +1,8 @@
 {
-  "name": "streamz",
+  "name": "fablearc",
   "version": "1.0.0",
   "private": true,
-  "description": "streamZ — A security-hardened, zero-blob, open-source desktop & web media center inspired by NuvioDesktop",
+  "description": "FABLEARC — Security-Hardened Cloud & Desktop Cinema Streaming Platform with 4K Multi-Audio FFmpeg Pipeline & 3NF Turso Cloud Replica",
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
@@ -18,11 +18,11 @@
     "node": ">=22.12.0"
   },
   "dependencies": {
-    "better-sqlite3": "^13.0.3",
     "ffmpeg-static": "^5.3.0",
     "ffprobe-static": "^3.1.0",
     "hls.js": "^1.5.17",
     "lucide-react": "^0.468.0",
+    "node-sqlite3-wasm": "^0.8.61",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
