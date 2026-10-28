@@ -893,6 +893,29 @@ export function buildApiUrl(path: string): string {
   return `${getCloudBackendOrigin()}${path}`;
 }
 
+function isDirectCorsFastPathUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    // pengu.uk does not send Access-Control-Allow-Origin headers and must use /api/stremio-proxy
+    if (host === 'pengu.uk' || host.endsWith('.pengu.uk')) {
+      return false;
+    }
+    // Public CORS-enabled catalog & metadata CDNs resolve in ~150ms directly from the browser
+    if (
+      host === 'v3-cinemeta.strem.io' ||
+      host.endsWith('.baby-beamup.club') ||
+      parsed.pathname.includes('/catalog/') ||
+      parsed.pathname.endsWith('/manifest.json')
+    ) {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 async function cachedJsonFetch<T = unknown>(
   url: string,
   ttlMs: number,
@@ -917,8 +940,25 @@ async function cachedJsonFetch<T = unknown>(
       window.location?.protocol?.startsWith('http') &&
       !(globalThis as Record<string, unknown>).__vitest_worker__;
 
+    const preferDirectCors = useServerProxy && isDirectCorsFastPathUrl(url);
     let response: Response | null = null;
-    if (useServerProxy) {
+
+    if (preferDirectCors) {
+      try {
+        const directResp = await fetch(url, {
+          method: 'GET',
+          headers: { Accept: 'application/json' },
+          signal,
+        });
+        if (directResp.ok) {
+          response = directResp;
+        }
+      } catch (err) {
+        if (signal?.aborted) throw err;
+      }
+    }
+
+    if (!response && useServerProxy) {
       try {
         const authToken = getClientAuthToken();
         const backendOrigin = getCloudBackendOrigin();

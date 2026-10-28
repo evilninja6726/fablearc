@@ -809,12 +809,10 @@ export function registerStreamzApiMiddlewares(
     token?: string | null,
   ): Promise<number | null> => {
     if (!token) return null;
-    await activeDb().ensureHydratedFromTursoCloud();
     let uid = activeDb().resolveUserIdFromToken(token);
-    if (!uid) {
-      await activeDb().ensureHydratedFromTursoCloud(true);
-      uid = activeDb().resolveUserIdFromToken(token);
-    }
+    if (uid) return uid;
+    await activeDb().ensureHydratedFromTursoCloud(true);
+    uid = activeDb().resolveUserIdFromToken(token);
     return uid;
   };
 
@@ -1319,9 +1317,13 @@ export function registerStreamzApiMiddlewares(
       const urlObj = new URL(req.url || '', 'http://localhost');
       const targetUrl = (urlObj.searchParams.get('url') || '').trim();
       const token = extractBearerToken(req, urlObj);
-      const userId = await resolveUserIdWithCloudSync(token);
 
-      const policy = evaluateStremioProxyUrlPolicy(targetUrl, Boolean(userId));
+      // Fast-path public manifests & catalogs without waiting on Turso Cloud session sync
+      let policy = evaluateStremioProxyUrlPolicy(targetUrl, false);
+      if (!policy.allowed && policy.statusCode === 401) {
+        const userId = await resolveUserIdWithCloudSync(token);
+        policy = evaluateStremioProxyUrlPolicy(targetUrl, Boolean(userId));
+      }
       if (!policy.allowed) {
         sendJson(res, policy.statusCode, { error: policy.reason });
         return;
@@ -1517,6 +1519,12 @@ export function registerStreamzApiMiddlewares(
         args.push('-noaccurate_seek', '-ss', String(startSec));
       }
 
+      const clientUa = String(req.headers['user-agent'] || '');
+      const preferFragmentedMp4 =
+        /(Firefox\/|iPhone|iPad|iPod)/i.test(clientUa) ||
+        (/Safari\//i.test(clientUa) &&
+          !/(Chrome|Chromium|CriOS|Edg|OPR)\//i.test(clientUa));
+
       args.push(
         '-i',
         loopbackInputUrl,
@@ -1544,17 +1552,33 @@ export function registerStreamzApiMiddlewares(
         '1024',
         '-flush_packets',
         '1',
-        '-cluster_size_limit',
-        '512k',
-        '-cluster_time_limit',
-        '250',
-        '-f',
-        'matroska',
-        'pipe:1',
       );
 
+      if (preferFragmentedMp4) {
+        args.push(
+          '-movflags',
+          'frag_keyframe+empty_moov+default_base_moof+faststart',
+          '-f',
+          'mp4',
+          'pipe:1',
+        );
+      } else {
+        args.push(
+          '-cluster_size_limit',
+          '512k',
+          '-cluster_time_limit',
+          '250',
+          '-f',
+          'matroska',
+          'pipe:1',
+        );
+      }
+
       res.statusCode = 200;
-      res.setHeader('Content-Type', 'video/x-matroska');
+      res.setHeader(
+        'Content-Type',
+        preferFragmentedMp4 ? 'video/mp4' : 'video/x-matroska',
+      );
       res.setHeader('Cache-Control', 'no-store');
       res.setHeader('X-Content-Type-Options', 'nosniff');
 
