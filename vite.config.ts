@@ -1,7 +1,14 @@
 import { defineConfig, Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
 import { ChildProcess, spawn } from 'node:child_process';
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import { randomBytes } from 'node:crypto';
+import {
+  createServer as createHttpServer,
+  request as httpRequest,
+  type IncomingMessage,
+  type ServerResponse,
+} from 'node:http';
+import { request as httpsRequest } from 'node:https';
 import ffmpegPath from 'ffmpeg-static';
 import {
   AdminUserSummary,
@@ -227,6 +234,7 @@ export async function unwrapMediaStreamUrl(initialUrl: string): Promise<string> 
   }
 
   let current = initialUrl;
+  let reachedReachableTarget = false;
   for (let hop = 0; hop < 5; hop++) {
     if (!isSafePublicUrl(current, false)) {
       throw new Error('Blocked unsafe redirect target');
@@ -243,6 +251,7 @@ export async function unwrapMediaStreamUrl(initialUrl: string): Promise<string> 
           throw new Error('Blocked unsafe embedded redirect target');
         }
         current = embeddedLink;
+        reachedReachableTarget = true;
         continue;
       }
     } catch (err) {
@@ -253,7 +262,7 @@ export async function unwrapMediaStreamUrl(initialUrl: string): Promise<string> 
 
     try {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 7000);
+      const timer = setTimeout(() => controller.abort(), 14000);
       const resp = await fetch(current, {
         method: 'GET',
         headers: {
@@ -265,6 +274,7 @@ export async function unwrapMediaStreamUrl(initialUrl: string): Promise<string> 
         signal: controller.signal,
       });
       clearTimeout(timer);
+      await resp.body?.cancel().catch(() => {});
 
       if (resp.status >= 300 && resp.status < 400) {
         const loc = resp.headers.get('location');
@@ -281,10 +291,15 @@ export async function unwrapMediaStreamUrl(initialUrl: string): Promise<string> 
             throw new Error('Blocked unsafe redirect target');
           }
           current = embedded;
+          reachedReachableTarget = true;
           break;
         }
         current = nextUrl;
+        reachedReachableTarget = true;
         continue;
+      }
+      if (resp.status >= 200 && resp.status < 300) {
+        reachedReachableTarget = true;
       }
       break;
     } catch (err) {
@@ -299,11 +314,291 @@ export async function unwrapMediaStreamUrl(initialUrl: string): Promise<string> 
     throw new Error('Blocked unsafe redirect target');
   }
 
-  resolvedUrlCache.set(initialUrl, {
-    url: current,
-    expiresAt: Date.now() + 5 * 60 * 1000,
-  });
+  if (current !== initialUrl || reachedReachableTarget) {
+    resolvedUrlCache.set(initialUrl, {
+      url: current,
+      expiresAt: Date.now() + 5 * 60 * 1000,
+    });
+  }
   return current;
+}
+
+/**
+ * Internal loopback HTTP range-forwarding gateway (`http://127.0.0.1:<port>/media/<id>`).
+ *
+ * Why this is essential on Linux cloud containers (Render / Railway / Docker):
+ * `ffmpeg-static` on Linux x64 (`ffmpeg-7.0.2-amd64-static`) is statically linked against Debian 10 `glibc 2.28`,
+ * which dynamically `dlopen()`s `libnss_dns.so.2` when resolving DNS hostnames (`getaddrinfo`).
+ * On modern Linux containers (`glibc 2.35+`), `libnss_dns` was merged into `libc.so.6` with a different ABI,
+ * causing `ffmpeg-static` to fail with `Failed to resolve hostname` on every remote URL while working on macOS.
+ *
+ * By pointing `ffmpeg -i` at `http://127.0.0.1:<port>/media/<token>` (numeric IPv4 loopback), `ffmpeg` never
+ * calls `getaddrinfo()` or GnuTLS, while Node.js handles DNS resolution, TLS SNI (Cloudflare R2 / Workers),
+ * safe 302 redirects, and full `Range: bytes=...` seeking for `.mkv`, `.mp4`, and `.m3u8` streams.
+ */
+const loopbackMediaRegistry = new Map<string, { url: string; expiresAt: number }>();
+let loopbackGatewayPort: number | null = null;
+let loopbackGatewayInitPromise: Promise<number> | null = null;
+
+function registerLoopbackTarget(targetUrl: string): string {
+  const now = Date.now();
+  if (loopbackMediaRegistry.size > 500) {
+    for (const [k, v] of loopbackMediaRegistry.entries()) {
+      if (v.expiresAt <= now) loopbackMediaRegistry.delete(k);
+    }
+  }
+  const id = randomBytes(12).toString('hex');
+  loopbackMediaRegistry.set(id, {
+    url: targetUrl,
+    expiresAt: now + 2 * 60 * 60 * 1000, // 2 hours
+  });
+  return id;
+}
+
+function forwardLoopbackMediaRequest(
+  targetUrl: string,
+  clientReq: IncomingMessage,
+  clientRes: ServerResponse,
+  gatewayPort: number,
+  hop = 0,
+): void {
+  if (hop > 5 || !isSafePublicUrl(targetUrl, false)) {
+    if (!clientRes.headersSent) {
+      clientRes.statusCode = 400;
+      clientRes.end('Blocked or excessive upstream redirect');
+    }
+    return;
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(targetUrl);
+  } catch {
+    if (!clientRes.headersSent) {
+      clientRes.statusCode = 400;
+      clientRes.end('Invalid upstream URL');
+    }
+    return;
+  }
+
+  const isHttps = parsed.protocol === 'https:';
+  const reqFn = isHttps ? httpsRequest : httpRequest;
+
+  const upHeaders: Record<string, string> = {
+    'User-Agent':
+      (typeof clientReq.headers['user-agent'] === 'string' &&
+        clientReq.headers['user-agent']) ||
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    Accept: '*/*',
+    Connection: 'keep-alive',
+  };
+  if (typeof clientReq.headers.range === 'string') {
+    upHeaders.Range = clientReq.headers.range;
+  }
+
+  const upReq = reqFn(
+    {
+      protocol: parsed.protocol,
+      hostname: parsed.hostname,
+      port: parsed.port || (isHttps ? 443 : 80),
+      path: `${parsed.pathname}${parsed.search}`,
+      method: clientReq.method === 'HEAD' ? 'HEAD' : 'GET',
+      headers: upHeaders,
+      ...(isHttps ? { servername: parsed.hostname } : {}),
+      timeout: 25_000,
+    },
+    (upRes) => {
+      const status = upRes.statusCode || 502;
+      if (status >= 300 && status < 400 && upRes.headers.location) {
+        upRes.resume();
+        try {
+          let nextUrl = new URL(upRes.headers.location, targetUrl).toString();
+          const parsedNext = new URL(nextUrl);
+          const embedded =
+            parsedNext.searchParams.get('link') || parsedNext.searchParams.get('url');
+          if (embedded && /^https?:\/\//i.test(embedded)) {
+            nextUrl = embedded;
+          }
+          forwardLoopbackMediaRequest(
+            nextUrl,
+            clientReq,
+            clientRes,
+            gatewayPort,
+            hop + 1,
+          );
+        } catch {
+          if (!clientRes.headersSent) {
+            clientRes.statusCode = 502;
+            clientRes.end('Invalid redirect location');
+          }
+        }
+        return;
+      }
+
+      const contentType = String(upRes.headers['content-type'] || '').toLowerCase();
+      const isM3u8 =
+        parsed.pathname.toLowerCase().endsWith('.m3u8') ||
+        contentType.includes('mpegurl');
+
+      if (isM3u8 && status === 200 && clientReq.method !== 'HEAD') {
+        const chunks: Buffer[] = [];
+        let totalLen = 0;
+        upRes.on('data', (chunk: Buffer) => {
+          totalLen += chunk.length;
+          if (totalLen <= 2 * 1024 * 1024) {
+            chunks.push(chunk);
+          }
+        });
+        upRes.on('end', () => {
+          const rawText = Buffer.concat(chunks).toString('utf8');
+          const rewritten = rawText
+            .split(/\r?\n/)
+            .map((line) => {
+              const trimmed = line.trim();
+              if (!trimmed) return line;
+              if (trimmed.startsWith('#')) {
+                return line.replace(/URI="([^"]+)"/g, (_m, uri: string) => {
+                  try {
+                    const abs = new URL(uri, targetUrl).toString();
+                    if (!isSafePublicUrl(abs, false)) return _m;
+                    const cid = registerLoopbackTarget(abs);
+                    return `URI="http://127.0.0.1:${gatewayPort}/media/${cid}.m3u8"`;
+                  } catch {
+                    return _m;
+                  }
+                });
+              }
+              try {
+                const abs = new URL(trimmed, targetUrl).toString();
+                if (!isSafePublicUrl(abs, false)) return line;
+                const cid = registerLoopbackTarget(abs);
+                const ext = abs.toLowerCase().includes('.m3u8') ? '.m3u8' : '.ts';
+                return `http://127.0.0.1:${gatewayPort}/media/${cid}${ext}`;
+              } catch {
+                return line;
+              }
+            })
+            .join('\n');
+          const buf = Buffer.from(rewritten, 'utf8');
+          if (!clientRes.headersSent) {
+            clientRes.statusCode = 200;
+            clientRes.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+            clientRes.setHeader('Content-Length', String(buf.length));
+            clientRes.end(buf);
+          }
+        });
+        upRes.on('error', () => {
+          if (!clientRes.headersSent) {
+            clientRes.statusCode = 502;
+            clientRes.end();
+          } else {
+            clientRes.destroy();
+          }
+        });
+        return;
+      }
+
+      if (!clientRes.headersSent) {
+        clientRes.statusCode = status;
+        for (const h of [
+          'content-type',
+          'content-length',
+          'content-range',
+          'accept-ranges',
+        ]) {
+          const val = upRes.headers[h];
+          if (val !== undefined) {
+            clientRes.setHeader(h, val);
+          }
+        }
+      }
+
+      upRes.pipe(clientRes);
+      upRes.on('error', () => {
+        clientRes.destroy();
+      });
+    },
+  );
+
+  upReq.on('timeout', () => {
+    upReq.destroy(new Error('Upstream socket timeout'));
+  });
+  upReq.on('error', () => {
+    if (!clientRes.headersSent) {
+      clientRes.statusCode = 502;
+      clientRes.end('Upstream connection failed');
+    } else {
+      clientRes.destroy();
+    }
+  });
+
+  clientReq.on('close', () => {
+    if (!upReq.destroyed) {
+      upReq.destroy();
+    }
+  });
+
+  upReq.end();
+}
+
+async function ensureLoopbackMediaGateway(): Promise<number> {
+  if (loopbackGatewayPort !== null) {
+    return loopbackGatewayPort;
+  }
+  if (loopbackGatewayInitPromise) {
+    return loopbackGatewayInitPromise;
+  }
+
+  loopbackGatewayInitPromise = new Promise<number>((resolve, reject) => {
+    const srv = createHttpServer((req, res) => {
+      const urlPath = (req.url || '').split('?')[0];
+      const match = urlPath.match(/^\/media\/([0-9a-f]{24})(?:\.[a-z0-9]+)?$/i);
+      if (!match) {
+        res.statusCode = 404;
+        res.end('Not found');
+        return;
+      }
+      const entry = loopbackMediaRegistry.get(match[1].toLowerCase());
+      if (!entry || entry.expiresAt <= Date.now()) {
+        loopbackMediaRegistry.delete(match[1].toLowerCase());
+        res.statusCode = 404;
+        res.end('Expired or unknown stream token');
+        return;
+      }
+      forwardLoopbackMediaRequest(
+        entry.url,
+        req,
+        res,
+        loopbackGatewayPort || 80,
+        0,
+      );
+    });
+
+    srv.on('error', (err) => {
+      loopbackGatewayInitPromise = null;
+      reject(err);
+    });
+
+    srv.listen(0, '127.0.0.1', () => {
+      const addr = srv.address();
+      if (addr && typeof addr === 'object' && addr.port) {
+        loopbackGatewayPort = addr.port;
+        srv.unref();
+        resolve(addr.port);
+      } else {
+        reject(new Error('Failed to bind loopback media gateway'));
+      }
+    });
+  });
+
+  return loopbackGatewayInitPromise;
+}
+
+async function createLoopbackMediaUrl(resolvedUrl: string): Promise<string> {
+  const port = await ensureLoopbackMediaGateway();
+  const id = registerLoopbackTarget(resolvedUrl);
+  const ext = resolvedUrl.toLowerCase().includes('.m3u8') ? '.m3u8' : '';
+  return `http://127.0.0.1:${port}/media/${id}${ext}`;
 }
 
 /**
@@ -499,7 +794,7 @@ export interface MiddlewareContainer {
   ) => void;
 }
 
-const MAX_ACTIVE_STREAMS_PER_USER = 2;
+const MAX_ACTIVE_STREAMS_PER_USER = 4;
 
 export function registerStreamzApiMiddlewares(
   rawMiddlewares: MiddlewareContainer,
@@ -1038,8 +1333,10 @@ export function registerStreamzApiMiddlewares(
         ttlSec = 3600; // 1 hour for manifests
       } else if (targetUrl.includes('/meta/')) {
         ttlSec = 1800; // 30 min for metadata
-      } else if (targetUrl.includes('/stream/') || targetUrl.includes('/subtitles/')) {
-        ttlSec = 600; // 10 min for streams & subtitles
+      } else if (targetUrl.includes('/stream/')) {
+        ttlSec = 90; // 90s for stream links so short-lived CDN tokens (e.g. pengu psig) never expire in cache
+      } else if (targetUrl.includes('/subtitles/')) {
+        ttlSec = 600; // 10 min for subtitles
       }
 
       const { data, cacheStatus } = await globalCache.getOrFetch<unknown>(
@@ -1083,46 +1380,58 @@ export function registerStreamzApiMiddlewares(
         return;
       }
 
-      const { data, cacheStatus } = await globalCache.getOrFetch<MediaProbeResult>(
-        `probe:${rawStreamUrl}`,
-        1800,
-        async () => {
-          const resolvedUrl = await unwrapMediaStreamUrl(rawStreamUrl);
-          return await new Promise<MediaProbeResult>((resolve) => {
-            const proc = spawn(
-              ffmpegPath!,
-              [
-                '-hide_banner',
-                '-protocol_whitelist',
-                'http,https,tcp,tls,crypto',
-                '-user_agent',
-                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-                '-analyzeduration',
-                '1800000',
-                '-probesize',
-                '2000000',
-                '-i',
-                resolvedUrl,
-              ],
-              { stdio: ['ignore', 'ignore', 'pipe'] },
-            );
+      const probeCacheKey = `probe:${rawStreamUrl}`;
+      const cachedProbe = globalCache.getSync<MediaProbeResult>(probeCacheKey);
+      let data: MediaProbeResult;
+      let cacheStatus: string;
 
-            let stderr = '';
-            const killTimer = setTimeout(() => {
-              proc.kill('SIGKILL');
-            }, 9000);
+      if (
+        cachedProbe &&
+        (cachedProbe.durationSec > 0 || cachedProbe.audioTracks.length > 0)
+      ) {
+        data = cachedProbe;
+        cacheStatus = 'HIT-L1';
+      } else {
+        const resolvedUrl = await unwrapMediaStreamUrl(rawStreamUrl);
+        const loopbackInputUrl = await createLoopbackMediaUrl(resolvedUrl);
+        data = await new Promise<MediaProbeResult>((resolve) => {
+          const proc = spawn(
+            ffmpegPath!,
+            [
+              '-hide_banner',
+              '-protocol_whitelist',
+              'file,http,https,tcp,tls,crypto,pipe,fd,data,hls',
+              '-user_agent',
+              'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+              '-analyzeduration',
+              '1800000',
+              '-probesize',
+              '2000000',
+              '-i',
+              loopbackInputUrl,
+            ],
+            { stdio: ['ignore', 'ignore', 'pipe'] },
+          );
 
-            proc.stderr.on('data', (chunk: Buffer) => {
-              stderr += chunk.toString('utf8');
-            });
+          let stderr = '';
+          const killTimer = setTimeout(() => {
+            proc.kill('SIGKILL');
+          }, 12000);
 
-            proc.on('close', () => {
-              clearTimeout(killTimer);
-              resolve(parseFfmpegProbeOutput(stderr, resolvedUrl));
-            });
+          proc.stderr.on('data', (chunk: Buffer) => {
+            stderr += chunk.toString('utf8');
           });
-        },
-      );
+
+          proc.on('close', () => {
+            clearTimeout(killTimer);
+            resolve(parseFfmpegProbeOutput(stderr, resolvedUrl));
+          });
+        });
+        cacheStatus = 'MISS';
+        if (data.durationSec > 0 || data.audioTracks.length > 0) {
+          globalCache.setSync(probeCacheKey, data, 1800);
+        }
+      }
 
       res.statusCode = 200;
       res.setHeader('Content-Type', 'application/json');
@@ -1163,6 +1472,7 @@ export function registerStreamzApiMiddlewares(
       }
 
       const resolvedUrl = await unwrapMediaStreamUrl(rawStreamUrl);
+      const loopbackInputUrl = await createLoopbackMediaUrl(resolvedUrl);
 
       // Enforce per-user concurrent FFmpeg process limit (evict oldest process if exceeding limit)
       let userProcs = activeUserFfmpegStreams.get(userId);
@@ -1183,8 +1493,10 @@ export function registerStreamzApiMiddlewares(
         '-hide_banner',
         '-loglevel',
         'error',
+        '-threads',
+        '2',
         '-protocol_whitelist',
-        'http,https,tcp,tls,crypto',
+        'file,http,https,tcp,tls,crypto,pipe,fd,data,hls',
         '-fflags',
         '+genpts+igndts+discardcorrupt',
         '-analyzeduration',
@@ -1207,7 +1519,7 @@ export function registerStreamzApiMiddlewares(
 
       args.push(
         '-i',
-        resolvedUrl,
+        loopbackInputUrl,
         '-map',
         '0:v:0',
         '-map',
