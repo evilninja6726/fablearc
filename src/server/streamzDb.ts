@@ -7,8 +7,16 @@ const requireNode = createRequire(import.meta.url);
 type SqliteDatabaseSync = import('node:sqlite').DatabaseSync;
 
 function loadDatabaseSyncConstructor(): typeof import('node:sqlite').DatabaseSync {
-  const mod = requireNode('node:sqlite') as typeof import('node:sqlite');
-  return mod.DatabaseSync;
+  try {
+    const mod = requireNode('node:sqlite') as typeof import('node:sqlite');
+    if (mod && typeof mod.DatabaseSync === 'function') {
+      return mod.DatabaseSync;
+    }
+  } catch {
+    // Fallback for Node < 22.5 (e.g. Render / Vercel Node 20 runtime)
+  }
+  const betterSqlite3 = requireNode('better-sqlite3') as typeof import('node:sqlite').DatabaseSync;
+  return betterSqlite3;
 }
 
 export type UserRole = 'admin' | 'user';
@@ -310,6 +318,256 @@ export class StreamZDatabase {
     const DatabaseSyncCtor = loadDatabaseSyncConstructor();
     this.db = new DatabaseSyncCtor(targetPath);
     this.initPragmasAndSchema();
+
+    if (targetPath !== ':memory:') {
+      this.seedDefaultAccountsIfEmpty();
+      this.hydrateFromTursoCloud();
+    }
+  }
+
+  private seedDefaultAccountsIfEmpty(): void {
+    try {
+      const countRow = this.db
+        .prepare('SELECT COUNT(*) AS c FROM users')
+        .get() as { c: number } | undefined;
+      if ((countRow?.c ?? 0) > 0) return;
+
+      const initialUsers = [
+        {
+          id: 4,
+          email: 'admin@streamz.com',
+          display_name: 'StreamZ Admin',
+          avatar_color: '#E11D48',
+          role: 'admin',
+          password_hash:
+            'scrypt$2370d7f5549359852a59e86eb2057a9d$99ed9df2b25ad4781af03fd752b8e7346d99f7761488f9f579c9921cb38669a9',
+          streaming_cfg: '',
+          created_at: '2026-10-23 12:34:39',
+        },
+        {
+          id: 5,
+          email: 'tanishq25@gmail.com',
+          display_name: 'Tanishq Dahiya',
+          avatar_color: '#2563EB',
+          role: 'user',
+          password_hash:
+            'scrypt$0af89ce34ad65efbc86aebc286e201c8$1b26ad7def6b6c61e7d4ade8f1342d0147f26539028612243ec0d0052bcebbc8',
+          streaming_cfg: '',
+          created_at: '2026-10-23 12:41:07',
+        },
+        {
+          id: 6,
+          email: 'alok.mishraa.dev@gmail.com',
+          display_name: 'Alok Mishra',
+          avatar_color: '#2563EB',
+          role: 'user',
+          password_hash:
+            'scrypt$ff1862203d72de76f8f5ca07bc983c29$874091675ae963e757755067b02b09c13f6d314f5e069c87b726c1458676c34b',
+          streaming_cfg: '',
+          created_at: '2026-10-23 17:12:15',
+        },
+      ];
+
+      const insertStmt = this.db.prepare(`
+        INSERT OR IGNORE INTO users (
+          id, email, display_name, avatar_color, role, password_hash, pwd_salt, pwd_hash, streaming_cfg, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+
+      for (const u of initialUsers) {
+        const [, saltHex, hashHex] = u.password_hash.split('$');
+        const saltBuf = Buffer.from(saltHex, 'hex');
+        const hashBuf = Buffer.from(hashHex, 'hex');
+        insertStmt.run(
+          u.id,
+          u.email,
+          u.display_name,
+          u.avatar_color,
+          u.role,
+          u.password_hash,
+          saltBuf,
+          hashBuf,
+          u.streaming_cfg,
+          u.created_at,
+        );
+      }
+    } catch {
+      // Ignore seed error
+    }
+  }
+
+  /**
+   * Pulls existing users, providers, watch history, and watchlist from Turso Cloud on startup
+   * so ephemeral cloud containers (like Render Free) automatically restore all user state.
+   */
+  private hydrateFromTursoCloud(): void {
+    if (!this.tursoUrl || !this.tursoAuthToken) return;
+    const httpEndpoint = this.tursoUrl
+      .replace(/^libsql:\/\//i, 'https://')
+      .replace(/\/+$/, '');
+
+    const queries = [
+      'SELECT id, email, display_name, avatar_color, role, password_hash, streaming_cfg, created_at FROM users',
+      'SELECT id, manifest_url, manifest_json, updated_at FROM provider_registry',
+      'SELECT user_id, provider_id, enabled, sort_order, custom_manifest_json FROM user_providers',
+      'SELECT id, media_id, media_type, title, poster, background, rating_bp, release_info FROM media_catalog',
+      'SELECT user_id, media_ref, episode_id, episode_label, pos_sec, dur_sec, updated_at FROM user_watch_history_v2',
+      'SELECT user_id, media_ref, added_at FROM user_watchlist_v2',
+    ];
+
+    const requests: Array<Record<string, unknown>> = queries.map((sql) => ({
+      type: 'execute',
+      stmt: { sql },
+    }));
+    requests.push({ type: 'close' });
+
+    fetch(`${httpEndpoint}/v2/pipeline`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${this.tursoAuthToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ requests }),
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((payload: unknown) => {
+        if (!payload || typeof payload !== 'object') return;
+        const results = (payload as { results?: Array<Record<string, unknown>> }).results;
+        if (!Array.isArray(results)) return;
+
+        const extractRows = (resIdx: number): Array<Array<string | number | null>> => {
+          const resItem = results[resIdx] as
+            | {
+                response?: {
+                  result?: {
+                    rows?: Array<Array<{ type: string; value?: string | number }>>;
+                  };
+                };
+              }
+            | undefined;
+          const rawRows = resItem?.response?.result?.rows;
+          if (!Array.isArray(rawRows)) return [];
+          return rawRows.map((row) =>
+            row.map((cell) => {
+              if (!cell || cell.type === 'null' || cell.value === undefined) return null;
+              if (cell.type === 'integer') return Number(cell.value);
+              return cell.value;
+            }),
+          );
+        };
+
+        const cloudUsers = extractRows(0);
+        const cloudProviders = extractRows(1);
+        const cloudUserProviders = extractRows(2);
+        const cloudCatalog = extractRows(3);
+        const cloudHistory = extractRows(4);
+        const cloudWatchlist = extractRows(5);
+
+        this.db.exec('BEGIN IMMEDIATE TRANSACTION');
+        try {
+          const userStmt = this.db.prepare(`
+            INSERT OR REPLACE INTO users (
+              id, email, display_name, avatar_color, role, password_hash, pwd_salt, pwd_hash, streaming_cfg, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `);
+          for (const u of cloudUsers) {
+            const pwdHashStr = String(u[5] || '');
+            const parts = pwdHashStr.split('$');
+            if (parts.length !== 3) continue;
+            userStmt.run(
+              Number(u[0]),
+              String(u[1]),
+              String(u[2]),
+              String(u[3] || '#E11D48'),
+              String(u[4] || 'user'),
+              pwdHashStr,
+              Buffer.from(parts[1], 'hex'),
+              Buffer.from(parts[2], 'hex'),
+              String(u[6] || ''),
+              formatHumanDateTime(u[7] as string | number),
+            );
+          }
+
+          const provStmt = this.db.prepare(`
+            INSERT OR REPLACE INTO provider_registry (id, manifest_url, manifest_json, updated_at)
+            VALUES (?, ?, ?, ?)
+          `);
+          for (const p of cloudProviders) {
+            provStmt.run(
+              Number(p[0]),
+              String(p[1]),
+              String(p[2]),
+              formatHumanDateTime(p[3] as string | number),
+            );
+          }
+
+          const upStmt = this.db.prepare(`
+            INSERT OR REPLACE INTO user_providers (user_id, provider_id, enabled, sort_order, custom_manifest_json)
+            VALUES (?, ?, ?, ?, ?)
+          `);
+          for (const up of cloudUserProviders) {
+            upStmt.run(
+              Number(up[0]),
+              Number(up[1]),
+              Number(up[2] ?? 1),
+              Number(up[3] ?? 0),
+              up[4] !== null ? String(up[4]) : null,
+            );
+          }
+
+          const catStmt = this.db.prepare(`
+            INSERT OR REPLACE INTO media_catalog (id, media_id, media_type, title, poster, background, rating_bp, release_info)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          `);
+          for (const c of cloudCatalog) {
+            catStmt.run(
+              Number(c[0]),
+              String(c[1]),
+              Number(c[2] ?? 0),
+              String(c[3]),
+              c[4] !== null ? String(c[4]) : null,
+              c[5] !== null ? String(c[5]) : null,
+              c[6] !== null ? Number(c[6]) : null,
+              c[7] !== null ? String(c[7]) : null,
+            );
+          }
+
+          const histStmt = this.db.prepare(`
+            INSERT OR REPLACE INTO user_watch_history_v2 (user_id, media_ref, episode_id, episode_label, pos_sec, dur_sec, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+          `);
+          for (const h of cloudHistory) {
+            histStmt.run(
+              Number(h[0]),
+              Number(h[1]),
+              h[2] !== null ? String(h[2]) : null,
+              h[3] !== null ? String(h[3]) : null,
+              Number(h[4] ?? 0),
+              Number(h[5] ?? 0),
+              formatHumanDateTime(h[6] as string | number),
+            );
+          }
+
+          const wlStmt = this.db.prepare(`
+            INSERT OR REPLACE INTO user_watchlist_v2 (user_id, media_ref, added_at)
+            VALUES (?, ?, ?)
+          `);
+          for (const w of cloudWatchlist) {
+            wlStmt.run(
+              Number(w[0]),
+              Number(w[1]),
+              formatHumanDateTime(w[2] as string | number),
+            );
+          }
+
+          this.db.exec('COMMIT');
+        } catch {
+          this.db.exec('ROLLBACK');
+        }
+      })
+      .catch(() => {
+        // Ignore cloud hydration network errors
+      });
   }
 
   /**
