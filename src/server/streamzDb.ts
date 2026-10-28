@@ -4,8 +4,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const requireNode = createRequire(import.meta.url);
-const { DatabaseSync } = requireNode('node:sqlite') as typeof import('node:sqlite');
 type SqliteDatabaseSync = import('node:sqlite').DatabaseSync;
+
+function loadDatabaseSyncConstructor(): typeof import('node:sqlite').DatabaseSync {
+  const mod = requireNode('node:sqlite') as typeof import('node:sqlite');
+  return mod.DatabaseSync;
+}
 
 export type UserRole = 'admin' | 'user';
 
@@ -303,7 +307,8 @@ export class StreamZDatabase {
     this.tursoUrl = (process.env.TURSO_DATABASE_URL || '').trim() || null;
     this.tursoAuthToken = (process.env.TURSO_AUTH_TOKEN || '').trim() || null;
 
-    this.db = new DatabaseSync(targetPath);
+    const DatabaseSyncCtor = loadDatabaseSyncConstructor();
+    this.db = new DatabaseSyncCtor(targetPath);
     this.initPragmasAndSchema();
   }
 
