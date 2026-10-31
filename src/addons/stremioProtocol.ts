@@ -290,11 +290,11 @@ export function extractStreamQualityInfo(
 }
 
 /**
- * Sorts Stremio streams first by quality, then by multi-audio priority:
+ * Sorts Stremio streams first by resolution tier, then by increasing file size within each resolution tier:
  * 1. Non-promotional playable streams first (direct -> magnet -> youtube -> external)
  * 2. Decreasing resolution qualityScore (2160p/4K -> 1440p -> 1080p -> 720p -> 480p -> 360p)
- * 3. Multi-Audio / Dual-Audio priority within the same resolution tier (Multi-Audio -> Dual Audio -> Single Audio)
- * 4. Decreasing file size / bitrate within the same resolution & audio tier
+ * 3. Increasing file size within the same resolution tier (least size first -> increasing until tier is done)
+ * 4. Multi-Audio / Dual-Audio priority when file sizes are equal or unspecified
  */
 export function sortStreamsByDecreasingQuality(
   streams: StremioStreamItem[],
@@ -320,15 +320,19 @@ export function sortStreamsByDecreasingQuality(
     const scoreB = b.qualityScore ?? 0;
     if (scoreB !== scoreA) return scoreB - scoreA;
 
-    // 2. Priority to Multi-Audio / Dual-Audio within the same quality tier
+    // 2. Increasing file size within the same quality tier (least size first -> increasing)
+    const sizeA = a.sizeBytes ?? 0;
+    const sizeB = b.sizeBytes ?? 0;
+    if (sizeA > 0 && sizeB > 0 && sizeA !== sizeB) {
+      return sizeA - sizeB;
+    }
+    if (sizeA > 0 && sizeB === 0) return -1;
+    if (sizeB > 0 && sizeA === 0) return 1;
+
+    // 3. Priority to Multi-Audio / Dual-Audio when sizes are equal
     const audioA = a.audioScore ?? (a.isMultiAudio ? 1 : 0);
     const audioB = b.audioScore ?? (b.isMultiAudio ? 1 : 0);
     if (audioB !== audioA) return audioB - audioA;
-
-    // 3. Decreasing file size / bitrate
-    const sizeA = a.sizeBytes ?? 0;
-    const sizeB = b.sizeBytes ?? 0;
-    if (sizeB !== sizeA) return sizeB - sizeA;
 
     return 0;
   });

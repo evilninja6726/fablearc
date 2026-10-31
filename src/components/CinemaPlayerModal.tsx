@@ -522,42 +522,78 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     };
   }, [activeVideoId]);
 
+  const [probedStreamUrl, setProbedStreamUrl] = useState<string | null>(null);
+
   // Probe embedded multi-language audio tracks and container duration whenever activeStream changes
   useEffect(() => {
     if (!activeStream || activeStream.kind !== 'direct' || !activeStream.url) {
       setProbedAudioTracks([]);
       setProbedDurationSec(0);
+      setProbedStreamUrl(null);
       return;
     }
 
+    const streamUrl = activeStream.url;
     const isM3u8 =
-      activeStream.isHls || activeStream.url.toLowerCase().includes('.m3u8');
-    setUseFfmpegAudioEngine(!isM3u8);
+      activeStream.isHls || streamUrl.toLowerCase().includes('.m3u8');
+    if (isM3u8) {
+      setUseFfmpegAudioEngine(false);
+      setProbedAudioTracks([]);
+      setProbedDurationSec(0);
+      setSelectedAudioTrackIndex(0);
+      setProbingAudio(false);
+      setProbedStreamUrl(streamUrl);
+      return;
+    }
 
     let cancelled = false;
     setProbingAudio(true);
     setProbedAudioTracks([]);
     setSelectedAudioTrackIndex(0);
 
-    probeMediaStream(activeStream.url)
+    probeMediaStream(streamUrl)
       .then((probe) => {
-        if (cancelled || !probe) return;
-        if (probe.durationSec > 0) {
-          setProbedDurationSec(probe.durationSec);
-        }
-        if (probe.audioTracks.length > 0) {
-          // Sort tracks with English first, then Hindi, then any other language
-          const sortedTracks = sortAudioTracksByLanguagePriority(probe.audioTracks);
-          setProbedAudioTracks(sortedTracks);
-          // Automatically prefer the top-priority language track (English -> Hindi -> first track)
-          const preferredTrack = sortedTracks[0];
-          if (preferredTrack && preferredTrack.audioIndex !== 0) {
-            setSelectedAudioTrackIndex(preferredTrack.audioIndex);
+        if (cancelled) return;
+        let shouldUseFfmpeg = true;
+        if (probe) {
+          if (probe.durationSec > 0) {
+            setProbedDurationSec(probe.durationSec);
+          }
+          if (probe.audioTracks.length > 0) {
+            // Sort tracks with English first, then Hindi, then any other language
+            const sortedTracks = sortAudioTracksByLanguagePriority(probe.audioTracks);
+            setProbedAudioTracks(sortedTracks);
+            // Automatically prefer the top-priority language track (English -> Hindi -> first track)
+            const preferredTrack = sortedTracks[0];
+            const targetAudioIndex = preferredTrack ? preferredTrack.audioIndex : 0;
+            setSelectedAudioTrackIndex(targetAudioIndex);
+
+            // Direct-play from source CDN (0 MB backend bandwidth) when default track 0 already uses a browser-native audio codec
+            const isBrowserNativeAudio = Boolean(
+              preferredTrack &&
+                /^(aac|mp3|mp4a|opus|vorbis|flac)$/i.test(preferredTrack.codec),
+            );
+            const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
+            const isSafariOrIos =
+              /(iPhone|iPad|iPod)/i.test(ua) ||
+              (/Safari\//i.test(ua) && !/(Chrome|Chromium|CriOS|Edg|OPR)\//i.test(ua));
+            const isMkvContainer = /\.mkv(\?|$)/i.test(streamUrl);
+            if (
+              targetAudioIndex === 0 &&
+              isBrowserNativeAudio &&
+              !(isSafariOrIos && isMkvContainer)
+            ) {
+              shouldUseFfmpeg = false;
+            }
           }
         }
+        setUseFfmpegAudioEngine(shouldUseFfmpeg);
       })
       .finally(() => {
-        if (!cancelled) setProbingAudio(false);
+        if (!cancelled) {
+          setProbingAudio(false);
+          setProbedStreamUrl(streamUrl);
+        }
       });
 
     return () => {
@@ -658,6 +694,11 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     const isM3u8Playlist =
       activeStream.isHls || activeStream.url.toLowerCase().includes('.m3u8');
 
+    // Wait for /api/media-probe to finish selecting the optimal audio track & playback mode before opening the stream
+    if (!isM3u8Playlist && probedStreamUrl !== activeStream.url) {
+      return;
+    }
+
     if (isM3u8Playlist && Hls.isSupported() && !useFfmpegAudioEngine) {
       const hls = new Hls({ enableWorker: true });
       hlsRef.current = hls;
@@ -714,7 +755,14 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         hlsRef.current = null;
       }
     };
-  }, [activeStream, seekNonce, selectedAudioTrackIndex, streamStartOffsetSec, useFfmpegAudioEngine]);
+  }, [
+    activeStream,
+    probedStreamUrl,
+    seekNonce,
+    selectedAudioTrackIndex,
+    streamStartOffsetSec,
+    useFfmpegAudioEngine,
+  ]);
 
   // Switch audio track / language while preserving exact playback position & last video frame
   const handleSelectAudioTrack = (trackIndex: number) => {
@@ -1051,7 +1099,10 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                 const isHlsStream =
                   Boolean(activeStream?.isHls) ||
                   Boolean(activeStream?.url?.toLowerCase().includes('.m3u8'));
-                if (useFfmpegAudioEngine && isHlsStream) {
+                if (!useFfmpegAudioEngine && !isHlsStream) {
+                  // Direct CDN playback failed (e.g. container/codec quirk) -> fall back to FFmpeg remux pipeline
+                  setUseFfmpegAudioEngine(true);
+                } else if (useFfmpegAudioEngine && isHlsStream) {
                   // Fall back to direct HLS.js playback only for .m3u8 playlists
                   setUseFfmpegAudioEngine(false);
                 } else {

@@ -183,8 +183,8 @@ describe('Default Addons & Decreasing Stream Quality Sorting', () => {
     const sorted = sortStreamsByDecreasingQuality(unsorted);
     expect(sorted.map((s) => s.id)).toEqual([
       '4k-remux',
-      '1080p-large',
       '1080p-small',
+      '1080p-large',
       '720p-stream',
       'promo-1',
     ]);
@@ -193,7 +193,7 @@ describe('Default Addons & Decreasing Stream Quality Sorting', () => {
     expect(sorted[3].qualityBadge).toBe('720p HD');
   });
 
-  it('sorts streams first by quality tier and prioritizes Multi-Audio / Dual-Audio within each quality tier', () => {
+  it('sorts streams first by quality tier and by increasing file size within each quality tier', () => {
     const streams: StremioStreamItem[] = [
       {
         id: '1080p-single-large',
@@ -260,14 +260,14 @@ describe('Default Addons & Decreasing Stream Quality Sorting', () => {
     expect(sorted.map((s) => s.id)).toEqual([
       '4k-multi-audio',
       '4k-single',
-      '1080p-multi-audio',
       '1080p-dual-audio',
+      '1080p-multi-audio',
       '1080p-single-large',
     ]);
     expect(sorted[0].isMultiAudio).toBe(true);
     expect(sorted[0].audioBadge).toBe('Multi-Audio');
-    expect(sorted[2].audioBadge).toBe('Multi-Audio');
-    expect(sorted[3].audioBadge).toBe('Dual Audio');
+    expect(sorted[2].audioBadge).toBe('Dual Audio');
+    expect(sorted[3].audioBadge).toBe('Multi-Audio');
   });
 });
 

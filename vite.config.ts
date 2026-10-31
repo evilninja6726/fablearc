@@ -1540,6 +1540,8 @@ export function registerStreamzApiMiddlewares(
           !/(Chrome|Chromium|CriOS|Edg|OPR)\//i.test(clientUa));
 
       args.push(
+        '-readrate',
+        '1.35',
         '-i',
         loopbackInputUrl,
         '-map',
@@ -1553,7 +1555,7 @@ export function registerStreamzApiMiddlewares(
         '-ac',
         '2',
         '-b:a',
-        '192k',
+        '128k',
         '-af',
         'aresample=async=1:first_pts=0',
         '-avoid_negative_ts',
