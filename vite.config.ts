@@ -1481,6 +1481,10 @@ export function registerStreamzApiMiddlewares(
         0,
         parseFloat(urlObj.searchParams.get('start') || '0') || 0,
       );
+      const streamMode = (urlObj.searchParams.get('mode') || 'muxed')
+        .trim()
+        .toLowerCase();
+      const isAudioOnly = streamMode === 'audio';
 
       if (!rawStreamUrl || !isSafePublicUrl(rawStreamUrl, false) || !ffmpegPath) {
         sendJson(res, 400, { error: 'Invalid or blocked stream request' });
@@ -1539,39 +1543,32 @@ export function registerStreamzApiMiddlewares(
         (/Safari\//i.test(clientUa) &&
           !/(Chrome|Chromium|CriOS|Edg|OPR)\//i.test(clientUa));
 
-      args.push(
-        '-readrate',
-        '1.35',
-        '-i',
-        loopbackInputUrl,
-        '-map',
-        '0:v:0',
-        '-map',
-        `0:a:${audioTrack}?`,
-        '-c:v',
-        'copy',
-        '-c:a',
-        'aac',
-        '-ac',
-        '2',
-        '-b:a',
-        '128k',
-        '-af',
-        'aresample=async=1:first_pts=0',
-        '-avoid_negative_ts',
-        'make_zero',
-        '-muxdelay',
-        '0',
-        '-muxpreload',
-        '0',
-        '-max_muxing_queue_size',
-        '1024',
-        '-flush_packets',
-        '1',
-      );
-
-      if (preferFragmentedMp4) {
+      if (isAudioOnly) {
+        // Audio-only transcode mode (-vn): strips 100% of video bytes from Render HTTP responses (~99% bandwidth reduction)
         args.push(
+          '-readrate',
+          '1.35',
+          '-i',
+          loopbackInputUrl,
+          '-vn',
+          '-map',
+          `0:a:${audioTrack}?`,
+          '-c:a',
+          'aac',
+          '-ac',
+          '2',
+          '-b:a',
+          '128k',
+          '-af',
+          'aresample=async=1:first_pts=0',
+          '-avoid_negative_ts',
+          'make_zero',
+          '-muxdelay',
+          '0',
+          '-muxpreload',
+          '0',
+          '-flush_packets',
+          '1',
           '-movflags',
           'frag_keyframe+empty_moov+default_base_moof+faststart',
           '-f',
@@ -1580,20 +1577,65 @@ export function registerStreamzApiMiddlewares(
         );
       } else {
         args.push(
-          '-cluster_size_limit',
-          '512k',
-          '-cluster_time_limit',
-          '250',
-          '-f',
-          'matroska',
-          'pipe:1',
+          '-readrate',
+          '1.35',
+          '-i',
+          loopbackInputUrl,
+          '-map',
+          '0:v:0',
+          '-map',
+          `0:a:${audioTrack}?`,
+          '-c:v',
+          'copy',
+          '-c:a',
+          'aac',
+          '-ac',
+          '2',
+          '-b:a',
+          '128k',
+          '-af',
+          'aresample=async=1:first_pts=0',
+          '-avoid_negative_ts',
+          'make_zero',
+          '-muxdelay',
+          '0',
+          '-muxpreload',
+          '0',
+          '-max_muxing_queue_size',
+          '1024',
+          '-flush_packets',
+          '1',
         );
+
+        if (preferFragmentedMp4) {
+          args.push(
+            '-movflags',
+            'frag_keyframe+empty_moov+default_base_moof+faststart',
+            '-f',
+            'mp4',
+            'pipe:1',
+          );
+        } else {
+          args.push(
+            '-cluster_size_limit',
+            '512k',
+            '-cluster_time_limit',
+            '250',
+            '-f',
+            'matroska',
+            'pipe:1',
+          );
+        }
       }
 
       res.statusCode = 200;
       res.setHeader(
         'Content-Type',
-        preferFragmentedMp4 ? 'video/mp4' : 'video/x-matroska',
+        isAudioOnly
+          ? 'audio/mp4'
+          : preferFragmentedMp4
+            ? 'video/mp4'
+            : 'video/x-matroska',
       );
       res.setHeader('Cache-Control', 'no-store');
       res.setHeader('X-Content-Type-Options', 'nosniff');

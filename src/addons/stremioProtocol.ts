@@ -1536,12 +1536,14 @@ export function buildTranscodedStreamUrl(
   audioTrackIndex = 0,
   startSec = 0,
   explicitToken?: string,
+  mode: 'muxed' | 'audio' = 'muxed',
 ): string {
   const roundedStart = Math.max(0, Math.floor(startSec));
   const authToken = explicitToken ?? getClientAuthToken();
   const tokenParam = authToken ? `&token=${encodeURIComponent(authToken)}` : '';
+  const modeParam = mode === 'audio' ? '&mode=audio' : '';
   const backendOrigin = getCloudBackendOrigin();
-  return `${backendOrigin}/api/media-stream?url=${encodeURIComponent(streamUrl)}&audioTrack=${audioTrackIndex}&start=${roundedStart}${tokenParam}`;
+  return `${backendOrigin}/api/media-stream?url=${encodeURIComponent(streamUrl)}&audioTrack=${audioTrackIndex}&start=${roundedStart}${modeParam}${tokenParam}`;
 }
 
 /**
