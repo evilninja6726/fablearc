@@ -215,7 +215,15 @@ const LANGUAGE_NAMES: Record<string, string> = {
   und: 'Original / Default',
 };
 
-const resolvedUrlCache = new Map<string, { url: string; expiresAt: number }>();
+const resolvedUrlCache = new Map<
+  string,
+  { url: string; unreachable: boolean; expiresAt: number }
+>();
+
+export interface UnwrappedStreamTarget {
+  url: string;
+  unreachable: boolean;
+}
 
 /**
  * Follows redirects up to 5 hops and unwraps intermediate link-generator pages
@@ -223,18 +231,21 @@ const resolvedUrlCache = new Map<string, { url: string; expiresAt: number }>();
  * into the underlying direct media stream URL.
  * Validates every hop against `isSafePublicUrl` to block 302 redirect SSRF attacks.
  */
-export async function unwrapMediaStreamUrl(initialUrl: string): Promise<string> {
+export async function unwrapMediaStreamUrlWithStatus(
+  initialUrl: string,
+): Promise<UnwrappedStreamTarget> {
   if (!isSafePublicUrl(initialUrl, false)) {
     throw new Error('Blocked unsafe stream URL');
   }
 
   const cached = resolvedUrlCache.get(initialUrl);
   if (cached && cached.expiresAt > Date.now()) {
-    return cached.url;
+    return { url: cached.url, unreachable: cached.unreachable };
   }
 
   let current = initialUrl;
   let reachedReachableTarget = false;
+  let unreachable = false;
   for (let hop = 0; hop < 5; hop++) {
     if (!isSafePublicUrl(current, false)) {
       throw new Error('Blocked unsafe redirect target');
@@ -296,10 +307,19 @@ export async function unwrapMediaStreamUrl(initialUrl: string): Promise<string> 
         }
         current = nextUrl;
         reachedReachableTarget = true;
+        if (
+          parsedNext.searchParams.has('X-Amz-Signature') ||
+          parsedNext.hostname.endsWith('.r2.cloudflarestorage.com')
+        ) {
+          break;
+        }
         continue;
       }
       if (resp.status >= 200 && resp.status < 300) {
         reachedReachableTarget = true;
+        unreachable = false;
+      } else if (resp.status === 404 || resp.status === 410 || resp.status === 451) {
+        unreachable = true;
       }
       break;
     } catch (err) {
@@ -314,13 +334,23 @@ export async function unwrapMediaStreamUrl(initialUrl: string): Promise<string> 
     throw new Error('Blocked unsafe redirect target');
   }
 
-  if (current !== initialUrl || reachedReachableTarget) {
+  if (/\/signin\.mp4(\?|$)/i.test(current)) {
+    unreachable = true;
+  }
+
+  if (current !== initialUrl || reachedReachableTarget || unreachable) {
     resolvedUrlCache.set(initialUrl, {
       url: current,
+      unreachable,
       expiresAt: Date.now() + 5 * 60 * 1000,
     });
   }
-  return current;
+  return { url: current, unreachable };
+}
+
+export async function unwrapMediaStreamUrl(initialUrl: string): Promise<string> {
+  const res = await unwrapMediaStreamUrlWithStatus(initialUrl);
+  return res.url;
 }
 
 /**
@@ -696,6 +726,7 @@ export interface MediaProbeResult {
   durationSec: number;
   videoCodec: string;
   audioTracks: ProbedAudioTrack[];
+  unreachable?: boolean;
 }
 
 function parseFfmpegProbeOutput(stderr: string, resolvedUrl: string): MediaProbeResult {
@@ -1403,49 +1434,76 @@ export function registerStreamzApiMiddlewares(
 
       if (
         cachedProbe &&
-        (cachedProbe.durationSec > 0 || cachedProbe.audioTracks.length > 0)
+        (cachedProbe.durationSec > 0 ||
+          cachedProbe.audioTracks.length > 0 ||
+          cachedProbe.unreachable)
       ) {
         data = cachedProbe;
         cacheStatus = 'HIT-L1';
       } else {
-        const resolvedUrl = await unwrapMediaStreamUrl(rawStreamUrl);
-        const loopbackInputUrl = await createLoopbackMediaUrl(resolvedUrl);
-        data = await new Promise<MediaProbeResult>((resolve) => {
-          const proc = spawn(
-            ffmpegPath!,
-            [
-              '-hide_banner',
-              '-protocol_whitelist',
-              'file,http,https,tcp,tls,crypto,pipe,fd,data,hls',
-              '-user_agent',
-              'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-              '-analyzeduration',
-              '1800000',
-              '-probesize',
-              '2000000',
-              '-i',
-              loopbackInputUrl,
-            ],
-            { stdio: ['ignore', 'ignore', 'pipe'] },
-          );
+        const unwrapped = await unwrapMediaStreamUrlWithStatus(rawStreamUrl);
+        const resolvedUrl = unwrapped.url;
+        if (unwrapped.unreachable) {
+          data = {
+            resolvedUrl,
+            durationSec: 0,
+            videoCodec: 'none',
+            audioTracks: [],
+            unreachable: true,
+          };
+          cacheStatus = 'MISS-UNREACHABLE';
+          globalCache.setSync(probeCacheKey, data, 300);
+        } else {
+          const loopbackInputUrl = await createLoopbackMediaUrl(resolvedUrl);
+          data = await new Promise<MediaProbeResult>((resolve) => {
+            const proc = spawn(
+              ffmpegPath!,
+              [
+                '-hide_banner',
+                '-protocol_whitelist',
+                'file,http,https,tcp,tls,crypto,pipe,fd,data,hls',
+                '-user_agent',
+                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+                '-analyzeduration',
+                '1800000',
+                '-probesize',
+                '2000000',
+                '-i',
+                loopbackInputUrl,
+              ],
+              { stdio: ['ignore', 'ignore', 'pipe'] },
+            );
 
-          let stderr = '';
-          const killTimer = setTimeout(() => {
-            proc.kill('SIGKILL');
-          }, 12000);
+            let stderr = '';
+            const killTimer = setTimeout(() => {
+              proc.kill('SIGKILL');
+            }, 12000);
 
-          proc.stderr.on('data', (chunk: Buffer) => {
-            stderr += chunk.toString('utf8');
+            proc.stderr.on('data', (chunk: Buffer) => {
+              stderr += chunk.toString('utf8');
+            });
+
+            proc.on('close', () => {
+              clearTimeout(killTimer);
+              const parsed = parseFfmpegProbeOutput(stderr, resolvedUrl);
+              if (
+                parsed.durationSec === 0 &&
+                parsed.audioTracks.length === 0 &&
+                /HTTP error (403|404|410|451|500|502|503)|Server returned 4\d\d|Invalid data found/i.test(
+                  stderr,
+                )
+              ) {
+                parsed.unreachable = true;
+              }
+              resolve(parsed);
+            });
           });
-
-          proc.on('close', () => {
-            clearTimeout(killTimer);
-            resolve(parseFfmpegProbeOutput(stderr, resolvedUrl));
-          });
-        });
-        cacheStatus = 'MISS';
-        if (data.durationSec > 0 || data.audioTracks.length > 0) {
-          globalCache.setSync(probeCacheKey, data, 1800);
+          cacheStatus = 'MISS';
+          if (data.durationSec > 0 || data.audioTracks.length > 0) {
+            globalCache.setSync(probeCacheKey, data, 1800);
+          } else if (data.unreachable) {
+            globalCache.setSync(probeCacheKey, data, 300);
+          }
         }
       }
 
@@ -1481,10 +1539,6 @@ export function registerStreamzApiMiddlewares(
         0,
         parseFloat(urlObj.searchParams.get('start') || '0') || 0,
       );
-      const streamMode = (urlObj.searchParams.get('mode') || 'muxed')
-        .trim()
-        .toLowerCase();
-      const isAudioOnly = streamMode === 'audio';
 
       if (!rawStreamUrl || !isSafePublicUrl(rawStreamUrl, false) || !ffmpegPath) {
         sendJson(res, 400, { error: 'Invalid or blocked stream request' });
@@ -1537,96 +1591,35 @@ export function registerStreamzApiMiddlewares(
         args.push('-noaccurate_seek', '-ss', String(startSec));
       }
 
-      const clientUa = String(req.headers['user-agent'] || '');
-      const preferFragmentedMp4 =
-        /(Firefox\/|iPhone|iPad|iPod)/i.test(clientUa) ||
-        (/Safari\//i.test(clientUa) &&
-          !/(Chrome|Chromium|CriOS|Edg|OPR)\//i.test(clientUa));
-
-      if (isAudioOnly) {
-        // Real-time streaming MP3 (-vn): flushes every 25ms with zero video bytes (~99% Render bandwidth reduction)
-        args.push(
-          '-i',
-          loopbackInputUrl,
-          '-vn',
-          '-map',
-          `0:a:${audioTrack}?`,
-          '-c:a',
-          'libmp3lame',
-          '-ac',
-          '2',
-          '-b:a',
-          '128k',
-          '-af',
-          'aresample=async=1:first_pts=0',
-          '-write_xing',
-          '0',
-          '-flush_packets',
-          '1',
-          '-f',
-          'mp3',
-          'pipe:1',
-        );
-      } else {
-        args.push(
-          '-i',
-          loopbackInputUrl,
-          '-map',
-          '0:v:0',
-          '-map',
-          `0:a:${audioTrack}?`,
-          '-c:v',
-          'copy',
-          '-c:a',
-          'aac',
-          '-ac',
-          '2',
-          '-b:a',
-          '192k',
-          '-af',
-          'aresample=async=1:first_pts=0',
-          '-avoid_negative_ts',
-          'make_zero',
-          '-muxdelay',
-          '0',
-          '-muxpreload',
-          '0',
-          '-max_muxing_queue_size',
-          '1024',
-          '-flush_packets',
-          '1',
-        );
-
-        if (preferFragmentedMp4) {
-          args.push(
-            '-movflags',
-            'frag_keyframe+empty_moov+default_base_moof+faststart',
-            '-f',
-            'mp4',
-            'pipe:1',
-          );
-        } else {
-          args.push(
-            '-cluster_size_limit',
-            '512k',
-            '-cluster_time_limit',
-            '250',
-            '-f',
-            'matroska',
-            'pipe:1',
-          );
-        }
-      }
+      // Strictly enforce Audio-Only (-vn) streaming MP3 output on the server:
+      // Guarantees zero video bytes ever leave Render HTTP Responses (~0.96 MB/min = ~99.5% bandwidth reduction)
+      // while flushing MP3 audio frames every 25ms with zero container buffering.
+      args.push(
+        '-i',
+        loopbackInputUrl,
+        '-vn',
+        '-map',
+        `0:a:${audioTrack}?`,
+        '-c:a',
+        'libmp3lame',
+        '-ac',
+        '2',
+        '-b:a',
+        '128k',
+        '-af',
+        'aresample=async=1:first_pts=0',
+        '-write_xing',
+        '0',
+        '-flush_packets',
+        '1',
+        '-f',
+        'mp3',
+        'pipe:1',
+      );
 
       res.statusCode = 200;
-      res.setHeader(
-        'Content-Type',
-        isAudioOnly
-          ? 'audio/mpeg'
-          : preferFragmentedMp4
-            ? 'video/mp4'
-            : 'video/x-matroska',
-      );
+      res.setHeader('Content-Type', 'audio/mpeg');
+      res.setHeader('X-Stream-Mode', 'audio-only');
       res.setHeader('Cache-Control', 'no-store');
       res.setHeader('X-Content-Type-Options', 'nosniff');
 

@@ -772,4 +772,62 @@ describe('Strix-Style E2E & Security Audit Suite', () => {
     expect(stylesCss).toContain('@media (max-width: 768px)');
     expect(stylesCss).toContain('@media (max-width: 480px)');
   });
+
+  it('E2E Flow #9: Zero-Video-Bandwidth Split Playback Architecture & Audio Master-Clock Verification', async () => {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const rootDir = path.resolve(__dirname, '..');
+
+    const cinemaPlayerTsx = fs.readFileSync(
+      path.join(rootDir, 'src/components/CinemaPlayerModal.tsx'),
+      'utf8',
+    );
+    const viteConfigTs = fs.readFileSync(
+      path.join(rootDir, 'vite.config.ts'),
+      'utf8',
+    );
+    const { buildTranscodedStreamUrl } = await import(
+      '../src/addons/stremioProtocol'
+    );
+
+    // 1. Verify buildTranscodedStreamUrl defaults to mode=audio
+    const generatedStreamUrl = buildTranscodedStreamUrl(
+      'https://cdn.example.com/movie.mkv',
+      1,
+      120,
+      'test-token',
+    );
+    expect(generatedStreamUrl).toContain('mode=audio');
+    expect(generatedStreamUrl).toContain('audioTrack=1');
+    expect(generatedStreamUrl).toContain('start=120');
+
+    // 2. Verify CinemaPlayerModal never routes <video> through /api/media-stream or falls back to muxed video proxying
+    expect(cinemaPlayerTsx).not.toContain('forceMuxedFallback');
+    expect(cinemaPlayerTsx).not.toContain('isMuxedFfmpegMode');
+    expect(cinemaPlayerTsx).toContain('SILENT_WAV_DATA_URI');
+    expect(cinemaPlayerTsx).toContain('syncSplitPlayback');
+    expect(cinemaPlayerTsx).toContain('audioBlockedByBrowser');
+
+    // 3. Verify vite.config.ts /api/media-stream strictly enforces -vn audio/mpeg and never copies video streams
+    expect(viteConfigTs).toContain("res.setHeader('Content-Type', 'audio/mpeg')");
+    expect(viteConfigTs).toContain("res.setHeader('X-Stream-Mode', 'audio-only')");
+    expect(viteConfigTs).not.toContain("'video/x-matroska'");
+
+    // 4. Verify live E2E /api/media-stream endpoint returns audio/mpeg and X-Stream-Mode: audio-only even if mode=muxed is passed
+    const { token } = ctx.db.registerUser({
+      displayName: 'Stream Tester',
+      email: 'streamtester@fablearc.test',
+      password: 'ValidPass123!',
+    });
+
+    const controller = new AbortController();
+    const streamResp = await fetch(
+      `${ctx.baseUrl}/api/media-stream?url=${encodeURIComponent('https://example.com/nonexistent-video.mkv')}&audioTrack=0&start=0&mode=muxed&token=${encodeURIComponent(token)}`,
+      { signal: controller.signal },
+    );
+    expect(streamResp.status).toBe(200);
+    expect(streamResp.headers.get('content-type')).toBe('audio/mpeg');
+    expect(streamResp.headers.get('x-stream-mode')).toBe('audio-only');
+    controller.abort();
+  });
 });

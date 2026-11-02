@@ -1508,13 +1508,24 @@ export interface MediaProbeResponse {
   durationSec: number;
   videoCodec: string;
   audioTracks: ProbedAudioTrack[];
+  unreachable?: boolean;
 }
+
+const clientProbeCache = new Map<
+  string,
+  { data: MediaProbeResponse; expiresAt: number }
+>();
 
 export async function probeMediaStream(
   streamUrl: string,
   explicitToken?: string,
 ): Promise<MediaProbeResponse | null> {
   try {
+    const cached = clientProbeCache.get(streamUrl);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.data;
+    }
+
     const authToken = explicitToken ?? getClientAuthToken();
     const tokenQuery = authToken ? `&token=${encodeURIComponent(authToken)}` : '';
     const backendOrigin = getCloudBackendOrigin();
@@ -1530,10 +1541,15 @@ export async function probeMediaStream(
     if (!resp.ok) return null;
     const data = (await resp.json()) as MediaProbeResponse;
     if (!data || !Array.isArray(data.audioTracks)) return null;
-    return {
+    const normalized: MediaProbeResponse = {
       ...data,
       audioTracks: sortAudioTracksByLanguagePriority(data.audioTracks),
     };
+    clientProbeCache.set(streamUrl, {
+      data: normalized,
+      expiresAt: Date.now() + 10 * 60 * 1000,
+    });
+    return normalized;
   } catch {
     return null;
   }
@@ -1544,7 +1560,7 @@ export function buildTranscodedStreamUrl(
   audioTrackIndex = 0,
   startSec = 0,
   explicitToken?: string,
-  mode: 'muxed' | 'audio' = 'muxed',
+  mode: 'audio' | 'muxed' = 'audio',
 ): string {
   const roundedStart = Math.max(0, Math.floor(startSec));
   const authToken = explicitToken ?? getClientAuthToken();

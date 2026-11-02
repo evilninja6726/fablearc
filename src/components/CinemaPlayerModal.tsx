@@ -213,6 +213,10 @@ const CROP_OPTIONS: Array<{
   },
 ];
 
+// 44-byte silent PCM WAV used to bless/unlock HTMLAudioElement on initial mount gesture
+const SILENT_WAV_DATA_URI =
+  'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
+
 export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
   media,
   addons,
@@ -226,6 +230,8 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const directVideoLoadedUrlRef = useRef<string | null>(null);
+  const userPausedRef = useRef<boolean>(false);
+  const audioUnlockedRef = useRef<boolean>(false);
   const freezeCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const hlsRef = useRef<Hls | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -260,7 +266,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
   const [selectedAudioTrackIndex, setSelectedAudioTrackIndex] = useState<number>(0);
   const [probingAudio, setProbingAudio] = useState(false);
   const [useFfmpegAudioEngine, setUseFfmpegAudioEngine] = useState<boolean>(true);
-  const [forceMuxedFallback, setForceMuxedFallback] = useState<boolean>(false);
+  const [audioBlockedByBrowser, setAudioBlockedByBrowser] = useState<boolean>(false);
   const [resolvedDirectUrl, setResolvedDirectUrl] = useState<string | null>(null);
   const [probedStreamUrl, setProbedStreamUrl] = useState<string | null>(null);
   const [streamStartOffsetSec, setStreamStartOffsetSec] = useState<number>(
@@ -478,7 +484,32 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
   useEffect(() => {
     let cancelled = false;
 
+    const initialTargetId =
+      media.type === 'series' && (initialEpisode ?? media.videos[0])?.id
+        ? (initialEpisode ?? media.videos[0])!.id
+        : media.imdbId || media.id;
+
     const loadStreams = async () => {
+      if (
+        initialStreams &&
+        initialStreams.length > 0 &&
+        activeVideoId === initialTargetId
+      ) {
+        const sortedInitial = sortStreamsByDecreasingQuality(initialStreams);
+        setStreams(sortedInitial);
+        setActiveStream((prev) => {
+          if (prev) return prev;
+          if (initialStream) return initialStream;
+          return (
+            sortedInitial.find((s) => s.kind === 'direct' && !s.isPromo) ??
+            sortedInitial.find((s) => s.kind === 'youtube') ??
+            sortedInitial[0] ??
+            null
+          );
+        });
+        return;
+      }
+
       setLoadingStreams(true);
       try {
         const resolved = await fetchStreamsFromAddons(
@@ -527,36 +558,146 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     };
   }, [activeVideoId]);
 
+  // Bless/unlock HTMLAudioElement on initial mount gesture so async audio.play() after /api/media-probe is never blocked by Autoplay Policy
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio || audioUnlockedRef.current) return;
+    try {
+      audio.src = SILENT_WAV_DATA_URI;
+      audio.muted = false;
+      audio.volume = 0.01;
+      const playPromise = audio.play();
+      if (playPromise !== undefined) {
+        playPromise
+          .then(() => {
+            audioUnlockedRef.current = true;
+            if (audio.src === SILENT_WAV_DATA_URI) {
+              audio.pause();
+            }
+          })
+          .catch(() => {});
+      }
+    } catch {
+      // Ignore if environment does not support data URI audio preview
+    }
+  }, []);
+
+  // Automatic one-tap/key recovery if browser blocked unmuted <audio> autoplay
+  useEffect(() => {
+    if (!audioBlockedByBrowser) return;
+    const resumeBlockedAudio = () => {
+      const audio = audioRef.current;
+      const video = videoRef.current;
+      if (audio) {
+        audio.muted = isMuted;
+        audio.volume = volume;
+        audio
+          .play()
+          .then(() => {
+            audioUnlockedRef.current = true;
+            setAudioBlockedByBrowser(false);
+            if (video && video.paused && !userPausedRef.current) {
+              video.play().catch(() => {});
+            }
+          })
+          .catch(() => {});
+      }
+    };
+    window.addEventListener('pointerdown', resumeBlockedAudio, { capture: true });
+    window.addEventListener('keydown', resumeBlockedAudio, { capture: true });
+    window.addEventListener('touchstart', resumeBlockedAudio, { capture: true });
+    return () => {
+      window.removeEventListener('pointerdown', resumeBlockedAudio, { capture: true });
+      window.removeEventListener('keydown', resumeBlockedAudio, { capture: true });
+      window.removeEventListener('touchstart', resumeBlockedAudio, { capture: true });
+    };
+  }, [audioBlockedByBrowser, isMuted, volume]);
+
   const isSplitAudioMode = Boolean(
     useFfmpegAudioEngine &&
-      !forceMuxedFallback &&
-      resolvedDirectUrl &&
-      resolvedDirectUrl.startsWith('https://') &&
       activeStream?.kind === 'direct' &&
       !activeStream.isHls &&
       !activeStream.url?.toLowerCase().includes('.m3u8'),
   );
-  const isMuxedFfmpegMode = Boolean(useFfmpegAudioEngine && !isSplitAudioMode);
+
+  // Master-Slave Lockstep Synchronizer: keeps <video> (direct CDN, 0 MB on Render) locked to <audio> (128k MP3 from Render)
+  const syncSplitPlayback = useCallback(() => {
+    if (!isSplitAudioMode || userPausedRef.current) return;
+    const video = videoRef.current;
+    const audio = audioRef.current;
+    if (!video || !audio) return;
+
+    const videoReady = video.readyState >= 2;
+    const audioReady = audio.readyState >= 2;
+
+    if (videoReady && audioReady) {
+      const expectedVideoSec = streamStartOffsetSec + audio.currentTime;
+      if (
+        !video.seeking &&
+        Number.isFinite(expectedVideoSec) &&
+        expectedVideoSec >= 0 &&
+        Math.abs(video.currentTime - expectedVideoSec) > 0.42
+      ) {
+        try {
+          video.currentTime = expectedVideoSec;
+        } catch {
+          // Ignore if video metadata is still settling
+        }
+      }
+
+      if (audio.paused) {
+        audio.muted = isMuted;
+        audio.volume = volume;
+        audio
+          .play()
+          .then(() => {
+            audioUnlockedRef.current = true;
+            setAudioBlockedByBrowser(false);
+          })
+          .catch((err) => {
+            if (
+              err &&
+              (err.name === 'NotAllowedError' ||
+                /interact|gesture|permission/i.test(String(err.message || '')))
+            ) {
+              setAudioBlockedByBrowser(true);
+            }
+          });
+      }
+
+      if (video.paused) {
+        video.muted = true;
+        video.play().catch(() => {});
+      }
+
+      setIsBuffering(false);
+      setHasStartedPlayback(true);
+      setHasFreezeFrame(false);
+    } else {
+      setIsBuffering(true);
+      if (!videoReady && !audio.paused) {
+        audio.pause();
+      }
+      if (!audioReady && !video.paused) {
+        video.pause();
+      }
+    }
+  }, [isMuted, isSplitAudioMode, streamStartOffsetSec, volume]);
 
   // Probe embedded multi-language audio tracks and container duration whenever activeStream changes
   useEffect(() => {
     directVideoLoadedUrlRef.current = null;
+    userPausedRef.current = false;
+    setAudioBlockedByBrowser(false);
     if (!activeStream || activeStream.kind !== 'direct' || !activeStream.url) {
       setProbedAudioTracks([]);
       setProbedDurationSec(0);
       setResolvedDirectUrl(null);
       setProbedStreamUrl(null);
-      setForceMuxedFallback(false);
       return;
     }
 
     const streamUrl = activeStream.url;
-    const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
-    const isSafariOrIos =
-      /(iPhone|iPad|iPod)/i.test(ua) ||
-      (/Safari\//i.test(ua) && !/(Chrome|Chromium|CriOS|Edg|OPR)\//i.test(ua));
-    const isMkvContainer = /\.mkv(\?|$)/i.test(streamUrl);
-    setForceMuxedFallback(isSafariOrIos && isMkvContainer);
     setResolvedDirectUrl(null);
 
     const isM3u8 =
@@ -580,22 +721,34 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     probeMediaStream(streamUrl)
       .then((probe) => {
         if (cancelled) return;
-        let shouldUseFfmpeg = true;
         const targetCdnUrl =
           probe?.resolvedUrl && /^https?:\/\//i.test(probe.resolvedUrl)
             ? probe.resolvedUrl
             : streamUrl;
-        setResolvedDirectUrl(targetCdnUrl);
 
-        // If unwrapped CDN URL is plain HTTP (e.g. http://usa7-as04.shegu.net), HTTPS pages block direct mixed-content video
+        // 1. Auto-skip dead (404 / 451 / signin.mp4) upstream servers immediately
+        if (
+          probe?.unreachable ||
+          /\/signin\.mp4(\?|$)/i.test(targetCdnUrl) ||
+          (probe && probe.durationSec === 0 && probe.audioTracks.length === 0)
+        ) {
+          switchToNextStream('Server offline or file removed');
+          return;
+        }
+
+        // 2. Auto-skip plain HTTP servers (e.g. http://usa7-as04.shegu.net) on HTTPS pages so we never proxy 20 GB video through Render
         const isInsecureHttpCdn =
           typeof window !== 'undefined' &&
           window.location?.protocol === 'https:' &&
           targetCdnUrl.startsWith('http://');
         if (isInsecureHttpCdn) {
-          setForceMuxedFallback(true);
+          switchToNextStream('Skipped insecure HTTP server');
+          return;
         }
 
+        setResolvedDirectUrl(targetCdnUrl);
+
+        let shouldUseFfmpeg = true;
         if (probe) {
           if (probe.durationSec > 0) {
             setProbedDurationSec(probe.durationSec);
@@ -609,24 +762,21 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
             const targetAudioIndex = preferredTrack ? preferredTrack.audioIndex : 0;
             setSelectedAudioTrackIndex(targetAudioIndex);
 
-            // Direct-play from source CDN (0 MB backend bandwidth) when default track 0 already uses a browser-native audio codec
+            // Direct-play from source CDN (0 MB Render bandwidth) when default track 0 already uses a browser-native audio codec
             const isBrowserNativeAudio = Boolean(
               preferredTrack &&
                 /^(aac|mp3|mp4a|opus|vorbis|flac)$/i.test(preferredTrack.codec),
             );
-            if (
-              targetAudioIndex === 0 &&
-              isBrowserNativeAudio &&
-              !isInsecureHttpCdn &&
-              !(isSafariOrIos && isMkvContainer)
-            ) {
+            if (targetAudioIndex === 0 && isBrowserNativeAudio) {
               shouldUseFfmpeg = false;
             }
           }
         }
         setUseFfmpegAudioEngine(shouldUseFfmpeg);
+        setProbingAudio(false);
+        setProbedStreamUrl(streamUrl);
       })
-      .finally(() => {
+      .catch(() => {
         if (!cancelled) {
           setProbingAudio(false);
           setProbedStreamUrl(streamUrl);
@@ -636,7 +786,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [activeStream]);
+  }, [activeStream, switchToNextStream]);
 
   // Download live SRT/VTT content when a subtitle track is selected
   useEffect(() => {
@@ -713,7 +863,8 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     [externalPlayer, activeStream, media.name],
   );
 
-  // Load direct stream via Split Direct-Video + Audio-Only MP3 FFmpeg Pipeline, Muxed Fallback, HLS.js, or native HTML5 video
+  // Load direct stream via Split Direct-Video + Audio-Only MP3 FFmpeg Pipeline, HLS.js, or native HTML5 video
+  // Note: <video> NEVER streams from /api/media-stream, guaranteeing 0 MB of video bandwidth on Render!
   useEffect(() => {
     const video = videoRef.current;
     const audio = audioRef.current;
@@ -765,6 +916,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       // Split Direct-Video + Real-Time MP3 Audio-Only Transcode:
       // 1. <video> streams 4K/1080p video directly from the unwrapped CDN URL (0 MB Render bandwidth!)
       // 2. <audio> streams 128 kbps MP3 audio (-vn) from Render (~0.11 GB per 2-hour movie!)
+      // 3. <video> waits for <audio> via syncSplitPlayback() so both start in exact lockstep!
       video.muted = true;
       video.playbackRate = playbackSpeed;
       if (directVideoLoadedUrlRef.current !== effectiveCdnUrl) {
@@ -778,21 +930,24 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
               streamStartOffsetSec > 0 &&
               Math.abs(video.currentTime - streamStartOffsetSec) > 1
             ) {
-              video.currentTime = streamStartOffsetSec;
+              try {
+                video.currentTime = streamStartOffsetSec;
+              } catch {
+                // Ignore if not yet seekable
+              }
             }
-            video.play().catch(() => {
-              setIsPlaying(false);
-            });
+            syncSplitPlayback();
           },
           { once: true },
         );
       } else {
         if (Math.abs(video.currentTime - streamStartOffsetSec) > 1.5) {
-          video.currentTime = streamStartOffsetSec;
+          try {
+            video.currentTime = streamStartOffsetSec;
+          } catch {
+            // Ignore
+          }
         }
-        video.play().catch(() => {
-          setIsPlaying(false);
-        });
       }
 
       if (audio) {
@@ -808,30 +963,22 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         audio.volume = volume;
         audio.playbackRate = playbackSpeed;
         audio.load();
-        audio.play().catch(() => {});
+        audio
+          .play()
+          .then(() => {
+            audioUnlockedRef.current = true;
+            setAudioBlockedByBrowser(false);
+          })
+          .catch((err) => {
+            if (
+              err &&
+              (err.name === 'NotAllowedError' ||
+                /interact|gesture|permission/i.test(String(err.message || '')))
+            ) {
+              setAudioBlockedByBrowser(true);
+            }
+          });
       }
-    } else if (useFfmpegAudioEngine) {
-      if (audio) {
-        audio.pause();
-        audio.removeAttribute('src');
-        audio.load();
-      }
-      directVideoLoadedUrlRef.current = null;
-      const transcodedUrl = buildTranscodedStreamUrl(
-        effectiveCdnUrl,
-        selectedAudioTrackIndex,
-        streamStartOffsetSec,
-        undefined,
-        'muxed',
-      );
-      video.src = seekNonce > 0 ? `${transcodedUrl}&_sn=${seekNonce}` : transcodedUrl;
-      video.muted = isMuted;
-      video.volume = volume;
-      video.playbackRate = playbackSpeed;
-      video.load();
-      video.play().catch(() => {
-        setIsPlaying(false);
-      });
     } else {
       if (audio) {
         audio.pause();
@@ -877,11 +1024,18 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
 
   // Switch audio track / language while preserving exact playback position & last video frame
   const handleSelectAudioTrack = (trackIndex: number) => {
-    if (trackIndex === selectedAudioTrackIndex && useFfmpegAudioEngine) return;
+    if (trackIndex === selectedAudioTrackIndex) return;
     captureVideoFrameSnapshot();
+    userPausedRef.current = false;
     setStreamStartOffsetSec(Math.max(0, Math.floor(currentTimeSec)));
     setSelectedAudioTrackIndex(trackIndex);
-    setUseFfmpegAudioEngine(true);
+    const chosenTrack = probedAudioTracks.find((t) => t.audioIndex === trackIndex);
+    const canPlayChosenTrackNatively = Boolean(
+      trackIndex === 0 &&
+        chosenTrack &&
+        /^(aac|mp3|mp4a|opus|vorbis|flac)$/i.test(chosenTrack.codec),
+    );
+    setUseFfmpegAudioEngine(!canPlayChosenTrackNatively);
     if (hlsRef.current) {
       hlsRef.current.audioTrack = trackIndex;
     }
@@ -891,18 +1045,31 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     const video = videoRef.current;
     const audio = audioRef.current;
     if (!video || activeStream?.kind !== 'direct') return;
-    if (video.paused) {
-      video.play().catch(() => {});
+    if (video.paused && (!isSplitAudioMode || !audio || audio.paused)) {
+      userPausedRef.current = false;
       if (isSplitAudioMode && audio) {
-        audio.play().catch(() => {});
+        audio.muted = isMuted;
+        audio.volume = volume;
+        audio
+          .play()
+          .then(() => {
+            audioUnlockedRef.current = true;
+            setAudioBlockedByBrowser(false);
+          })
+          .catch(() => {});
+        video.muted = true;
+        video.play().catch(() => {});
+      } else {
+        video.play().catch(() => {});
       }
     } else {
+      userPausedRef.current = true;
       video.pause();
       if (isSplitAudioMode && audio) {
         audio.pause();
       }
     }
-  }, [activeStream?.kind, isSplitAudioMode]);
+  }, [activeStream?.kind, isMuted, isSplitAudioMode, volume]);
 
   const seekTo = useCallback(
     (nextSec: number) => {
@@ -910,6 +1077,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       const audio = audioRef.current;
       if (!video || activeStream?.kind !== 'direct') return;
       captureVideoFrameSnapshot();
+      userPausedRef.current = false;
       const maxDur = effectiveDurationSec > 0 ? effectiveDurationSec : 14400;
       const clamped = Math.max(0, Math.min(maxDur, Math.floor(nextSec)));
       setCurrentTimeSec(clamped);
@@ -932,36 +1100,14 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         }
         if (audio && isAudioBuffered) {
           audio.currentTime = targetRelativeSec;
+          syncSplitPlayback();
         } else {
+          if (!video.paused) {
+            video.pause();
+          }
           setStreamStartOffsetSec(clamped);
           setSeekNonce((prev) => prev + 1);
         }
-      } else if (useFfmpegAudioEngine) {
-        // Fast path: if the target time is already buffered inside the browser's <video> buffer,
-        // seek directly in memory without tearing down or restarting the FFmpeg pipeline.
-        const targetRelativeSec = clamped - streamStartOffsetSec;
-        let isBufferedInRam = false;
-        if (targetRelativeSec >= 0 && video.buffered && video.buffered.length > 0) {
-          for (let i = 0; i < video.buffered.length; i++) {
-            const bStart = video.buffered.start(i);
-            const bEnd = video.buffered.end(i);
-            if (targetRelativeSec >= bStart && targetRelativeSec + 0.8 <= bEnd) {
-              isBufferedInRam = true;
-              break;
-            }
-          }
-        }
-
-        if (isBufferedInRam) {
-          video.currentTime = targetRelativeSec;
-          setIsBuffering(false);
-          setHasFreezeFrame(false);
-          return;
-        }
-
-        setIsBuffering(true);
-        setStreamStartOffsetSec(clamped);
-        setSeekNonce((prev) => prev + 1);
       } else {
         setIsBuffering(true);
         video.currentTime = clamped;
@@ -973,7 +1119,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       effectiveDurationSec,
       isSplitAudioMode,
       streamStartOffsetSec,
-      useFfmpegAudioEngine,
+      syncSplitPlayback,
     ],
   );
 
@@ -1191,68 +1337,143 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
           </div>
         )}
 
+        {/* Browser Autoplay Audio Unmute Banner (if browser blocked async unmuted <audio>) */}
+        {audioBlockedByBrowser && (
+          <button
+            type="button"
+            className="failover-toast-banner"
+            style={{
+              cursor: 'pointer',
+              border: '1px solid rgba(245, 197, 24, 0.75)',
+              background: 'rgba(18, 16, 10, 0.94)',
+              color: '#f5c518',
+              zIndex: 60,
+            }}
+            onClick={(e) => {
+              e.stopPropagation();
+              const audio = audioRef.current;
+              const video = videoRef.current;
+              if (audio) {
+                audio.muted = isMuted;
+                audio.volume = volume;
+                audio
+                  .play()
+                  .then(() => {
+                    audioUnlockedRef.current = true;
+                    setAudioBlockedByBrowser(false);
+                    if (video && video.paused && !userPausedRef.current) {
+                      video.play().catch(() => {});
+                    }
+                  })
+                  .catch(() => {});
+              }
+            }}
+          >
+            <Volume2 size={16} />
+            <span>Tap anywhere to enable audio</span>
+          </button>
+        )}
+
+        {/* Always-mounted Audio Master Clock Element (pre-unlocked on initial user gesture) */}
+        <audio
+          ref={audioRef}
+          style={{ display: 'none' }}
+          preload="auto"
+          onLoadedData={() => {
+            if (isSplitAudioMode) syncSplitPlayback();
+          }}
+          onCanPlay={() => {
+            if (isSplitAudioMode) syncSplitPlayback();
+          }}
+          onCanPlayThrough={() => {
+            if (isSplitAudioMode) syncSplitPlayback();
+          }}
+          onPlaying={() => {
+            if (isSplitAudioMode) syncSplitPlayback();
+          }}
+          onWaiting={() => {
+            if (isSplitAudioMode) {
+              setIsBuffering(true);
+              if (videoRef.current && !videoRef.current.paused) {
+                videoRef.current.pause();
+              }
+            }
+          }}
+          onTimeUpdate={() => {
+            if (isSplitAudioMode && !userPausedRef.current) {
+              syncSplitPlayback();
+            }
+          }}
+        />
+
         {activeStream?.kind === 'direct' && activeStream.url && (
           <>
-            <audio
-              ref={audioRef}
-              style={{ display: 'none' }}
-              preload="auto"
-              onCanPlay={() => {
-                if (
-                  isSplitAudioMode &&
-                  videoRef.current &&
-                  !videoRef.current.paused &&
-                  audioRef.current?.paused
-                ) {
-                  audioRef.current.play().catch(() => {});
-                }
-              }}
-            />
             <video
               ref={videoRef}
               className={`player-video-element fit-${aspectMode}`}
               poster={media.background || media.poster}
               playsInline
               onLoadStart={() => setIsBuffering(true)}
+              onLoadedData={() => {
+                if (isSplitAudioMode) {
+                  syncSplitPlayback();
+                }
+              }}
               onWaiting={() => {
                 setIsBuffering(true);
-                if (isSplitAudioMode && audioRef.current) {
+                if (isSplitAudioMode && audioRef.current && !audioRef.current.paused) {
                   audioRef.current.pause();
                 }
               }}
               onStalled={() => setIsBuffering(true)}
               onSeeking={() => setIsBuffering(true)}
               onSeeked={() => {
-                setIsBuffering(false);
-                setHasFreezeFrame(false);
+                if (isSplitAudioMode) {
+                  syncSplitPlayback();
+                } else {
+                  setIsBuffering(false);
+                  setHasFreezeFrame(false);
+                }
               }}
-              onCanPlay={() => setIsBuffering(false)}
-              onCanPlayThrough={() => setIsBuffering(false)}
+              onCanPlay={() => {
+                if (isSplitAudioMode) {
+                  syncSplitPlayback();
+                } else {
+                  setIsBuffering(false);
+                }
+              }}
+              onCanPlayThrough={() => {
+                if (isSplitAudioMode) {
+                  syncSplitPlayback();
+                } else {
+                  setIsBuffering(false);
+                }
+              }}
               onPlaying={() => {
                 setIsPlaying(true);
-                setIsBuffering(false);
-                setHasStartedPlayback(true);
-                setHasFreezeFrame(false);
-                setFailoverCountdownSec(30);
-                if (isSplitAudioMode && audioRef.current && audioRef.current.paused) {
-                  audioRef.current.play().catch(() => {});
+                if (isSplitAudioMode) {
+                  syncSplitPlayback();
+                } else {
+                  setIsBuffering(false);
+                  setHasStartedPlayback(true);
+                  setHasFreezeFrame(false);
+                  setFailoverCountdownSec(30);
                 }
               }}
               onPlay={() => {
                 setIsPlaying(true);
-                if (isSplitAudioMode && audioRef.current && audioRef.current.paused) {
-                  audioRef.current.play().catch(() => {});
+                if (isSplitAudioMode) {
+                  syncSplitPlayback();
                 }
               }}
               onPause={(e) => {
-                setIsPlaying(false);
-                if (isSplitAudioMode && audioRef.current) {
+                if (userPausedRef.current || !isSplitAudioMode) {
+                  setIsPlaying(false);
+                }
+                if (userPausedRef.current && isSplitAudioMode && audioRef.current) {
                   audioRef.current.pause();
                 }
-                const rawPos = e.currentTarget.currentTime;
-                const actualPos = isMuxedFfmpegMode
-                  ? streamStartOffsetSec + rawPos
-                  : rawPos;
+                const actualPos = e.currentTarget.currentTime;
                 const dur = effectiveDurationSec || e.currentTarget.duration || 0;
                 if (actualPos > 1) {
                   onProgressRef.current(
@@ -1276,22 +1497,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
               }}
               onError={() => {
                 setIsBuffering(true);
-                const isHlsStream =
-                  Boolean(activeStream?.isHls) ||
-                  Boolean(activeStream?.url?.toLowerCase().includes('.m3u8'));
-                if (!useFfmpegAudioEngine && !isHlsStream) {
-                  // Direct CDN playback failed -> fall back to FFmpeg pipeline
-                  setUseFfmpegAudioEngine(true);
-                } else if (isSplitAudioMode) {
-                  // Direct CDN video container unsupported natively -> fall back to muxed FFmpeg stream
-                  directVideoLoadedUrlRef.current = null;
-                  setForceMuxedFallback(true);
-                } else if (useFfmpegAudioEngine && isHlsStream) {
-                  // Fall back to direct HLS.js playback only for .m3u8 playlists
-                  setUseFfmpegAudioEngine(false);
-                } else {
-                  switchToNextStream('Stream unavailable');
-                }
+                switchToNextStream('Video format or server unavailable');
               }}
               onLoadedMetadata={(e) => {
                 e.currentTarget.muted = isSplitAudioMode ? true : isMuted;
@@ -1306,38 +1512,16 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                 }
               }}
               onTimeUpdate={(e) => {
-                const rawPos = e.currentTarget.currentTime;
-                if (rawPos > 0.08 && !e.currentTarget.paused) {
-                  setIsBuffering(false);
-                  setHasStartedPlayback(true);
-                  setHasFreezeFrame(false);
+                const actualPos = e.currentTarget.currentTime;
+                if (actualPos > 0.08 && !e.currentTarget.paused) {
+                  if (!isSplitAudioMode || (audioRef.current && audioRef.current.readyState >= 2)) {
+                    setIsBuffering(false);
+                    setHasStartedPlayback(true);
+                    setHasFreezeFrame(false);
+                  }
                 }
-                const actualPos = isMuxedFfmpegMode
-                  ? streamStartOffsetSec + rawPos
-                  : rawPos;
-                if (isSplitAudioMode && audioRef.current && !e.currentTarget.paused) {
-                  const audio = audioRef.current;
-                  if (audio.paused && audio.readyState >= 2) {
-                    audio.play().catch(() => {});
-                  }
-                  const targetAudioRel = actualPos - streamStartOffsetSec;
-                  if (
-                    targetAudioRel >= 0 &&
-                    Math.abs(audio.currentTime - targetAudioRel) > 0.45 &&
-                    !audio.seeking &&
-                    audio.buffered &&
-                    audio.buffered.length > 0
-                  ) {
-                    for (let i = 0; i < audio.buffered.length; i++) {
-                      if (
-                        targetAudioRel >= audio.buffered.start(i) &&
-                        targetAudioRel + 0.25 <= audio.buffered.end(i)
-                      ) {
-                        audio.currentTime = targetAudioRel;
-                        break;
-                      }
-                    }
-                  }
+                if (isSplitAudioMode && !e.currentTarget.paused) {
+                  syncSplitPlayback();
                 }
                 const dur = effectiveDurationSec || e.currentTarget.duration || 0;
                 if (scrubPreviewSec === null) {

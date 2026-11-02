@@ -3611,6 +3611,11 @@ export const App: React.FC = () => {
           addons={addons}
           initialEpisode={playingSession.episode}
           initialStream={playingSession.stream}
+          initialStreams={
+            dossierItem?.id === playingSession.media.id && dossierStreams.length > 0
+              ? dossierStreams
+              : undefined
+          }
           initialPositionSec={playingSession.resumeSec}
           onClose={() => {
             if (latestPlayerProgressRef.current) {
