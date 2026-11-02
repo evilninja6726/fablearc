@@ -1483,10 +1483,22 @@ export function getAudioTrackLanguagePriority(
 export function sortAudioTracksByLanguagePriority(
   tracks: ProbedAudioTrack[],
 ): ProbedAudioTrack[] {
+  const codecWeight = (codec: string): number => {
+    const c = (codec || '').toLowerCase();
+    if (/^(aac|mp3|mp4a|opus|vorbis)$/.test(c)) return 0; // Browser-native codecs first
+    if (/^(ac3|eac3)$/.test(c)) return 1; // Fast Dolby compatibility tracks second
+    return 2; // Heavy lossless TrueHD / DTS last within the same language
+  };
+
   return [...tracks].sort((a, b) => {
     const prioA = getAudioTrackLanguagePriority(a);
     const prioB = getAudioTrackLanguagePriority(b);
     if (prioA !== prioB) return prioA - prioB;
+    if ((a.langCode || '').toLowerCase() === (b.langCode || '').toLowerCase()) {
+      const cwA = codecWeight(a.codec);
+      const cwB = codecWeight(b.codec);
+      if (cwA !== cwB) return cwA - cwB;
+    }
     return a.audioIndex - b.audioIndex;
   });
 }
@@ -1532,12 +1544,14 @@ export function buildTranscodedStreamUrl(
   audioTrackIndex = 0,
   startSec = 0,
   explicitToken?: string,
+  mode: 'muxed' | 'audio' = 'muxed',
 ): string {
   const roundedStart = Math.max(0, Math.floor(startSec));
   const authToken = explicitToken ?? getClientAuthToken();
   const tokenParam = authToken ? `&token=${encodeURIComponent(authToken)}` : '';
+  const modeParam = mode === 'audio' ? '&mode=audio' : '';
   const backendOrigin = getCloudBackendOrigin();
-  return `${backendOrigin}/api/media-stream?url=${encodeURIComponent(streamUrl)}&audioTrack=${audioTrackIndex}&start=${roundedStart}${tokenParam}`;
+  return `${backendOrigin}/api/media-stream?url=${encodeURIComponent(streamUrl)}&audioTrack=${audioTrackIndex}&start=${roundedStart}${modeParam}${tokenParam}`;
 }
 
 /**
