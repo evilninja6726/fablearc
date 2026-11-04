@@ -40,6 +40,8 @@ import {
   getAudioTrackLanguagePriority,
   getCachedMediaProbe,
   InstalledAddon,
+  isUnreachableOrSlowStream,
+  markStreamUnreachableInCache,
   MediaProbeResponse,
   pingStreamBatch,
   ProbedAudioTrack,
@@ -422,31 +424,24 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     (reason: string) => {
       if (!activeStream) return;
       failedStreamIdsRef.current.add(activeStream.id);
+      markStreamUnreachableInCache(activeStream.url, 'Offline');
 
-      const playableCandidates = streams.filter(
+      const remainingStreams = streams.filter(
+        (s) => s.id !== activeStream.id && !isUnreachableOrSlowStream(s),
+      );
+      setStreams(remainingStreams);
+
+      const playableCandidates = remainingStreams.filter(
         (s) => (s.kind === 'direct' || s.kind === 'youtube') && !s.isPromo,
       );
-      const pool = playableCandidates.length > 0 ? playableCandidates : streams;
-      if (pool.length <= 1) {
+      const pool = playableCandidates.length > 0 ? playableCandidates : remainingStreams;
+      if (pool.length === 0) {
         setFailoverToast('No alternative stream available to switch to.');
         return;
       }
 
-      const currentIdx = pool.findIndex((s) => s.id === activeStream.id);
-      let nextStream: StremioStreamItem | undefined;
-
-      for (let offset = 1; offset <= pool.length; offset++) {
-        const candidate = pool[(Math.max(0, currentIdx) + offset) % pool.length];
-        if (candidate && !failedStreamIdsRef.current.has(candidate.id)) {
-          nextStream = candidate;
-          break;
-        }
-      }
-
-      if (!nextStream) {
-        failedStreamIdsRef.current.clear();
-        nextStream = pool[(Math.max(0, currentIdx) + 1) % pool.length];
-      }
+      const nextStream =
+        pool.find((s) => !failedStreamIdsRef.current.has(s.id)) ?? pool[0];
 
       if (nextStream && nextStream.id !== activeStream.id) {
         captureVideoFrameSnapshot();
@@ -572,19 +567,21 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         const metricsMap = await pingStreamBatch(chunk);
         if (cancelled || metricsMap.size === 0) continue;
         setStreams((prev) =>
-          prev.map((s) => {
-            const m = metricsMap.get(s.id);
-            if (!m) return s;
-            return {
-              ...s,
-              ttfbMs: m.ttfbMs,
-              speedMbps: m.speedMbps || s.speedMbps,
-              responsivenessScore: m.responsivenessScore || s.responsivenessScore,
-              serverStatusBadge: m.statusBadge,
-              unreachable: m.unreachable || !m.ok,
-              resolvedDirectUrl: m.resolvedUrl || s.resolvedDirectUrl || s.url,
-            };
-          }),
+          prev
+            .map((s) => {
+              const m = metricsMap.get(s.id);
+              if (!m) return s;
+              return {
+                ...s,
+                ttfbMs: m.ttfbMs,
+                speedMbps: m.speedMbps || s.speedMbps,
+                responsivenessScore: m.responsivenessScore || s.responsivenessScore,
+                serverStatusBadge: m.statusBadge,
+                unreachable: m.unreachable || !m.ok,
+                resolvedDirectUrl: m.resolvedUrl || s.resolvedDirectUrl || s.url,
+              };
+            })
+            .filter((s) => !isUnreachableOrSlowStream(s)),
         );
       }
     };

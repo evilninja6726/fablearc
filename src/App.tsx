@@ -44,6 +44,7 @@ import {
   fetchStreamsFromAddons,
   fetchStremioManifest,
   InstalledAddon,
+  isUnreachableOrSlowStream,
   parseStreamingCatalogsConfig,
   pingStreamBatch,
   prefetchStreamsForMedia,
@@ -1447,19 +1448,21 @@ export const App: React.FC = () => {
               const metricsMap = await pingStreamBatch(chunk);
               if (metricsMap.size === 0) continue;
               setDossierStreams((prev) =>
-                prev.map((s) => {
-                  const m = metricsMap.get(s.id);
-                  if (!m) return s;
-                  return {
-                    ...s,
-                    ttfbMs: m.ttfbMs,
-                    speedMbps: m.speedMbps || s.speedMbps,
-                    responsivenessScore: m.responsivenessScore || s.responsivenessScore,
-                    serverStatusBadge: m.statusBadge,
-                    unreachable: m.unreachable || !m.ok,
-                    resolvedDirectUrl: m.resolvedUrl || s.resolvedDirectUrl || s.url,
-                  };
-                }),
+                prev
+                  .map((s) => {
+                    const m = metricsMap.get(s.id);
+                    if (!m) return s;
+                    return {
+                      ...s,
+                      ttfbMs: m.ttfbMs,
+                      speedMbps: m.speedMbps || s.speedMbps,
+                      responsivenessScore: m.responsivenessScore || s.responsivenessScore,
+                      serverStatusBadge: m.statusBadge,
+                      unreachable: m.unreachable || !m.ok,
+                      resolvedDirectUrl: m.resolvedUrl || s.resolvedDirectUrl || s.url,
+                    };
+                  })
+                  .filter((s) => !isUnreachableOrSlowStream(s)),
               );
             }
           })

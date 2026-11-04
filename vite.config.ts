@@ -1769,16 +1769,19 @@ export function registerStreamzApiMiddlewares(
             return okRes;
           } catch {
             const elapsed = Date.now() - startAt;
-            return {
+            const timeoutRes = {
               id,
               ok: false,
               unreachable: true,
               isHttps: false,
+              resolvedUrl: rawUrl,
               ttfbMs: elapsed,
               speedMbps: 0,
               responsivenessScore: -300,
               statusBadge: 'Slow / Timeout',
             };
+            globalCache.setSync(cacheKey, timeoutRes, 300);
+            return timeoutRes;
           }
         }),
       );
