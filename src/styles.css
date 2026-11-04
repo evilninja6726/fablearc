@@ -1959,7 +1959,7 @@ select {
   align-items: center;
   justify-content: space-between;
   padding: 18px 28px;
-  background: linear-gradient(180deg, rgba(4, 5, 8, 0.92) 0%, rgba(4, 5, 8, 0) 100%);
+  background: linear-gradient(180deg, rgba(0, 0, 0, 0.92) 0%, rgba(0, 0, 0, 0) 100%);
   z-index: 25;
   transition: opacity 220ms ease, transform 220ms ease;
 }
@@ -2052,6 +2052,7 @@ select {
   max-width: 100%;
   max-height: 100%;
   display: block;
+  background: #000000;
   transition: transform 200ms ease;
 }
 
@@ -2419,8 +2420,8 @@ select {
   padding: 14px 28px 22px;
   background: linear-gradient(
     0deg,
-    rgba(4, 5, 8, 0.96) 0%,
-    rgba(4, 5, 8, 0.65) 75%,
+    rgba(0, 0, 0, 0.96) 0%,
+    rgba(0, 0, 0, 0.65) 75%,
     transparent 100%
   );
   display: flex;
