@@ -1416,6 +1416,124 @@ export const App: React.FC = () => {
         dossierScrollRef.current.scrollTo({ top: 0, behavior: 'smooth' });
       }
 
+      const mergeIncomingWithMeasured = (
+        prevList: StremioStreamItem[],
+        incomingList: StremioStreamItem[],
+      ): StremioStreamItem[] => {
+        if (prevList.length === 0) return incomingList;
+        const measuredById = new Map<string, StremioStreamItem>();
+        for (const p of prevList) {
+          if (p.serverStatusBadge || p.isTopResponsive || p.ttfbMs !== undefined) {
+            measuredById.set(p.id, p);
+          }
+        }
+        if (measuredById.size === 0) return incomingList;
+        const merged = incomingList
+          .map((itemStream) => {
+            const measured = measuredById.get(itemStream.id);
+            return measured ? { ...itemStream, ...measured } : itemStream;
+          })
+          .filter((s) => !isUnreachableOrSlowStream(s));
+        const topWinner = merged.find((s) => s.isTopResponsive && !s.unreachable);
+        if (!topWinner) return sortStreamsByDecreasingQuality(merged);
+        const rest = sortStreamsByDecreasingQuality(
+          merged.filter((s) => s.id !== topWinner.id),
+        );
+        return [topWinner, ...rest];
+      };
+
+      let firstWaveBenchmarked = false;
+      const runProgressiveStreamFetch = async (
+        videoIdToFetch: string,
+        mediaContext: StremioMediaItem,
+      ) => {
+        const handlePartialWave = (partialWave: StremioStreamItem[]) => {
+          const initialWave = applyCachedServerHealth(
+            sortStreamsByDecreasingQuality(partialWave),
+          );
+          if (initialWave.length === 0) return;
+          setDossierLoadingStreams(false);
+          setDossierStreams((prev) => mergeIncomingWithMeasured(prev, initialWave));
+
+          if (!firstWaveBenchmarked && initialWave.some((s) => s.kind === 'direct')) {
+            firstWaveBenchmarked = true;
+            setDossierBenchmarkingServers(true);
+            rankStreamsByResponsiveness(initialWave)
+              .then((rankedWave) => {
+                setDossierStreams((prev) =>
+                  mergeIncomingWithMeasured(rankedWave, prev.length > 0 ? prev : rankedWave),
+                );
+              })
+              .catch(() => {});
+          }
+        };
+
+        const streams = await fetchStreamsFromAddons(
+          addons,
+          mediaContext.type,
+          videoIdToFetch,
+          mediaContext,
+          handlePartialWave,
+        );
+        const finalSorted = applyCachedServerHealth(
+          sortStreamsByDecreasingQuality(streams),
+        );
+        setDossierStreams((prev) => mergeIncomingWithMeasured(prev, finalSorted));
+        setDossierLoadingStreams(false);
+
+        if (finalSorted.length > 0) {
+          setDossierBenchmarkingServers(true);
+          rankStreamsByResponsiveness(finalSorted)
+            .then(async (ranked) => {
+              setDossierStreams((prev) => (prev.length > 0 ? ranked : prev));
+              setDossierBenchmarkingServers(false);
+
+              const unpinged = ranked.filter(
+                (s) =>
+                  s.kind === 'direct' &&
+                  !s.isPromo &&
+                  Boolean(s.url) &&
+                  !s.serverStatusBadge,
+              );
+              for (let i = 0; i < unpinged.length; i += 18) {
+                const chunk = unpinged.slice(i, i + 18);
+                const metricsMap = await pingStreamBatch(chunk);
+                if (metricsMap.size === 0) continue;
+                setDossierStreams((prev) =>
+                  prev
+                    .map((s) => {
+                      const m = metricsMap.get(s.id);
+                      if (!m) return s;
+                      return {
+                        ...s,
+                        ttfbMs: m.ttfbMs,
+                        speedMbps: m.speedMbps || s.speedMbps,
+                        responsivenessScore: m.responsivenessScore || s.responsivenessScore,
+                        serverStatusBadge: m.statusBadge,
+                        unreachable: m.unreachable || !m.ok,
+                        resolvedDirectUrl: m.resolvedUrl || s.resolvedDirectUrl || s.url,
+                      };
+                    })
+                    .filter((s) => !isUnreachableOrSlowStream(s)),
+                );
+              }
+            })
+            .catch(() => {
+              setDossierBenchmarkingServers(false);
+            });
+        }
+      };
+
+      const baseImdbOrId = item.imdbId || item.id;
+      const earlyTargetVideoId =
+        item.type === 'series'
+          ? item.videos?.[0]?.id || (baseImdbOrId.startsWith('tt') ? `${baseImdbOrId}:1:1` : '')
+          : baseImdbOrId;
+
+      const earlyStreamPromise = earlyTargetVideoId
+        ? runProgressiveStreamFetch(earlyTargetVideoId, item)
+        : null;
+
       const enriched = await fetchMetaFromAddons(addons, item.type, item.id, item);
       const finalItem = enriched || item;
       setDossierItem(finalItem);
@@ -1455,62 +1573,10 @@ export const App: React.FC = () => {
           ? finalItem.videos[0].id
           : finalItem.imdbId || finalItem.id;
 
-      const streams = await fetchStreamsFromAddons(
-        addons,
-        finalItem.type,
-        targetVideoId,
-        finalItem,
-      );
-      const initialSorted = applyCachedServerHealth(
-        sortStreamsByDecreasingQuality(streams),
-      );
-      setDossierStreams(initialSorted);
-      setDossierLoadingStreams(false);
-
-      // Background partial server speed & health benchmark:
-      // Tests top candidate servers (64 KB Range check), promotes the fastest zero-buffer server to #1,
-      // keeps remaining servers in decreasing quality order, pre-warms /api/media-probe for the #1 server,
-      // and then progressively pings all remaining direct servers in background batches!
-      if (initialSorted.length > 0) {
-        setDossierBenchmarkingServers(true);
-        rankStreamsByResponsiveness(initialSorted)
-          .then(async (ranked) => {
-            setDossierStreams((prev) => (prev.length > 0 ? ranked : prev));
-            setDossierBenchmarkingServers(false);
-
-            const unpinged = ranked.filter(
-              (s) =>
-                s.kind === 'direct' &&
-                !s.isPromo &&
-                Boolean(s.url) &&
-                !s.serverStatusBadge,
-            );
-            for (let i = 0; i < unpinged.length; i += 18) {
-              const chunk = unpinged.slice(i, i + 18);
-              const metricsMap = await pingStreamBatch(chunk);
-              if (metricsMap.size === 0) continue;
-              setDossierStreams((prev) =>
-                prev
-                  .map((s) => {
-                    const m = metricsMap.get(s.id);
-                    if (!m) return s;
-                    return {
-                      ...s,
-                      ttfbMs: m.ttfbMs,
-                      speedMbps: m.speedMbps || s.speedMbps,
-                      responsivenessScore: m.responsivenessScore || s.responsivenessScore,
-                      serverStatusBadge: m.statusBadge,
-                      unreachable: m.unreachable || !m.ok,
-                      resolvedDirectUrl: m.resolvedUrl || s.resolvedDirectUrl || s.url,
-                    };
-                  })
-                  .filter((s) => !isUnreachableOrSlowStream(s)),
-              );
-            }
-          })
-          .catch(() => {
-            setDossierBenchmarkingServers(false);
-          });
+      if (!earlyStreamPromise || targetVideoId !== earlyTargetVideoId) {
+        await runProgressiveStreamFetch(targetVideoId, finalItem);
+      } else {
+        await earlyStreamPromise;
       }
     },
     [addons, currentUser],

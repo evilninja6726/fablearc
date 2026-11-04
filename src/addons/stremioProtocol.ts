@@ -1355,6 +1355,11 @@ const streamListCache = new Map<
   { data: StremioStreamItem[]; expiresAt: number }
 >();
 const inFlightStreamFetches = new Map<string, Promise<StremioStreamItem[]>>();
+const inFlightPartialListeners = new Map<
+  string,
+  Set<(partialStreams: StremioStreamItem[]) => void>
+>();
+const partialStreamSnapshots = new Map<string, StremioStreamItem[]>();
 
 /**
  * Queries all enabled `stream` addons for `/stream/<type>/<videoId>.json`, parses resolution quality & file size,
@@ -1395,6 +1400,7 @@ export async function fetchStreamsFromAddons(
   mediaType: string,
   videoId: string,
   mediaItem?: StremioMediaItem,
+  onPartialStreams?: (partialStreams: StremioStreamItem[]) => void,
 ): Promise<StremioStreamItem[]> {
   const streamAddons = addons.filter(
     (a) =>
@@ -1410,17 +1416,61 @@ export async function fetchStreamsFromAddons(
 
   const cached = streamListCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) {
-    return applyCachedServerHealth(cached.data);
+    const hydrated = applyCachedServerHealth(cached.data);
+    if (onPartialStreams && hydrated.length > 0) {
+      onPartialStreams(hydrated);
+    }
+    return hydrated;
+  }
+
+  if (onPartialStreams) {
+    let listenerSet = inFlightPartialListeners.get(cacheKey);
+    if (!listenerSet) {
+      listenerSet = new Set();
+      inFlightPartialListeners.set(cacheKey, listenerSet);
+    }
+    listenerSet.add(onPartialStreams);
+    const existingSnapshot = partialStreamSnapshots.get(cacheKey);
+    if (existingSnapshot && existingSnapshot.length > 0) {
+      try {
+        onPartialStreams(applyCachedServerHealth(existingSnapshot));
+      } catch {
+        // Ignore callback error
+      }
+    }
   }
 
   const existingInFlight = inFlightStreamFetches.get(cacheKey);
   if (existingInFlight) {
-    const list = await existingInFlight;
-    return applyCachedServerHealth(list);
+    try {
+      const list = await existingInFlight;
+      return applyCachedServerHealth(list);
+    } finally {
+      if (onPartialStreams) {
+        inFlightPartialListeners.get(cacheKey)?.delete(onPartialStreams);
+      }
+    }
   }
 
   const fetchPromise = (async (): Promise<StremioStreamItem[]> => {
     const results: StremioStreamItem[] = [];
+
+    const notifyPartialWave = () => {
+      if (results.length === 0) return;
+      const sortedPartial = sortStreamsByDecreasingQuality([...results]);
+      partialStreamSnapshots.set(cacheKey, sortedPartial);
+      const listeners = inFlightPartialListeners.get(cacheKey);
+      if (listeners && listeners.size > 0) {
+        const hydratedPartial = applyCachedServerHealth(sortedPartial);
+        listeners.forEach((cb) => {
+          try {
+            cb(hydratedPartial);
+          } catch {
+            // Ignore listener error
+          }
+        });
+      }
+    };
 
     await Promise.allSettled(
       streamAddons.map(async (addon) => {
@@ -1434,10 +1484,19 @@ export async function fetchStreamsFromAddons(
         });
         if (!check.allowed || !check.normalizedUrl) return;
 
-        const payload = await cachedJsonFetch<{
-          streams?: Array<Record<string, unknown>>;
-        }>(check.normalizedUrl, 600_000);
+        const abortCtrl = new AbortController();
+        const timeoutId = setTimeout(() => abortCtrl.abort(), 8500);
+        let payload: { streams?: Array<Record<string, unknown>> } | null = null;
+        try {
+          payload = await cachedJsonFetch<{
+            streams?: Array<Record<string, unknown>>;
+          }>(check.normalizedUrl, 600_000, abortCtrl.signal);
+        } finally {
+          clearTimeout(timeoutId);
+        }
         if (!Array.isArray(payload?.streams)) return;
+
+        const countBeforeAddon = results.length;
 
         payload.streams.forEach((raw, idx) => {
           if (!raw || typeof raw !== 'object') return;
@@ -1590,6 +1649,10 @@ export async function fetchStreamsFromAddons(
             }
           }
         });
+
+        if (results.length > countBeforeAddon) {
+          notifyPartialWave();
+        }
       }),
     );
 
@@ -1629,6 +1692,8 @@ export async function fetchStreamsFromAddons(
     return await fetchPromise;
   } finally {
     inFlightStreamFetches.delete(cacheKey);
+    inFlightPartialListeners.delete(cacheKey);
+    partialStreamSnapshots.delete(cacheKey);
   }
 }
 

@@ -288,6 +288,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       : applyCachedServerHealth(sortStreamsByDecreasingQuality(hydrated));
   });
   const [loadingStreams, setLoadingStreams] = useState(false);
+  const [loadingMoreProviders, setLoadingMoreProviders] = useState(false);
   const [activeStream, setActiveStream] = useState<StremioStreamItem | null>(() => {
     if (initialStream) return initialStream;
     const preRanked = initialStreams?.find((s) => s.isTopResponsive && !s.unreachable);
@@ -619,17 +620,44 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
 
     const rankWithTimeout = async (
       candidateList: StremioStreamItem[],
+      timeoutMs = 2600,
     ): Promise<StremioStreamItem[]> => {
       try {
         return await Promise.race([
           rankStreamsByResponsiveness(candidateList),
           new Promise<StremioStreamItem[]>((resolve) =>
-            window.setTimeout(() => resolve(candidateList), 6000),
+            window.setTimeout(() => resolve(candidateList), timeoutMs),
           ),
         ]);
       } catch {
         return candidateList;
       }
+    };
+
+    const mergeWithMeasuredMetrics = (
+      prevList: StremioStreamItem[],
+      incomingList: StremioStreamItem[],
+    ): StremioStreamItem[] => {
+      if (prevList.length === 0) return incomingList;
+      const measuredById = new Map<string, StremioStreamItem>();
+      for (const p of prevList) {
+        if (p.serverStatusBadge || p.isTopResponsive || p.ttfbMs !== undefined) {
+          measuredById.set(p.id, p);
+        }
+      }
+      if (measuredById.size === 0) return incomingList;
+      const merged = incomingList
+        .map((itemStream) => {
+          const measured = measuredById.get(itemStream.id);
+          return measured ? { ...itemStream, ...measured } : itemStream;
+        })
+        .filter((s) => !isUnreachableOrSlowStream(s));
+      const topWinner = merged.find((s) => s.isTopResponsive && !s.unreachable);
+      if (!topWinner) return sortStreamsByDecreasingQuality(merged);
+      const rest = sortStreamsByDecreasingQuality(
+        merged.filter((s) => s.id !== topWinner.id),
+      );
+      return [topWinner, ...rest];
     };
 
     const pickBestPlayableStream = (
@@ -655,14 +683,46 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
           ? hydratedInitial
           : applyCachedServerHealth(sortStreamsByDecreasingQuality(hydratedInitial));
 
+        setStreams(orderedInitial);
+        setLoadingMoreProviders(true);
+
+        // Continue receiving any background provider waves that were still in-flight when user clicked Play
+        fetchStreamsFromAddons(
+          addons,
+          media.type,
+          activeVideoId,
+          media,
+          (partialWave) => {
+            if (cancelled) return;
+            const cleanedWave = applyCachedServerHealth(
+              sortStreamsByDecreasingQuality(partialWave),
+            );
+            setStreams((prev) => mergeWithMeasuredMetrics(prev, cleanedWave));
+          },
+        )
+          .then((fullList) => {
+            if (cancelled) return;
+            setLoadingMoreProviders(false);
+            const cleanedFull = applyCachedServerHealth(
+              sortStreamsByDecreasingQuality(fullList),
+            );
+            setStreams((prev) => {
+              const merged = mergeWithMeasuredMetrics(prev, cleanedFull);
+              void pingRemainingServersInPlace(merged);
+              return merged;
+            });
+          })
+          .catch(() => {
+            if (!cancelled) setLoadingMoreProviders(false);
+          });
+
         if (hasRankedWinner || initialStream) {
-          setStreams(orderedInitial);
           setActiveStream((prev) => prev ?? initialStream ?? pickBestPlayableStream(orderedInitial));
           if (!hasRankedWinner) {
             rankStreamsByResponsiveness(orderedInitial)
               .then((ranked) => {
                 if (cancelled || ranked.length === 0) return;
-                setStreams(ranked);
+                setStreams((prev) => mergeWithMeasuredMetrics(ranked, prev.length > ranked.length ? prev : ranked));
                 void pingRemainingServersInPlace(ranked);
               })
               .catch(() => {});
@@ -672,15 +732,14 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
           return;
         }
 
-        // Wait for server benchmark to crown the ⚡ Fastest zero-buffer server BEFORE starting playback
-        // so the player never starts on an un-ranked stream and never restarts buffering a few seconds later!
         setLoadingStreams(true);
-        setStreams(orderedInitial);
         try {
-          const ranked = await rankWithTimeout(orderedInitial);
+          const ranked = await rankWithTimeout(orderedInitial, 2400);
           if (cancelled) return;
           const finalRanked = ranked.length > 0 ? ranked : orderedInitial;
-          setStreams(finalRanked);
+          setStreams((prev) =>
+            mergeWithMeasuredMetrics(finalRanked, prev.length > finalRanked.length ? prev : finalRanked),
+          );
           setActiveStream((prev) => prev ?? pickBestPlayableStream(finalRanked));
           void pingRemainingServersInPlace(finalRanked);
         } finally {
@@ -690,43 +749,76 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       }
 
       setLoadingStreams(true);
+      setLoadingMoreProviders(true);
+      let firstWaveStarted = false;
+
+      const handleFirstWavePlayback = async (waveList: StremioStreamItem[]) => {
+        if (firstWaveStarted || cancelled) return;
+        const hasDirect = waveList.some((s) => s.kind === 'direct' && !s.isPromo);
+        if (!hasDirect) return;
+        firstWaveStarted = true;
+        setLoadingStreams(false);
+
+        if (initialStream) {
+          setActiveStream((prev) => prev ?? initialStream);
+          return;
+        }
+
+        const rankedWave = await rankWithTimeout(waveList, 2400);
+        if (cancelled) return;
+        const bestWave = rankedWave.length > 0 ? rankedWave : waveList;
+        setStreams((prev) =>
+          mergeWithMeasuredMetrics(bestWave, prev.length > bestWave.length ? prev : bestWave),
+        );
+        setActiveStream((prev) => prev ?? pickBestPlayableStream(bestWave));
+      };
+
       try {
         const resolved = await fetchStreamsFromAddons(
           addons,
           media.type,
           activeVideoId,
           media,
+          (partialWave) => {
+            if (cancelled) return;
+            const sortedPartial = applyCachedServerHealth(
+              sortStreamsByDecreasingQuality(partialWave),
+            );
+            if (sortedPartial.length === 0) return;
+            setLoadingStreams(false);
+            setStreams((prev) => mergeWithMeasuredMetrics(prev, sortedPartial));
+            void handleFirstWavePlayback(sortedPartial);
+          },
         );
         if (cancelled) return;
-        const sorted = sortStreamsByDecreasingQuality(resolved);
+        const sorted = applyCachedServerHealth(sortStreamsByDecreasingQuality(resolved));
         if (sorted.length === 0) {
           setStreams([]);
           return;
         }
 
+        setStreams((prev) => mergeWithMeasuredMetrics(prev, sorted));
+
         if (initialStream) {
-          setStreams(sorted);
-          setActiveStream(initialStream);
+          setActiveStream((prev) => prev ?? initialStream);
           rankStreamsByResponsiveness(sorted)
             .then((ranked) => {
               if (cancelled || ranked.length === 0) return;
-              setStreams(ranked);
+              setStreams((prev) => mergeWithMeasuredMetrics(ranked, prev));
               void pingRemainingServersInPlace(ranked);
             })
             .catch(() => {});
           return;
         }
 
-        setStreams(sorted);
-        const ranked = await rankWithTimeout(sorted);
+        const ranked = await rankWithTimeout(sorted, firstWaveStarted ? 3800 : 2400);
         if (cancelled) return;
         const finalRanked = ranked.length > 0 ? ranked : sorted;
-        setStreams(finalRanked);
+        setStreams((prev) => mergeWithMeasuredMetrics(finalRanked, finalRanked));
         setActiveStream((prev) => {
           if (
             prev &&
-            userManuallySelectedStreamRef.current &&
-            finalRanked.some((r) => r.url === prev.url && r.name === prev.name)
+            (userManuallySelectedStreamRef.current || hasStartedPlaybackRef.current || !prev.unreachable)
           ) {
             return prev;
           }
@@ -734,7 +826,10 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         });
         void pingRemainingServersInPlace(finalRanked);
       } finally {
-        if (!cancelled) setLoadingStreams(false);
+        if (!cancelled) {
+          setLoadingStreams(false);
+          setLoadingMoreProviders(false);
+        }
       }
     };
 
@@ -2953,6 +3048,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                     <Layers size={16} />
                     <span>
                       Video Quality &amp; Servers ({streams.length})
+                      {loadingMoreProviders ? ' · Loading more providers…' : ''}
                     </span>
                   </>
                 )}
