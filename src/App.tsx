@@ -1420,15 +1420,16 @@ export const App: React.FC = () => {
         prevList: StremioStreamItem[],
         incomingList: StremioStreamItem[],
       ): StremioStreamItem[] => {
-        if (prevList.length === 0) return incomingList;
+        const cleanIncoming = incomingList.filter((s) => s.kind !== 'youtube');
+        if (prevList.length === 0) return cleanIncoming;
         const measuredById = new Map<string, StremioStreamItem>();
         for (const p of prevList) {
           if (p.serverStatusBadge || p.isTopResponsive || p.ttfbMs !== undefined) {
             measuredById.set(p.id, p);
           }
         }
-        if (measuredById.size === 0) return incomingList;
-        const merged = incomingList
+        if (measuredById.size === 0) return cleanIncoming;
+        const merged = cleanIncoming
           .map((itemStream) => {
             const measured = measuredById.get(itemStream.id);
             return measured ? { ...itemStream, ...measured } : itemStream;

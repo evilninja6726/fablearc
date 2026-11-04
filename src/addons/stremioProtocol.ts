@@ -324,12 +324,56 @@ export function sortStreamsByDecreasingQuality(
     external: 3,
   };
 
+  const getBrowserStreamCompatibilityScore = (s: StremioStreamItem): number => {
+    const urlLower = (s.url || '').toLowerCase();
+    const metaLower = `${s.name} ${s.title} ${urlLower}`.toLowerCase();
+    let score = 0;
+
+    // 1. Prefer verified direct HTTP Range CDNs with CORS (PixelDrain, FSL, BunnyCDN, 111477, 2Peckle)
+    if (
+      urlLower.includes('pixeldrain.dev') ||
+      urlLower.includes('pixeldrain.com') ||
+      /\b(fsldownload|fsl(?:-v2)?|b-cdn\.net|111477\.xyz|2peckle)\b/i.test(metaLower)
+    ) {
+      score += 40;
+    } else if (
+      urlLower.includes('hubcloud.ist') ||
+      urlLower.includes('rohitkiskk.workers.dev') ||
+      urlLower.includes('/resolve/cj/')
+    ) {
+      // Penalize broken redirect wrappers / dead HLS proxies so direct CDN mirrors rank first
+      score -= 50;
+    } else if (urlLower.includes('.r2.cloudflarestorage.com')) {
+      score -= 10;
+    }
+
+    // 2. Penalize Dolby Vision (DV / DoVi) streams that fail native HTML5 <video> decode in browsers
+    if (
+      /\b(dv|dolby[\s._-]*vision|dovi)\b/i.test(metaLower) &&
+      !/\b(hdr10|hdr)\b/i.test(metaLower)
+    ) {
+      score -= 35;
+    } else if (/\b(dv|dolby[\s._-]*vision|dovi)\b/i.test(metaLower)) {
+      score -= 20;
+    }
+
+    // 3. Prefer streamable file sizes (1 GB – 22 GB) over massive 35–70 GB BluRay Remuxes
+    const gb = (s.sizeBytes ?? 0) / (1024 * 1024 * 1024);
+    if (gb >= 1.0 && gb <= 22.0) {
+      score += 15;
+    } else if (gb > 30.0) {
+      score -= 25;
+    }
+
+    return score;
+  };
+
   return [...streams].sort((a, b) => {
     const promoA = a.isPromo ? 1 : 0;
     const promoB = b.isPromo ? 1 : 0;
     if (promoA !== promoB) return promoA - promoB;
 
-    // Group playable video streams (direct) above trailers/external links
+    // Group playable video streams (direct) above external links
     const kindDiff = kindPriority[a.kind] - kindPriority[b.kind];
     if (kindDiff !== 0) return kindDiff;
 
@@ -351,6 +395,13 @@ export function sortStreamsByDecreasingQuality(
       const healthyB = seedsB >= 5 ? 1 : 0;
       if (healthyB !== healthyA) return healthyB - healthyA;
       if (seedsB !== seedsA) return seedsB - seedsA;
+    }
+
+    // 2c. For direct streams in the same quality + audio tier, prefer fast CORS-enabled CDNs and non-DV streams
+    if (a.kind === 'direct' && b.kind === 'direct') {
+      const compatA = getBrowserStreamCompatibilityScore(a);
+      const compatB = getBrowserStreamCompatibilityScore(b);
+      if (compatB !== compatA) return compatB - compatA;
     }
 
     // 3. Decreasing file size / bitrate
@@ -1006,11 +1057,33 @@ async function cachedJsonFetch<T = unknown>(
     return hit.data as T;
   }
 
-  if (!signal) {
-    const existing = CLIENT_INFLIGHT.get(url);
-    if (existing) {
-      return existing as Promise<T>;
+  const withSignalRace = (basePromise: Promise<T>): Promise<T> => {
+    if (!signal) return basePromise;
+    if (signal.aborted) {
+      return Promise.reject(new Error('Request aborted'));
     }
+    return new Promise<T>((resolve, reject) => {
+      const onAbort = () => {
+        signal.removeEventListener('abort', onAbort);
+        reject(new Error('Request aborted'));
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+      basePromise.then(
+        (val) => {
+          signal.removeEventListener('abort', onAbort);
+          resolve(val);
+        },
+        (err) => {
+          signal.removeEventListener('abort', onAbort);
+          reject(err);
+        },
+      );
+    });
+  };
+
+  const existing = CLIENT_INFLIGHT.get(url);
+  if (existing) {
+    return withSignalRace(existing as Promise<T>);
   }
 
   const doFetch = async (): Promise<T> => {
@@ -1081,15 +1154,11 @@ async function cachedJsonFetch<T = unknown>(
     return parsed;
   };
 
-  if (signal) {
-    return doFetch();
-  }
-
   const promise = doFetch().finally(() => {
     CLIENT_INFLIGHT.delete(url);
   });
   CLIENT_INFLIGHT.set(url, promise);
-  return promise;
+  return withSignalRace(promise);
 }
 
 /**
@@ -1485,7 +1554,7 @@ export async function fetchStreamsFromAddons(
         if (!check.allowed || !check.normalizedUrl) return;
 
         const abortCtrl = new AbortController();
-        const timeoutId = setTimeout(() => abortCtrl.abort(), 8500);
+        const timeoutId = setTimeout(() => abortCtrl.abort(), 18000);
         let payload: { streams?: Array<Record<string, unknown>> } | null = null;
         try {
           payload = await cachedJsonFetch<{
@@ -1616,20 +1685,6 @@ export async function fetchStreamsFromAddons(
                 ...qualityInfo,
               });
             }
-          } else if (typeof raw.ytId === 'string' && raw.ytId.trim()) {
-            results.push({
-              id: `${addon.manifest.id}-yt-${idx}`,
-              addonId: addon.manifest.id,
-              addonName: addon.manifest.name,
-              name,
-              title,
-              kind: 'youtube',
-              ytId: raw.ytId.trim(),
-              qualityScore: 720,
-              qualityBadge: 'Trailer',
-              sizeBytes: 0,
-              isPromo: qualityInfo.isPromo,
-            });
           } else if (typeof raw.externalUrl === 'string' && raw.externalUrl.trim()) {
             const extCheck = validateAddonOrStreamUrl(raw.externalUrl.trim(), {
               requireHttps: true,
@@ -1655,27 +1710,6 @@ export async function fetchStreamsFromAddons(
         }
       }),
     );
-
-    // Include official trailers from the item's metadata (e.g. from Streaming Catalogs or Cinemeta)
-    if (mediaItem?.trailers && mediaItem.trailers.length > 0) {
-      mediaItem.trailers.forEach((tr, idx) => {
-        if (!results.some((r) => r.kind === 'youtube' && r.ytId === tr.source)) {
-          results.push({
-            id: `meta-trailer-${idx}-${tr.source}`,
-            addonId: mediaItem.sourceAddonId || 'meta.trailer',
-            addonName: mediaItem.sourceAddonName || 'Official Trailer',
-            name: tr.type || 'Official Trailer',
-            title: tr.title || `${mediaItem.name} — Official Trailer #${idx + 1}`,
-            kind: 'youtube',
-            ytId: tr.source,
-            qualityScore: 720,
-            qualityBadge: 'Trailer',
-            sizeBytes: 0,
-            isPromo: false,
-          });
-        }
-      });
-    }
 
     const sorted = sortStreamsByDecreasingQuality(results);
     if (sorted.length > 0) {
@@ -1851,51 +1885,66 @@ export function getCachedMediaProbe(streamUrl?: string | null): MediaProbeRespon
   return null;
 }
 
+const inFlightProbes = new Map<string, Promise<MediaProbeResponse | null>>();
+
 export async function probeMediaStream(
   streamUrl: string,
   explicitToken?: string,
 ): Promise<MediaProbeResponse | null> {
-  try {
-    const cached = clientProbeCache.get(streamUrl);
-    if (cached && cached.expiresAt > Date.now()) {
-      warmBrowserCdnConnection(cached.data.resolvedUrl || streamUrl);
-      return cached.data;
-    }
+  if (!streamUrl) return null;
+  const cached = clientProbeCache.get(streamUrl);
+  if (cached && cached.expiresAt > Date.now()) {
+    warmBrowserCdnConnection(cached.data.resolvedUrl || streamUrl);
+    return cached.data;
+  }
 
-    const authToken = explicitToken ?? getClientAuthToken();
-    const tokenQuery = authToken ? `&token=${encodeURIComponent(authToken)}` : '';
-    const backendOrigin = getCloudBackendOrigin();
-    const resp = await fetch(
-      `${backendOrigin}/api/media-probe?url=${encodeURIComponent(streamUrl)}${tokenQuery}`,
-      {
-        headers: {
-          Accept: 'application/json',
-          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+  const existingInFlight = inFlightProbes.get(streamUrl);
+  if (existingInFlight) {
+    return existingInFlight;
+  }
+
+  const probePromise = (async (): Promise<MediaProbeResponse | null> => {
+    try {
+      const authToken = explicitToken ?? getClientAuthToken();
+      const tokenQuery = authToken ? `&token=${encodeURIComponent(authToken)}` : '';
+      const backendOrigin = getCloudBackendOrigin();
+      const resp = await fetch(
+        `${backendOrigin}/api/media-probe?url=${encodeURIComponent(streamUrl)}${tokenQuery}`,
+        {
+          headers: {
+            Accept: 'application/json',
+            ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+          },
         },
-      },
-    );
-    if (!resp.ok) return null;
-    const data = (await resp.json()) as MediaProbeResponse;
-    if (!data || !Array.isArray(data.audioTracks)) return null;
-    const normalized: MediaProbeResponse = {
-      ...data,
-      audioTracks: sortAudioTracksByLanguagePriority(data.audioTracks),
-    };
-    clientProbeCache.set(streamUrl, {
-      data: normalized,
-      expiresAt: Date.now() + 10 * 60 * 1000,
-    });
-    if (normalized.resolvedUrl) {
-      clientProbeCache.set(normalized.resolvedUrl, {
+      );
+      if (!resp.ok) return null;
+      const data = (await resp.json()) as MediaProbeResponse;
+      if (!data || !Array.isArray(data.audioTracks)) return null;
+      const normalized: MediaProbeResponse = {
+        ...data,
+        audioTracks: sortAudioTracksByLanguagePriority(data.audioTracks),
+      };
+      clientProbeCache.set(streamUrl, {
         data: normalized,
         expiresAt: Date.now() + 10 * 60 * 1000,
       });
+      if (normalized.resolvedUrl) {
+        clientProbeCache.set(normalized.resolvedUrl, {
+          data: normalized,
+          expiresAt: Date.now() + 10 * 60 * 1000,
+        });
+      }
+      warmBrowserCdnConnection(normalized.resolvedUrl || streamUrl);
+      return normalized;
+    } catch {
+      return null;
     }
-    warmBrowserCdnConnection(normalized.resolvedUrl || streamUrl);
-    return normalized;
-  } catch {
-    return null;
-  }
+  })().finally(() => {
+    inFlightProbes.delete(streamUrl);
+  });
+
+  inFlightProbes.set(streamUrl, probePromise);
+  return probePromise;
 }
 
 export function buildTranscodedStreamUrl(
@@ -2023,10 +2072,10 @@ export async function rankStreamsByResponsiveness(
     return sortedBase;
   }
 
-  // Pick up to 6 diverse, high-probability zero-buffer candidates across BOTH 4K and 1080p tiers:
-  // - Up to 3 direct file streams from 4K (preferring FSL/R2/2Peckle/PixelDrain with known sizeBytes)
-  // - Up to 3 direct file streams from 1080p (fast 1.5–4 GB Dual-Audio files that start in <1s with zero buffering)
-  // - Fill any remaining slots up to 6 from the rest of allDirect
+  // Pick up to 8 diverse, high-probability zero-buffer candidates across BOTH 4K and 1080p tiers:
+  // - Up to 4 direct file streams from 4K (preferring PixelDrain/FSL/2Peckle/111477 with known sizeBytes)
+  // - Up to 4 direct file streams from 1080p (fast 1.5–4 GB Dual-Audio files that start in <1s with zero buffering)
+  // - Fill any remaining slots up to 8 from the rest of allDirect
   const selectedIds = new Set<string>();
   const directCandidates: StremioStreamItem[] = [];
   const addCandidate = (item?: StremioStreamItem) => {
@@ -2042,7 +2091,7 @@ export async function rankStreamsByResponsiveness(
     (s) => (s.qualityScore ?? 0) >= 1080 && (s.qualityScore ?? 0) < 2160,
   );
 
-  // Prefer FSL / R2 / PixelDrain / BunnyCDN servers with distinct mirror names and browser-native H.264 / sweet-spot sizes for instant zero-buffer start
+  // Prefer PixelDrain / FSL / BunnyCDN / 111477 servers with distinct mirror names and browser-native H.264 / sweet-spot sizes for instant zero-buffer start
   const pickDistinctMirrors = (
     list: StremioStreamItem[],
     count: number,
@@ -2052,9 +2101,11 @@ export async function rankStreamsByResponsiveness(
       const metaA = `${a.name} ${a.title} ${a.url || ''}`;
       const metaB = `${b.name} ${b.title} ${b.url || ''}`;
       const hostScore = (meta: string): number => {
-        if (/\b(fsl(?:-v2)?|r2|2peckle|b-cdn\.net|fsldownload)\b/i.test(meta)) return 3;
-        if (/\b(pixeldrain)\b/i.test(meta)) return 2;
-        if (/\b(arctic)\b/i.test(meta)) return 1;
+        if (/\b(pixeldrain|fsl(?:-v2)?|2peckle|b-cdn\.net|fsldownload|111477\.xyz)\b/i.test(meta))
+          return 4;
+        if (/\b(arctic)\b/i.test(meta)) return 2;
+        if (/\b(r2|cloudflarestorage)\b/i.test(meta)) return 1;
+        if (/\b(hubcloud\.ist|rohitkiskk)\b/i.test(meta)) return -3;
         return 0;
       };
       const hDiff = hostScore(metaB) - hostScore(metaA);
@@ -2069,13 +2120,17 @@ export async function rankStreamsByResponsiveness(
       const audioB = b.audioScore ?? (b.isMultiAudio ? 1 : 0);
       if (audioB !== audioA) return audioB - audioA;
 
+      const gbA = (a.sizeBytes ?? 0) / (1024 * 1024 * 1024);
+      const gbB = (b.sizeBytes ?? 0) / (1024 * 1024 * 1024);
       if (preferCompactSize) {
-        const gbA = (a.sizeBytes ?? 0) / (1024 * 1024 * 1024);
-        const gbB = (b.sizeBytes ?? 0) / (1024 * 1024 * 1024);
         const sweetA = gbA >= 1.0 && gbA <= 4.5 ? 1 : 0;
         const sweetB = gbB >= 1.0 && gbB <= 4.5 ? 1 : 0;
         if (sweetB !== sweetA) return sweetB - sweetA;
         if (gbA > 0 && gbB > 0) return gbA - gbB;
+      } else {
+        const sweet4kA = gbA >= 2.0 && gbA <= 22.0 ? 1 : 0;
+        const sweet4kB = gbB >= 2.0 && gbB <= 22.0 ? 1 : 0;
+        if (sweet4kB !== sweet4kA) return sweet4kB - sweet4kA;
       }
       return 0;
     });
@@ -2203,13 +2258,21 @@ export async function rankStreamsByResponsiveness(
       const nativeContainerBonus =
         s.isHls || /\b(mp4|m3u8|aac|opus|faststart)\b/i.test(combinedMeta) ? 45 : 0;
       const h264Bonus = /\b(x264|h\.?264|avc)\b/i.test(combinedMeta) ? 55 : 0;
-      const dvPenalty = /\b(dv|dolby\s*vision|dovi)\b/i.test(combinedMeta) ? -180 : 0;
+      const directCdnBonus =
+        /\b(pixeldrain|fsldownload|fsl(?:-v2)?|b-cdn\.net|111477\.xyz)\b/i.test(combinedMeta)
+          ? 45
+          : 0;
+      const gbSize = (s.sizeBytes ?? 0) / (1024 * 1024 * 1024);
+      const bloatPenalty = gbSize > 30 ? -160 : 0;
+      const dvPenalty = /\b(dv|dolby\s*vision|dovi)\b/i.test(combinedMeta) ? -220 : 0;
       const composite =
         m.responsivenessScore +
         qualityBonus +
         audioBonus +
         nativeContainerBonus +
         h264Bonus +
+        directCdnBonus +
+        bloatPenalty +
         dvPenalty;
       if (composite > bestCompositeScore) {
         bestCompositeScore = composite;

@@ -233,6 +233,7 @@ export interface UnwrappedStreamTarget {
  */
 export async function unwrapMediaStreamUrlWithStatus(
   initialUrl: string,
+  hopTimeoutMs = 14000,
 ): Promise<UnwrappedStreamTarget> {
   if (!isSafePublicUrl(initialUrl, false)) {
     throw new Error('Blocked unsafe stream URL');
@@ -274,7 +275,7 @@ export async function unwrapMediaStreamUrlWithStatus(
 
     try {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 14000);
+      const timer = setTimeout(() => controller.abort(), hopTimeoutMs);
       const resp = await fetch(current, {
         method: 'GET',
         headers: {
@@ -337,6 +338,9 @@ export async function unwrapMediaStreamUrlWithStatus(
     } catch (err) {
       if (err instanceof Error && err.message.startsWith('Blocked unsafe')) {
         throw err;
+      }
+      if (hopTimeoutMs <= 3000) {
+        unreachable = true;
       }
       break;
     }
@@ -1599,7 +1603,10 @@ export function registerStreamzApiMiddlewares(
           const startAt = Date.now();
           try {
             const unwrapStart = Date.now();
-            const unwrapped = await unwrapMediaStreamUrlWithStatus(rawUrl);
+            const unwrapped = await unwrapMediaStreamUrlWithStatus(
+              rawUrl,
+              isPingOnly ? 1800 : 2200,
+            );
             const unwrapMs = Math.max(8, Date.now() - unwrapStart);
             const resolvedUrl = unwrapped.url;
             const isHttps = resolvedUrl.toLowerCase().startsWith('https://');
@@ -1680,7 +1687,7 @@ export function registerStreamzApiMiddlewares(
             }
 
             // If this is an HLS M3U8 playlist (#EXTM3U), verify its first segment URL is actually reachable in a browser
-            // (and not 403 Forbidden like VidFast / truecedar.top / broken Vidy nodes, even when isPingOnly is true!)
+            // (and not 403/404 like VidFast / truecedar.top / broken Vidy nodes / 2-level nebula.bright67.online playlists!)
             if (
               statusOk &&
               (contentType.includes('mpegurl') || firstChunkText.trimStart().startsWith('#EXTM3U'))
@@ -1689,11 +1696,33 @@ export function registerStreamzApiMiddlewares(
               if (firstChunkText.includes('/direct/external/resource/')) {
                 statusOk = false;
               } else {
-                const segMatch = firstChunkText.match(/https?:\/\/[^\s"',\r\n]+/);
-                if (segMatch && isSafePublicUrl(segMatch[0], false)) {
+                const extractFirstHlsEntryUrl = (playlistText: string, baseUrl: string): string | null => {
+                  const mapMatch = playlistText.match(/#EXT-X-MAP:[^\r\n]*URI="([^"]+)"/i);
+                  if (mapMatch?.[1]) {
+                    try {
+                      return new URL(mapMatch[1].trim(), baseUrl).toString();
+                    } catch {
+                      // Fall through
+                    }
+                  }
+                  for (const rawLine of playlistText.split(/\r?\n/)) {
+                    const line = rawLine.trim();
+                    if (!line || line.startsWith('#')) continue;
+                    try {
+                      return new URL(line, baseUrl).toString();
+                    } catch {
+                      // Continue
+                    }
+                  }
+                  const absMatch = playlistText.match(/https?:\/\/[^\s"',\r\n]+/);
+                  return absMatch ? absMatch[0] : null;
+                };
+
+                const firstEntryUrl = extractFirstHlsEntryUrl(firstChunkText, resolvedUrl);
+                if (firstEntryUrl && isSafePublicUrl(firstEntryUrl, false)) {
                   try {
                     const segTargetBytes = isPingOnly ? 1024 : 32768;
-                    const segResp = await fetch(segMatch[0], {
+                    const segResp = await fetch(firstEntryUrl, {
                       method: 'GET',
                       headers: {
                         'User-Agent':
@@ -1713,12 +1742,54 @@ export function registerStreamzApiMiddlewares(
                       await segResp.body?.cancel().catch(() => {});
                     } else if (segResp.body) {
                       const segReader = segResp.body.getReader();
+                      let segFirstChunkText = '';
+                      let segBytesRead = 0;
                       while (bytesRead < segTargetBytes) {
                         const { done, value } = await segReader.read();
                         if (done || !value) break;
+                        if (segBytesRead === 0 && value.byteLength > 0) {
+                          segFirstChunkText = Buffer.from(
+                            value.subarray(0, Math.min(2048, value.byteLength)),
+                          ).toString('utf8');
+                        }
+                        segBytesRead += value.byteLength;
                         bytesRead += value.byteLength;
                       }
                       await segReader.cancel().catch(() => {});
+
+                      // Level-2 HLS Check: If the first entry was a sub-playlist (#EXTM3U, e.g. nebula.bright67.online),
+                      // verify that its first actual media segment (.mp4/.ts/.jpg) is reachable and not 404!
+                      if (segFirstChunkText.trimStart().startsWith('#EXTM3U')) {
+                        if (segFirstChunkText.includes('/direct/external/resource/')) {
+                          statusOk = false;
+                        } else {
+                          const leafSegUrl = extractFirstHlsEntryUrl(
+                            segFirstChunkText,
+                            segResp.url || firstEntryUrl,
+                          );
+                          if (leafSegUrl && isSafePublicUrl(leafSegUrl, false)) {
+                            const leafResp = await fetch(leafSegUrl, {
+                              method: 'GET',
+                              headers: {
+                                'User-Agent':
+                                  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+                                Range: 'bytes=0-1023',
+                              },
+                              redirect: 'follow',
+                              signal: controller.signal,
+                            });
+                            const leafCt = (leafResp.headers.get('content-type') || '').toLowerCase();
+                            await leafResp.body?.cancel().catch(() => {});
+                            if (
+                              leafResp.status < 200 ||
+                              leafResp.status >= 300 ||
+                              leafCt.includes('text/html')
+                            ) {
+                              statusOk = false;
+                            }
+                          }
+                        }
+                      }
                     }
                   } catch {
                     statusOk = false;

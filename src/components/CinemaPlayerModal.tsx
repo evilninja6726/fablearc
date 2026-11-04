@@ -620,7 +620,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
 
     const rankWithTimeout = async (
       candidateList: StremioStreamItem[],
-      timeoutMs = 2600,
+      timeoutMs = 4500,
     ): Promise<StremioStreamItem[]> => {
       try {
         return await Promise.race([
@@ -638,15 +638,16 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       prevList: StremioStreamItem[],
       incomingList: StremioStreamItem[],
     ): StremioStreamItem[] => {
-      if (prevList.length === 0) return incomingList;
+      const cleanIncoming = incomingList.filter((s) => s.kind !== 'youtube');
+      if (prevList.length === 0) return cleanIncoming;
       const measuredById = new Map<string, StremioStreamItem>();
       for (const p of prevList) {
         if (p.serverStatusBadge || p.isTopResponsive || p.ttfbMs !== undefined) {
           measuredById.set(p.id, p);
         }
       }
-      if (measuredById.size === 0) return incomingList;
-      const merged = incomingList
+      if (measuredById.size === 0) return cleanIncoming;
+      const merged = cleanIncoming
         .map((itemStream) => {
           const measured = measuredById.get(itemStream.id);
           return measured ? { ...itemStream, ...measured } : itemStream;
@@ -664,11 +665,17 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       list: StremioStreamItem[],
     ): StremioStreamItem | null =>
       list.find((s) => s.isTopResponsive && !s.unreachable) ??
+      list.find(
+        (s) =>
+          s.kind === 'direct' &&
+          !s.isPromo &&
+          !s.unreachable &&
+          Boolean(s.serverStatusBadge),
+      ) ??
       list.find((s) => s.kind === 'direct' && !s.isPromo && !s.unreachable) ??
       list.find((s) => s.kind === 'direct' && !s.isPromo) ??
       list.find((s) => s.kind === 'magnet' && !s.isPromo) ??
-      list.find((s) => s.kind === 'youtube') ??
-      list[0] ??
+      list.find((s) => s.kind !== 'youtube') ??
       null;
 
     const loadStreams = async () => {
@@ -677,7 +684,8 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         initialStreams.length > 0 &&
         activeVideoId === initialTargetId
       ) {
-        const hydratedInitial = applyCachedServerHealth(initialStreams);
+        const nonTrailerInitial = initialStreams.filter((s) => s.kind !== 'youtube');
+        const hydratedInitial = applyCachedServerHealth(nonTrailerInitial);
         const hasRankedWinner = hydratedInitial.some((s) => s.isTopResponsive);
         const orderedInitial = hasRankedWinner
           ? hydratedInitial
@@ -734,7 +742,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
 
         setLoadingStreams(true);
         try {
-          const ranked = await rankWithTimeout(orderedInitial, 2400);
+          const ranked = await rankWithTimeout(orderedInitial, 4500);
           if (cancelled) return;
           const finalRanked = ranked.length > 0 ? ranked : orderedInitial;
           setStreams((prev) =>
@@ -764,7 +772,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
           return;
         }
 
-        const rankedWave = await rankWithTimeout(waveList, 2400);
+        const rankedWave = await rankWithTimeout(waveList, 4500);
         if (cancelled) return;
         const bestWave = rankedWave.length > 0 ? rankedWave : waveList;
         setStreams((prev) =>
@@ -811,7 +819,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
           return;
         }
 
-        const ranked = await rankWithTimeout(sorted, firstWaveStarted ? 3800 : 2400);
+        const ranked = await rankWithTimeout(sorted, 4500);
         if (cancelled) return;
         const finalRanked = ranked.length > 0 ? ranked : sorted;
         setStreams((prev) => mergeWithMeasuredMetrics(finalRanked, finalRanked));
@@ -1072,15 +1080,12 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     }
 
     const streamUrl = currentStream.url;
-    // Fast-Start Audio & Video: If the background server benchmark already unwrapped the CDN URL,
-    // use it immediately so <video> and <audio> start loading in 0ms in parallel with /api/media-probe!
     const preResolvedCdn =
       currentStream.resolvedDirectUrl &&
       /^https?:\/\//i.test(currentStream.resolvedDirectUrl)
         ? currentStream.resolvedDirectUrl
         : streamUrl;
     setResolvedDirectUrl(preResolvedCdn);
-    setProbedStreamUrl(streamUrl);
 
     const isM3u8 =
       currentStream.isHls || streamUrl.toLowerCase().includes('.m3u8');
@@ -1101,7 +1106,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
           ? probe.resolvedUrl
           : preResolvedCdn;
 
-      // 1. Auto-skip dead (404 / 451 / signin.mp4) upstream servers immediately
+      // 1. Auto-skip dead (404 / 451 / signin.mp4) upstream servers immediately before mounting <video>/<audio>
       if (
         probe?.unreachable ||
         /\/signin\.mp4(\?|$)/i.test(targetCdnUrl) ||
@@ -1154,8 +1159,8 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     };
 
     // Layer 3 (Synchronous Probe Fast-Path):
-    // If the Details Page already pre-warmed `/api/media-probe` for this server, apply the cached probe
-    // synchronously in 0ms without showing "Loading..." or waiting for an async fetch tick!
+    // If the Details Page or rankStreamsByResponsiveness already pre-warmed `/api/media-probe` for this server,
+    // apply the cached probe synchronously in 0ms without waiting for an async fetch tick!
     const cachedProbe =
       getCachedMediaProbe(streamUrl) ?? getCachedMediaProbe(preResolvedCdn);
     if (cachedProbe) {
@@ -1163,6 +1168,9 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       return;
     }
 
+    // Hold <video> and <audio> loading until /api/media-probe confirms reachability & audio codec
+    // so dead servers or track switches never trigger (canceled) media requests!
+    setProbedStreamUrl(null);
     let cancelled = false;
     setProbingAudio(true);
     setProbedAudioTracks([]);
