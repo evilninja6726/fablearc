@@ -39,6 +39,7 @@ import {
   fetchSubtitlesFromAddons,
   getAudioTrackLanguagePriority,
   getCachedMediaProbe,
+  getStreamProviderCategory,
   InstalledAddon,
   isUnreachableOrSlowStream,
   markStreamUnreachableInCache,
@@ -292,6 +293,36 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     const preRanked = initialStreams?.find((s) => s.isTopResponsive && !s.unreachable);
     return preRanked ?? null;
   });
+  const [selectedProviderCategory, setSelectedProviderCategory] = useState<string>('all');
+
+  const providerCategories = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const s of streams) {
+      const cat = getStreamProviderCategory(s);
+      counts.set(cat, (counts.get(cat) ?? 0) + 1);
+    }
+    const list: Array<{ id: string; label: string; count: number }> = [
+      { id: 'all', label: 'All', count: streams.length },
+    ];
+    counts.forEach((count, cat) => {
+      list.push({ id: cat, label: cat, count });
+    });
+    return list;
+  }, [streams]);
+
+  const effectiveProviderCategory = useMemo(() => {
+    if (selectedProviderCategory === 'all') return 'all';
+    return providerCategories.some((c) => c.id === selectedProviderCategory)
+      ? selectedProviderCategory
+      : 'all';
+  }, [providerCategories, selectedProviderCategory]);
+
+  const filteredStreamsByProvider = useMemo(() => {
+    if (effectiveProviderCategory === 'all') return streams;
+    return streams.filter(
+      (s) => getStreamProviderCategory(s) === effectiveProviderCategory,
+    );
+  }, [effectiveProviderCategory, streams]);
 
   // Audio Track / Multi-Language state (probed via FFmpeg or HLS audioTracks)
   const [probedAudioTracks, setProbedAudioTracks] = useState<ProbedAudioTrack[]>([]);
@@ -708,18 +739,14 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     };
 
     loadStreams();
+    setSelectedProviderCategory('all');
+    setSubStyle((s) => ({ ...s, enabled: false }));
 
     fetchSubtitlesFromAddons(addons, media.type, activeVideoId).then((tracks) => {
       if (cancelled) return;
       setSubtitleTracks(tracks);
-      const preferredEng =
-        tracks.find((t) => t.lang.toLowerCase().startsWith('eng')) ?? tracks[0];
-      if (preferredEng) {
-        setSelectedSubtitleTrackId(preferredEng.id);
-      } else {
-        setSelectedSubtitleTrackId('');
-        setRawSubtitleContent('');
-      }
+      setSelectedSubtitleTrackId('');
+      setRawSubtitleContent('');
     });
 
     return () => {
@@ -2977,19 +3004,39 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
               </button>
             </div>
 
-            {/* 1. QUALITY / STREAMS DROPDOWN (Sorted by Quality First, Then Multi-Audio Priority) */}
+            {/* 1. QUALITY / STREAMS DROPDOWN (Categorized by Provider & Sorted by Quality + Multi-Audio) */}
             {activePopover === 'quality' && (
               <div className="bottom-popover-body">
+                {providerCategories.length > 1 && (
+                  <div
+                    className="button-strip compact provider-category-tabs"
+                    style={{ flexWrap: 'wrap', marginBottom: 8 }}
+                  >
+                    {providerCategories.map((cat) => (
+                      <button
+                        key={cat.id}
+                        type="button"
+                        className={
+                          effectiveProviderCategory === cat.id ? 'active-chip-btn' : ''
+                        }
+                        onClick={() => setSelectedProviderCategory(cat.id)}
+                      >
+                        {cat.label} ({cat.count})
+                      </button>
+                    ))}
+                  </div>
+                )}
                 <div className="popover-list-scroll">
-                  {streams.length === 0 ? (
+                  {filteredStreamsByProvider.length === 0 ? (
                     <p className="drawer-help-copy">
                       {loadingStreams
                         ? 'Finding available streams…'
                         : 'No streams available for this title right now.'}
                     </p>
                   ) : (
-                    streams.map((stream) => {
+                    filteredStreamsByProvider.map((stream) => {
                       const isSelected = activeStream?.id === stream.id;
+                      const providerLabel = getStreamProviderCategory(stream);
                       const tierClass =
                         (stream.qualityScore ?? 0) >= 2160
                           ? 'tier-4k'
@@ -3043,7 +3090,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                               {stream.sizeLabel && (
                                 <span className="mono size-pill">{stream.sizeLabel}</span>
                               )}
-                              <span className="addon-origin-tag">{stream.addonName}</span>
+                              <span className="addon-origin-tag">{providerLabel}</span>
                             </div>
                             <span className="popover-option-sub">{stream.title}</span>
                           </div>

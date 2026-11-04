@@ -1361,6 +1361,35 @@ const inFlightStreamFetches = new Map<string, Promise<StremioStreamItem[]>>();
  * merges trailers, and returns streams sorted in strictly decreasing order of quality.
  * Uses single-flight request coalescing + a 5-minute in-memory cache so card-hover prefetching makes Details/Player load in 0ms.
  */
+export function getStreamProviderCategory(
+  stream: Pick<StremioStreamItem, 'addonId' | 'addonName'>,
+): string {
+  const idLower = String(stream.addonId || '').toLowerCase();
+  const nameLower = String(stream.addonName || '').toLowerCase();
+  if (idLower.includes('pengu') || nameLower.includes('pengu')) {
+    return 'PenguPlay';
+  }
+  if (idLower.includes('hdhub') || nameLower.includes('hdhub')) {
+    return 'HdHub';
+  }
+  if (idLower.includes('111477') || nameLower.includes('111477')) {
+    return '111477';
+  }
+  if (idLower.includes('webstreamr') || nameLower.includes('webstreamr')) {
+    return 'WebStreamr';
+  }
+  if (idLower.includes('pwoi7q4u220fz') || nameLower.includes('hindi & indian ott')) {
+    return 'CNCVerse · Hindi & Indian OTT';
+  }
+  if (idLower.includes('p2tztbugmd1ys') || nameLower.includes('english & 4k')) {
+    return 'CNCVerse · English & 4K';
+  }
+  if (idLower.includes('pkhcby2w1jpgc') || nameLower.includes('anime & cartoons')) {
+    return 'CNCVerse · Anime & Cartoons';
+  }
+  return stream.addonName?.trim() || stream.addonId?.trim() || 'Other';
+}
+
 export async function fetchStreamsFromAddons(
   addons: InstalledAddon[],
   mediaType: string,
@@ -1392,10 +1421,10 @@ export async function fetchStreamsFromAddons(
 
   const fetchPromise = (async (): Promise<StremioStreamItem[]> => {
     const results: StremioStreamItem[] = [];
-    const seenDirectUrls = new Set<string>();
 
     await Promise.allSettled(
       streamAddons.map(async (addon) => {
+        const seenAddonUrls = new Set<string>();
         const effectiveManifestUrl = upgradeLegacyDefaultAddonUrl(addon.manifestUrl);
         const baseUrl = effectiveManifestUrl.replace(/\/manifest\.json$/i, '');
         const endpoint = `${baseUrl}/stream/${encodeURIComponent(mediaType)}/${encodeURIComponent(videoId)}.json`;
@@ -1507,13 +1536,17 @@ export async function fetchStreamsFromAddons(
             if (
               urlCheck.allowed &&
               urlCheck.normalizedUrl &&
-              !seenDirectUrls.has(urlCheck.normalizedUrl)
+              !seenAddonUrls.has(urlCheck.normalizedUrl)
             ) {
-              seenDirectUrls.add(urlCheck.normalizedUrl);
+              seenAddonUrls.add(urlCheck.normalizedUrl);
+              const normalizedProviderName = getStreamProviderCategory({
+                addonId: addon.manifest.id,
+                addonName: addon.manifest.name,
+              });
               results.push({
                 id: `${addon.manifest.id}-direct-${idx}`,
                 addonId: addon.manifest.id,
-                addonName: addon.manifest.name,
+                addonName: normalizedProviderName,
                 name,
                 title,
                 kind: 'direct',

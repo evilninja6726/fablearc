@@ -43,6 +43,7 @@ import {
   fetchMetaFromAddons,
   fetchStreamsFromAddons,
   fetchStremioManifest,
+  getStreamProviderCategory,
   InstalledAddon,
   isUnreachableOrSlowStream,
   parseStreamingCatalogsConfig,
@@ -534,8 +535,38 @@ export const App: React.FC = () => {
   const [dossierSelectedSeason, setDossierSelectedSeason] = useState<number>(1);
   const [dossierEpisodeQuery, setDossierEpisodeQuery] = useState<string>('');
   const [dossierShowStreams, setDossierShowStreams] = useState<boolean>(false);
+  const [dossierProviderCategory, setDossierProviderCategory] = useState<string>('all');
   const [dossierSimilarPool, setDossierSimilarPool] = useState<StremioMediaItem[]>([]);
   const dossierScrollRef = useRef<HTMLDivElement | null>(null);
+
+  const dossierProviderCategories = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const s of dossierStreams) {
+      const cat = getStreamProviderCategory(s);
+      counts.set(cat, (counts.get(cat) ?? 0) + 1);
+    }
+    const list: Array<{ id: string; label: string; count: number }> = [
+      { id: 'all', label: 'All', count: dossierStreams.length },
+    ];
+    counts.forEach((count, cat) => {
+      list.push({ id: cat, label: cat, count });
+    });
+    return list;
+  }, [dossierStreams]);
+
+  const effectiveDossierProviderCategory = useMemo(() => {
+    if (dossierProviderCategory === 'all') return 'all';
+    return dossierProviderCategories.some((c) => c.id === dossierProviderCategory)
+      ? dossierProviderCategory
+      : 'all';
+  }, [dossierProviderCategories, dossierProviderCategory]);
+
+  const filteredDossierStreams = useMemo(() => {
+    if (effectiveDossierProviderCategory === 'all') return dossierStreams;
+    return dossierStreams.filter(
+      (s) => getStreamProviderCategory(s) === effectiveDossierProviderCategory,
+    );
+  }, [dossierStreams, effectiveDossierProviderCategory]);
 
   // Custom Watchlist Collections ("plan", "watching", "completed", "favorites") & Personal 1-5 Star Ratings
   const [watchlistFilterTab, setWatchlistFilterTab] = useState<
@@ -1377,6 +1408,7 @@ export const App: React.FC = () => {
       setDossierSelectedSeason(1);
       setDossierEpisodeQuery('');
       setDossierShowStreams(false);
+      setDossierProviderCategory('all');
       setDossierLoadingMeta(true);
       setDossierLoadingStreams(true);
       setDossierStreams([]);
@@ -4198,15 +4230,48 @@ export const App: React.FC = () => {
               {/* Collapsible / Expandable Server & Quality Picker */}
               {dossierShowStreams && (
                 <div className="dossier-section">
-                  <span className="drawer-label">
-                    {dossierLoadingStreams
-                      ? 'Finding best quality streams…'
-                      : dossierBenchmarkingServers
-                        ? `Benchmarking Servers in Background (${dossierStreams.length})…`
-                        : `Available Servers — Fastest & Zero-Buffer First (${dossierStreams.length})`}
-                  </span>
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      gap: 10,
+                      flexWrap: 'wrap',
+                      marginBottom: 10,
+                    }}
+                  >
+                    <span className="drawer-label" style={{ marginBottom: 0 }}>
+                      {dossierLoadingStreams
+                        ? 'Finding best quality streams…'
+                        : dossierBenchmarkingServers
+                          ? `Benchmarking Servers in Background (${dossierStreams.length})…`
+                          : `Available Servers — Fastest & Zero-Buffer First (${filteredDossierStreams.length})`}
+                    </span>
+                    {dossierProviderCategories.length > 1 && (
+                      <div
+                        className="button-strip compact provider-category-tabs"
+                        style={{ flexWrap: 'wrap' }}
+                      >
+                        {dossierProviderCategories.map((cat) => (
+                          <button
+                            key={cat.id}
+                            type="button"
+                            className={
+                              effectiveDossierProviderCategory === cat.id
+                                ? 'active-chip-btn'
+                                : ''
+                            }
+                            onClick={() => setDossierProviderCategory(cat.id)}
+                          >
+                            {cat.label} ({cat.count})
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                   <div className="dossier-streams-list">
-                    {dossierStreams.map((st) => {
+                    {filteredDossierStreams.map((st) => {
+                      const providerLabel = getStreamProviderCategory(st);
                       const tierClass =
                         (st.qualityScore ?? 0) >= 2160
                           ? 'tier-4k'
@@ -4265,7 +4330,7 @@ export const App: React.FC = () => {
                               {st.sizeLabel && (
                                 <span className="mono size-pill">{st.sizeLabel}</span>
                               )}
-                              <span className="addon-origin-tag">{st.addonName}</span>
+                              <span className="addon-origin-tag">{providerLabel}</span>
                             </div>
                             <div className="stream-choice-meta">
                               <span>{st.title}</span>

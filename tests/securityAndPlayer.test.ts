@@ -7,6 +7,7 @@ import {
 } from '../src/security/securityGuards';
 import {
   computeAutoSyncDelayMs,
+  DEFAULT_SUBTITLE_STYLE,
   findActiveCue,
   parseSubtitles,
 } from '../src/player/subtitleEngine';
@@ -18,6 +19,7 @@ import {
   DEFAULT_BOOTSTRAP_MANIFEST_URLS,
   DEFAULT_PENGUPLAY_MANIFEST_URL,
   extractStreamQualityInfo,
+  getStreamProviderCategory,
   isUnreachableOrSlowStream,
   markStreamUnreachableInCache,
   normalizeStremioMeta,
@@ -405,7 +407,21 @@ describe('Subtitle & Non-AI AutoSync Engine', () => {
 Check the telemetry on the Oude Kerk relay.
 `;
 
-  it('parses WebVTT cues, strips SDH when toggled, and computes AutoSync delay', () => {
+  it('parses WebVTT cues, strips SDH when toggled, computes AutoSync delay, and keeps subtitles off by default', () => {
+    expect(DEFAULT_SUBTITLE_STYLE.enabled).toBe(false);
+    expect(
+      getStreamProviderCategory({ addonId: 'org.pengu.stream', addonName: 'PenguPlay' }),
+    ).toBe('PenguPlay');
+    expect(
+      getStreamProviderCategory({ addonId: 'com.stremio.HdHub', addonName: 'HdHub' }),
+    ).toBe('HdHub');
+    expect(
+      getStreamProviderCategory({
+        addonId: 'com.cncverse.stremiobridge.p2tztbugmd1ys',
+        addonName: 'CNCVerse Bridge',
+      }),
+    ).toBe('CNCVerse · English & 4K');
+
     const cues = parseSubtitles(sampleVtt);
     expect(cues).toHaveLength(1);
     expect(cues[0].startMs).toBe(2000);

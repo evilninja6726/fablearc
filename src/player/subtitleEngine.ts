@@ -18,7 +18,7 @@ export interface SubtitleStyleConfig {
 }
 
 export const DEFAULT_SUBTITLE_STYLE: SubtitleStyleConfig = {
-  enabled: true,
+  enabled: false,
   delayMs: 0,
   fontSizePx: 22,
   textColor: '#EAE6DF',
