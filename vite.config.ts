@@ -251,10 +251,11 @@ export async function unwrapMediaStreamUrlWithStatus(
       throw new Error('Blocked unsafe redirect target');
     }
 
-    // Check if current URL itself has a ?link=https://... query parameter
+    // Check if current URL itself has a ?d=https://..., ?link=https://..., or ?url=https://... query parameter
     try {
       const parsedCurrent = new URL(current);
       const embeddedLink =
+        parsedCurrent.searchParams.get('d') ||
         parsedCurrent.searchParams.get('link') ||
         parsedCurrent.searchParams.get('url');
       if (embeddedLink && /^https?:\/\//i.test(embeddedLink)) {
@@ -296,7 +297,9 @@ export async function unwrapMediaStreamUrlWithStatus(
         }
         const parsedNext = new URL(nextUrl);
         const embedded =
-          parsedNext.searchParams.get('link') || parsedNext.searchParams.get('url');
+          parsedNext.searchParams.get('d') ||
+          parsedNext.searchParams.get('link') ||
+          parsedNext.searchParams.get('url');
         if (embedded && /^https?:\/\//i.test(embedded)) {
           if (!isSafePublicUrl(embedded, false)) {
             throw new Error('Blocked unsafe redirect target');
@@ -315,10 +318,19 @@ export async function unwrapMediaStreamUrlWithStatus(
         }
         continue;
       }
+      const respCt = (resp.headers.get('content-type') || '').toLowerCase();
       if (resp.status >= 200 && resp.status < 300) {
-        reachedReachableTarget = true;
-        unreachable = false;
-      } else if (resp.status === 404 || resp.status === 410 || resp.status === 451) {
+        if (respCt.includes('text/html')) {
+          unreachable = true;
+        } else {
+          reachedReachableTarget = true;
+          unreachable = false;
+        }
+      } else if (
+        resp.status >= 400 &&
+        resp.status !== 405 &&
+        resp.status !== 416
+      ) {
         unreachable = true;
       }
       break;
@@ -1659,38 +1671,58 @@ export function registerStreamzApiMiddlewares(
               await resp.body?.cancel().catch(() => {});
             }
 
-            // If this is an HLS M3U8 playlist (#EXTM3U), verify its first segment URL is actually reachable (not 403 Forbidden like broken Vidy nodes)
+            // Reject HTML error pages masquerading as 200/206 video responses (e.g. broken Cloudflare workers returning text/html)
             if (
-              !isPingOnly &&
+              contentType.includes('text/html') ||
+              /^\s*(<!doctype\s+html|<html|<\?xml|\{"error")/i.test(firstChunkText)
+            ) {
+              statusOk = false;
+            }
+
+            // If this is an HLS M3U8 playlist (#EXTM3U), verify its first segment URL is actually reachable in a browser
+            // (and not 403 Forbidden like VidFast / truecedar.top / broken Vidy nodes, even when isPingOnly is true!)
+            if (
               statusOk &&
               (contentType.includes('mpegurl') || firstChunkText.trimStart().startsWith('#EXTM3U'))
             ) {
-              const segMatch = firstChunkText.match(/https?:\/\/[^\s"',\r\n]+/);
-              if (segMatch && isSafePublicUrl(segMatch[0], false)) {
-                try {
-                  const segResp = await fetch(segMatch[0], {
-                    method: 'GET',
-                    headers: {
-                      'User-Agent':
-                        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-                      Range: 'bytes=0-32767',
-                    },
-                    redirect: 'follow',
-                    signal: controller.signal,
-                  });
-                  if (segResp.status < 200 || segResp.status >= 300) {
-                    statusOk = false;
-                  } else if (segResp.body) {
-                    const segReader = segResp.body.getReader();
-                    while (bytesRead < 32768) {
-                      const { done, value } = await segReader.read();
-                      if (done || !value) break;
-                      bytesRead += value.byteLength;
+              // Segments wrapped in /direct/external/resource/ require forged Referer/X-CSRF-Token headers that browsers cannot send on redirect
+              if (firstChunkText.includes('/direct/external/resource/')) {
+                statusOk = false;
+              } else {
+                const segMatch = firstChunkText.match(/https?:\/\/[^\s"',\r\n]+/);
+                if (segMatch && isSafePublicUrl(segMatch[0], false)) {
+                  try {
+                    const segTargetBytes = isPingOnly ? 1024 : 32768;
+                    const segResp = await fetch(segMatch[0], {
+                      method: 'GET',
+                      headers: {
+                        'User-Agent':
+                          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+                        Range: `bytes=0-${segTargetBytes - 1}`,
+                      },
+                      redirect: 'follow',
+                      signal: controller.signal,
+                    });
+                    const segCt = (segResp.headers.get('content-type') || '').toLowerCase();
+                    if (
+                      segResp.status < 200 ||
+                      segResp.status >= 300 ||
+                      segCt.includes('text/html')
+                    ) {
+                      statusOk = false;
+                      await segResp.body?.cancel().catch(() => {});
+                    } else if (segResp.body) {
+                      const segReader = segResp.body.getReader();
+                      while (bytesRead < segTargetBytes) {
+                        const { done, value } = await segReader.read();
+                        if (done || !value) break;
+                        bytesRead += value.byteLength;
+                      }
+                      await segReader.cancel().catch(() => {});
                     }
-                    await segReader.cancel().catch(() => {});
+                  } catch {
+                    statusOk = false;
                   }
-                } catch {
-                  statusOk = false;
                 }
               }
             }

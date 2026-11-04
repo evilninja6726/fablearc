@@ -593,7 +593,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         return await Promise.race([
           rankStreamsByResponsiveness(candidateList),
           new Promise<StremioStreamItem[]>((resolve) =>
-            window.setTimeout(() => resolve(candidateList), 3800),
+            window.setTimeout(() => resolve(candidateList), 6000),
           ),
         ]);
       } catch {
@@ -1217,7 +1217,12 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         audio.load();
       }
       directVideoLoadedUrlRef.current = null;
-      const hls = new Hls({ enableWorker: true });
+      const hls = new Hls({
+        enableWorker: true,
+        fragLoadingMaxRetry: 1,
+        manifestLoadingMaxRetry: 1,
+        levelLoadingMaxRetry: 1,
+      });
       hlsRef.current = hls;
       hls.loadSource(activeStream.url);
       hls.attachMedia(video);
@@ -1231,6 +1236,16 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         video.play().catch(() => {
           setIsPlaying(false);
         });
+      });
+      hls.on(Hls.Events.ERROR, (_event, data) => {
+        const statusCode = data?.response?.code;
+        if (data.fatal || statusCode === 403 || statusCode === 404 || statusCode === 410) {
+          hls.destroy();
+          if (hlsRef.current === hls) {
+            hlsRef.current = null;
+          }
+          switchToNextStreamRef.current('HLS stream unavailable or forbidden');
+        }
       });
     } else if (isSplitAudioMode) {
       // Split Direct-Video + Real-Time MP3 Audio-Only Transcode:

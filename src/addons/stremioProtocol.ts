@@ -974,10 +974,12 @@ function isDirectCorsFastPathUrl(url: string): boolean {
     ) {
       return false;
     }
-    // Public CORS-enabled catalog, metadata & stream addons (including Torrentio & HDHub4u)
+    // Public CORS-enabled catalog, metadata & stream addons (including CNCVerse Bridge, Torrentio & HDHub4u)
     // resolve directly from the browser with 0 Bytes of Render bandwidth and bypass datacenter IP blocks!
     if (
       host === 'v3-cinemeta.strem.io' ||
+      host === 'cncverse.dpdns.org' ||
+      host.endsWith('.dpdns.org') ||
       host === 'torrentio.strem.fun' ||
       host.endsWith('.strem.fun') ||
       host === 'hdhub.thevolecitor.qzz.io' ||
@@ -1170,12 +1172,32 @@ export async function fetchStremioManifest(rawInput: string): Promise<{
         : undefined,
     }));
 
+  const normalizedProfileId = String(data.id ?? '').toLowerCase();
+  const normalizedActiveUrl = activeManifestUrl.toLowerCase();
+  let resolvedManifestName = data.name;
+  if (
+    normalizedProfileId.includes('pwoi7q4u220fz') ||
+    normalizedActiveUrl.includes('p_woi7q4u220fz')
+  ) {
+    resolvedManifestName = 'CNCVerse · Hindi & Indian OTT';
+  } else if (
+    normalizedProfileId.includes('p2tztbugmd1ys') ||
+    normalizedActiveUrl.includes('p_2tztbugmd1ys')
+  ) {
+    resolvedManifestName = 'CNCVerse · English & 4K';
+  } else if (
+    normalizedProfileId.includes('pkhcby2w1jpgc') ||
+    normalizedActiveUrl.includes('p_khcby2w1jpgc')
+  ) {
+    resolvedManifestName = 'CNCVerse · Anime & Cartoons';
+  }
+
   return {
     manifestUrl: activeManifestUrl,
     manifest: {
       id: data.id,
       version: typeof data.version === 'string' ? data.version : '1.0.0',
-      name: data.name,
+      name: resolvedManifestName,
       description:
         typeof data.description === 'string' && stripDiscordText(data.description)
           ? stripDiscordText(data.description)
@@ -1370,6 +1392,7 @@ export async function fetchStreamsFromAddons(
 
   const fetchPromise = (async (): Promise<StremioStreamItem[]> => {
     const results: StremioStreamItem[] = [];
+    const seenDirectUrls = new Set<string>();
 
     await Promise.allSettled(
       streamAddons.map(async (addon) => {
@@ -1439,6 +1462,23 @@ export async function fetchStreamsFromAddons(
 
           if (typeof raw.url === 'string' && raw.url.trim()) {
             let candidateStreamUrl = raw.url.trim();
+            if (candidateStreamUrl.toLowerCase().startsWith('magnet:')) {
+              return;
+            }
+            // Unwrap proxy wrapper query params (e.g. `http://140.238.244.130/proxy/bound?d=https%3A%2F%2Fpixeldrain.dev...`)
+            // so the browser connects directly to the underlying HTTPS CDN!
+            try {
+              const parsedCandidate = new URL(candidateStreamUrl);
+              const embeddedTarget =
+                parsedCandidate.searchParams.get('d') ||
+                parsedCandidate.searchParams.get('link') ||
+                parsedCandidate.searchParams.get('url');
+              if (embeddedTarget && /^https?:\/\//i.test(embeddedTarget.trim())) {
+                candidateStreamUrl = embeddedTarget.trim();
+              }
+            } catch {
+              // Keep original candidateStreamUrl
+            }
             // Auto-upgrade http:// stream URLs when they point to the same HTTPS-enabled addon host
             // (e.g. HdHub returning `http://hdhub.thevolecitor.qzz.io/resolve/...` even though the host serves HTTPS)
             if (candidateStreamUrl.startsWith('http://')) {
@@ -1464,7 +1504,12 @@ export async function fetchStreamsFromAddons(
               requireHttps: false,
               allowExplicitLanMediaServer: false,
             });
-            if (urlCheck.allowed && urlCheck.normalizedUrl) {
+            if (
+              urlCheck.allowed &&
+              urlCheck.normalizedUrl &&
+              !seenDirectUrls.has(urlCheck.normalizedUrl)
+            ) {
+              seenDirectUrls.add(urlCheck.normalizedUrl);
               results.push({
                 id: `${addon.manifest.id}-direct-${idx}`,
                 addonId: addon.manifest.id,
@@ -1899,23 +1944,28 @@ export async function rankStreamsByResponsiveness(
     (s) => (s.qualityScore ?? 0) >= 1080 && (s.qualityScore ?? 0) < 2160,
   );
 
-  // Prefer FSL / R2 / 2Peckle servers with distinct mirror names and sweet-spot file sizes for instant zero-buffer start
+  // Prefer FSL / R2 / PixelDrain / BunnyCDN servers with distinct mirror names and browser-native H.264 / sweet-spot sizes for instant zero-buffer start
   const pickDistinctMirrors = (
     list: StremioStreamItem[],
     count: number,
     preferCompactSize = false,
   ): StremioStreamItem[] => {
     const scored = [...list].sort((a, b) => {
-      const metaA = `${a.name} ${a.title}`;
-      const metaB = `${b.name} ${b.title}`;
+      const metaA = `${a.name} ${a.title} ${a.url || ''}`;
+      const metaB = `${b.name} ${b.title} ${b.url || ''}`;
       const hostScore = (meta: string): number => {
-        if (/\b(fsl(?:-v2)?|r2|2peckle)\b/i.test(meta)) return 3;
+        if (/\b(fsl(?:-v2)?|r2|2peckle|b-cdn\.net|fsldownload)\b/i.test(meta)) return 3;
         if (/\b(pixeldrain)\b/i.test(meta)) return 2;
         if (/\b(arctic)\b/i.test(meta)) return 1;
         return 0;
       };
       const hDiff = hostScore(metaB) - hostScore(metaA);
       if (hDiff !== 0) return hDiff;
+
+      // Prefer non-Dolby-Vision streams over 4K DV profiles that often fail hardware decode in HTML5 <video>
+      const dvPenaltyA = /\b(dv|dolby\s*vision|dovi)\b/i.test(metaA) ? 1 : 0;
+      const dvPenaltyB = /\b(dv|dolby\s*vision|dovi)\b/i.test(metaB) ? 1 : 0;
+      if (dvPenaltyA !== dvPenaltyB) return dvPenaltyA - dvPenaltyB;
 
       const audioA = a.audioScore ?? (a.isMultiAudio ? 1 : 0);
       const audioB = b.audioScore ?? (b.isMultiAudio ? 1 : 0);
@@ -2050,11 +2100,19 @@ export async function rankStreamsByResponsiveness(
           : Math.min(35, ((s.qualityScore ?? 720) / 2160) * 35);
       const audioBonus = (s.audioScore ?? 0) * 30;
       const combinedMeta = `${s.name} ${s.title} ${s.url || ''}`.toLowerCase();
-      // Layer 3: Reward fast-seek MP4/HLS containers and browser-native AAC/Opus audio codecs
+      // Layer 3: Reward fast-seek MP4/HLS containers, universal H.264 video codec, and browser-native AAC/Opus audio codecs;
+      // penalize 4K Dolby Vision profiles (`DV`/`DoVi`) that frequently fail HTML5 <video> decode in browsers.
       const nativeContainerBonus =
         s.isHls || /\b(mp4|m3u8|aac|opus|faststart)\b/i.test(combinedMeta) ? 45 : 0;
+      const h264Bonus = /\b(x264|h\.?264|avc)\b/i.test(combinedMeta) ? 55 : 0;
+      const dvPenalty = /\b(dv|dolby\s*vision|dovi)\b/i.test(combinedMeta) ? -180 : 0;
       const composite =
-        m.responsivenessScore + qualityBonus + audioBonus + nativeContainerBonus;
+        m.responsivenessScore +
+        qualityBonus +
+        audioBonus +
+        nativeContainerBonus +
+        h264Bonus +
+        dvPenalty;
       if (composite > bestCompositeScore) {
         bestCompositeScore = composite;
         bestStreamId = s.id;
@@ -2294,6 +2352,9 @@ export function upgradeLegacyDefaultAddonUrl(manifestUrl: string): string {
 export const DEFAULT_BOOTSTRAP_MANIFEST_URLS: string[] = [
   // Streaming Catalogs addon commented out (code preserved):
   // 'https://7a82163c306e-stremio-netflix-catalog-addon.baby-beamup.club/manifest.json',
+  'https://cncverse.dpdns.org/u/p_woi7q4u220fz/manifest.json',
+  'https://cncverse.dpdns.org/u/p_2tztbugmd1ys/manifest.json',
+  'https://cncverse.dpdns.org/u/p_khcby2w1jpgc/manifest.json',
   'https://aiometadata.elfhosted.com/stremio/manifest.json',
   'https://87d6a6ef6b58-webstreamrmbg.baby-beamup.club/manifest.json',
   DEFAULT_PENGUPLAY_MANIFEST_URL,

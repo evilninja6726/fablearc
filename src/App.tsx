@@ -965,10 +965,20 @@ export const App: React.FC = () => {
   useEffect(() => {
     const missingDefaultUrls = DEFAULT_BOOTSTRAP_MANIFEST_URLS.filter((defaultUrl) => {
       try {
-        const defaultHost = new URL(defaultUrl).hostname.toLowerCase();
+        const parsedDefault = new URL(defaultUrl);
+        const defaultHost = parsedDefault.hostname.toLowerCase();
+        const defaultPath = parsedDefault.pathname.replace(/\/+$/, '').toLowerCase();
+        const isMultiProfileHost =
+          defaultHost.includes('cncverse.dpdns.org') || defaultPath.includes('/u/p_');
         return !addons.some((existing) => {
           try {
-            return new URL(existing.manifestUrl).hostname.toLowerCase() === defaultHost;
+            const parsedExisting = new URL(existing.manifestUrl);
+            const existingHost = parsedExisting.hostname.toLowerCase();
+            if (isMultiProfileHost) {
+              const existingPath = parsedExisting.pathname.replace(/\/+$/, '').toLowerCase();
+              return existingHost === defaultHost && existingPath === defaultPath;
+            }
+            return existingHost === defaultHost;
           } catch {
             return false;
           }
