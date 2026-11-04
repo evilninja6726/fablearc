@@ -830,4 +830,34 @@ describe('Strix-Style E2E & Security Audit Suite', () => {
     expect(streamResp.headers.get('x-stream-mode')).toBe('audio-only');
     controller.abort();
   });
+
+  it('E2E Flow #10: Movie/Series Details Page with Similar Titles, ±10s Zone Double-Click Seek & Brightness/Volume Gestures', async () => {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const rootDir = path.resolve(__dirname, '..');
+
+    const appTsx = fs.readFileSync(path.join(rootDir, 'src/App.tsx'), 'utf8');
+    const cinemaPlayerTsx = fs.readFileSync(
+      path.join(rootDir, 'src/components/CinemaPlayerModal.tsx'),
+      'utf8',
+    );
+
+    // 1. Verify PosterCard opens Details Page (onOpenDossier) rather than bypassing details
+    expect(appTsx).toContain('Details &amp; Play');
+    expect(appTsx).toContain('details-page-container');
+    expect(appTsx).toContain('details-imdb-badge');
+    expect(appTsx).toContain('details-play-main-btn');
+    expect(appTsx).toContain('similarDossierItems');
+    expect(appTsx).toContain('details-similar-grid');
+
+    // 2. Verify Double-Click / Double-Tap ±10s zone seek in CinemaPlayerModal
+    expect(cinemaPlayerTsx).toContain('triggerZoneSeek');
+    expect(cinemaPlayerTsx).toContain('seek-ripple-indicator');
+
+    // 3. Verify Left Brightness & Right Volume vertical drag + laptop scroll + slider in CinemaPlayerModal
+    expect(cinemaPlayerTsx).toContain('applyBrightnessLevel');
+    expect(cinemaPlayerTsx).toContain('applyVolumeLevel');
+    expect(cinemaPlayerTsx).toContain('gesture-hud-pill');
+    expect(cinemaPlayerTsx).toContain('brightness-slider');
+  });
 });

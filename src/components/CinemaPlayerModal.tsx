@@ -18,6 +18,7 @@ import {
   RefreshCw,
   Rewind,
   Sparkles,
+  Sun,
   Tv,
   Volume2,
   VolumeX,
@@ -319,6 +320,33 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
   const [nativeDurationSec, setNativeDurationSec] = useState(0);
   const [volume, setVolume] = useState(1);
   const [isMuted, setIsMuted] = useState(false);
+  const [brightness, setBrightness] = useState(1);
+  const [gestureHud, setGestureHud] = useState<{
+    kind: 'brightness' | 'volume';
+    valuePct: number;
+  } | null>(null);
+  const gestureHudTimerRef = useRef<number | null>(null);
+  const [seekRipple, setSeekRipple] = useState<{
+    side: 'left' | 'right';
+    deltaSec: number;
+    key: number;
+  } | null>(null);
+  const seekRippleTimerRef = useRef<number | null>(null);
+  const singleTapTimerRef = useRef<number | null>(null);
+  const lastTapInfoRef = useRef<{ timeMs: number; zone: 'left' | 'center' | 'right' }>({
+    timeMs: 0,
+    zone: 'center',
+  });
+  const stageGestureRef = useRef<{
+    active: boolean;
+    pointerId: number;
+    side: 'left' | 'right';
+    startX: number;
+    startY: number;
+    startValue: number;
+    isDragging: boolean;
+  } | null>(null);
+  const suppressNextClickRef = useRef(false);
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
   const [aspectMode, setAspectMode] = useState<AspectCropMode>('contain');
   const [activePopover, setActivePopover] = useState<BottomPopoverType>(null);
@@ -1151,7 +1179,86 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     [captureVideoFrameSnapshot, scrubPreviewSec, seekTo],
   );
 
-  // Keyboard shortcuts (Space, F, M, R/A for quick resolution cycle, ArrowLeft, ArrowRight, Escape)
+  const showGestureHudBanner = useCallback(
+    (kind: 'brightness' | 'volume', valuePct: number) => {
+      setGestureHud({ kind, valuePct: Math.round(valuePct) });
+      if (gestureHudTimerRef.current) {
+        window.clearTimeout(gestureHudTimerRef.current);
+      }
+      gestureHudTimerRef.current = window.setTimeout(() => {
+        setGestureHud(null);
+      }, 1350);
+    },
+    [],
+  );
+
+  const applyVolumeLevel = useCallback(
+    (rawVolume: number, showHudIndicator = true) => {
+      const clamped = Math.max(0, Math.min(1, Number(rawVolume.toFixed(2))));
+      setVolume(clamped);
+      const nextMuted = clamped === 0;
+      setIsMuted(nextMuted);
+      if (isSplitAudioMode) {
+        if (videoRef.current) videoRef.current.muted = true;
+        if (audioRef.current) {
+          audioRef.current.volume = clamped;
+          audioRef.current.muted = nextMuted;
+        }
+      } else if (videoRef.current) {
+        videoRef.current.volume = clamped;
+        videoRef.current.muted = nextMuted;
+      }
+      if (showHudIndicator) {
+        showGestureHudBanner('volume', clamped * 100);
+      }
+    },
+    [isSplitAudioMode, showGestureHudBanner],
+  );
+
+  const applyBrightnessLevel = useCallback(
+    (rawBrightness: number, showHudIndicator = true) => {
+      const clamped = Math.max(0.2, Math.min(1.5, Number(rawBrightness.toFixed(2))));
+      setBrightness(clamped);
+      if (showHudIndicator) {
+        showGestureHudBanner('brightness', clamped * 100);
+      }
+    },
+    [showGestureHudBanner],
+  );
+
+  const triggerZoneSeek = useCallback(
+    (side: 'left' | 'right') => {
+      const stepSec = side === 'left' ? -10 : 10;
+      const targetSec = Math.max(0, currentTimeRef.current + stepSec);
+      seekTo(targetSec);
+      setSeekRipple((prev) => {
+        const nextDelta =
+          prev && prev.side === side ? prev.deltaSec + stepSec : stepSec;
+        return {
+          side,
+          deltaSec: nextDelta,
+          key: Date.now(),
+        };
+      });
+      if (seekRippleTimerRef.current) {
+        window.clearTimeout(seekRippleTimerRef.current);
+      }
+      seekRippleTimerRef.current = window.setTimeout(() => {
+        setSeekRipple(null);
+      }, 850);
+    },
+    [seekTo],
+  );
+
+  useEffect(() => {
+    return () => {
+      if (gestureHudTimerRef.current) window.clearTimeout(gestureHudTimerRef.current);
+      if (seekRippleTimerRef.current) window.clearTimeout(seekRippleTimerRef.current);
+      if (singleTapTimerRef.current) window.clearTimeout(singleTapTimerRef.current);
+    };
+  }, []);
+
+  // Keyboard shortcuts (Space, F, M, R/A for quick resolution cycle, ArrowLeft, ArrowRight, ArrowUp/Down for Volume, Shift+ArrowUp/Down or [/] for Brightness, Escape)
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
@@ -1189,14 +1296,35 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
           } else if (videoRef.current) {
             videoRef.current.muted = next;
           }
+          showGestureHudBanner('volume', next ? 0 : volume * 100);
           return next;
         });
       } else if (e.key === 'ArrowLeft') {
         e.preventDefault();
-        seekTo(currentTimeSec - 10);
+        triggerZoneSeek('left');
       } else if (e.key === 'ArrowRight') {
         e.preventDefault();
-        seekTo(currentTimeSec + 10);
+        triggerZoneSeek('right');
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        if (e.shiftKey) {
+          applyBrightnessLevel(brightness + 0.05, true);
+        } else {
+          applyVolumeLevel((isMuted ? 0 : volume) + 0.05, true);
+        }
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        if (e.shiftKey) {
+          applyBrightnessLevel(brightness - 0.05, true);
+        } else {
+          applyVolumeLevel((isMuted ? 0 : volume) - 0.05, true);
+        }
+      } else if (e.key === ']') {
+        e.preventDefault();
+        applyBrightnessLevel(brightness + 0.05, true);
+      } else if (e.key === '[') {
+        e.preventDefault();
+        applyBrightnessLevel(brightness - 0.05, true);
       }
     };
 
@@ -1204,12 +1332,18 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [
     activePopover,
-    currentTimeSec,
+    applyBrightnessLevel,
+    applyVolumeLevel,
+    brightness,
     cycleNextAspectRatio,
+    isMuted,
+    isSplitAudioMode,
     onClose,
-    seekTo,
+    showGestureHudBanner,
     toggleFullscreen,
     togglePlayPause,
+    triggerZoneSeek,
+    volume,
   ]);
 
   const changeSpeed = (speed: number) => {
@@ -1312,23 +1446,181 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         </div>
       </header>
 
-      {/* Main Video / Trailer Stage */}
+      {/* Main Video / Trailer Stage (Supports Left/Right Double-Tap ±10s Seek + Left Drag/Wheel Brightness + Right Drag/Wheel Volume) */}
       <div
         className="player-stage"
-        onClick={() => {
-          if (activePopover) {
-            setActivePopover(null);
-            resetHudTimer();
-          } else if (!showControlsHud) {
-            // On mobile/touch or when HUD is auto-hidden, first tap wakes up all player controls
-            resetHudTimer();
+        onPointerDown={(e) => {
+          const target = e.target as HTMLElement | null;
+          if (target && target.closest('button, a, input, .pause-dossier-overlay, .player-buffer-overlay')) {
+            return;
+          }
+          const rect = e.currentTarget.getBoundingClientRect();
+          if (rect.width <= 0) return;
+          const relX = (e.clientX - rect.left) / rect.width;
+          const side: 'left' | 'right' = relX < 0.5 ? 'left' : 'right';
+          stageGestureRef.current = {
+            active: true,
+            pointerId: e.pointerId,
+            side,
+            startX: e.clientX,
+            startY: e.clientY,
+            startValue: side === 'left' ? brightness : isMuted ? 0 : volume,
+            isDragging: false,
+          };
+        }}
+        onPointerMove={(e) => {
+          const g = stageGestureRef.current;
+          if (!g || !g.active || g.pointerId !== e.pointerId) return;
+          const dy = g.startY - e.clientY;
+          const dx = e.clientX - g.startX;
+          if (!g.isDragging) {
+            if (Math.abs(dy) < 12 || Math.abs(dx) > Math.abs(dy) * 1.1) {
+              return;
+            }
+            g.isDragging = true;
+            suppressNextClickRef.current = true;
+            if (singleTapTimerRef.current) {
+              window.clearTimeout(singleTapTimerRef.current);
+              singleTapTimerRef.current = null;
+            }
+          }
+          const rect = e.currentTarget.getBoundingClientRect();
+          const sensitivityPx = Math.max(180, rect.height * 0.55);
+          const deltaNormalized = dy / sensitivityPx;
+          if (g.side === 'left') {
+            applyBrightnessLevel(g.startValue + deltaNormalized * 1.1, true);
           } else {
-            resetHudTimer();
-            togglePlayPause();
+            applyVolumeLevel(g.startValue + deltaNormalized, true);
+          }
+          resetHudTimer();
+        }}
+        onPointerUp={(e) => {
+          if (stageGestureRef.current && stageGestureRef.current.pointerId === e.pointerId) {
+            stageGestureRef.current = null;
           }
         }}
-        onDoubleClick={toggleFullscreen}
+        onPointerCancel={() => {
+          stageGestureRef.current = null;
+        }}
+        onWheel={(e) => {
+          const target = e.target as HTMLElement | null;
+          if (target && target.closest('.bottom-popover-panel, .pause-dossier-overlay')) {
+            return;
+          }
+          if (Math.abs(e.deltaY) < 4) return;
+          const rect = e.currentTarget.getBoundingClientRect();
+          if (rect.width <= 0) return;
+          const relX = (e.clientX - rect.left) / rect.width;
+          const step = e.deltaY < 0 ? 0.05 : -0.05;
+          if (relX < 0.5) {
+            applyBrightnessLevel(brightness + step, true);
+          } else {
+            applyVolumeLevel((isMuted ? 0 : volume) + step, true);
+          }
+          resetHudTimer();
+        }}
+        onClick={(e) => {
+          if (suppressNextClickRef.current) {
+            suppressNextClickRef.current = false;
+            return;
+          }
+          const target = e.target as HTMLElement | null;
+          if (target && target.closest('button, a, input, .pause-dossier-overlay, .player-buffer-overlay')) {
+            return;
+          }
+          const rect = e.currentTarget.getBoundingClientRect();
+          const relX = rect.width > 0 ? (e.clientX - rect.left) / rect.width : 0.5;
+          const zone: 'left' | 'center' | 'right' =
+            relX < 0.35 ? 'left' : relX > 0.65 ? 'right' : 'center';
+          const now = Date.now();
+          const elapsed = now - lastTapInfoRef.current.timeMs;
+
+          if (elapsed > 0 && elapsed < 280 && lastTapInfoRef.current.zone === zone) {
+            // Double-click / Double-tap detected!
+            if (singleTapTimerRef.current) {
+              window.clearTimeout(singleTapTimerRef.current);
+              singleTapTimerRef.current = null;
+            }
+            lastTapInfoRef.current = { timeMs: 0, zone };
+            resetHudTimer();
+            if (zone === 'left') {
+              triggerZoneSeek('left');
+            } else if (zone === 'right') {
+              triggerZoneSeek('right');
+            } else {
+              toggleFullscreen();
+            }
+            return;
+          }
+
+          lastTapInfoRef.current = { timeMs: now, zone };
+          if (singleTapTimerRef.current) {
+            window.clearTimeout(singleTapTimerRef.current);
+          }
+          singleTapTimerRef.current = window.setTimeout(() => {
+            singleTapTimerRef.current = null;
+            if (activePopover) {
+              setActivePopover(null);
+              resetHudTimer();
+            } else if (!showControlsHud) {
+              resetHudTimer();
+            } else {
+              resetHudTimer();
+              togglePlayPause();
+            }
+          }, 230);
+        }}
       >
+        {/* Double-Click / Double-Tap ±10s Seek Ripple Overlay */}
+        {seekRipple && (
+          <div
+            key={seekRipple.key}
+            className={`seek-ripple-indicator ${seekRipple.side}`}
+            aria-live="polite"
+          >
+            <div className="seek-ripple-bubble">
+              {seekRipple.side === 'left' ? <Rewind size={24} /> : <FastForward size={24} />}
+              <strong>
+                {seekRipple.deltaSec > 0 ? `+${seekRipple.deltaSec}s` : `${seekRipple.deltaSec}s`}
+              </strong>
+              <span>{seekRipple.side === 'left' ? 'Rewind' : 'Forward'}</span>
+            </div>
+          </div>
+        )}
+
+        {/* Left Brightness / Right Volume Gesture & Scroll HUD Pill */}
+        {gestureHud && (
+          <div
+            className={`gesture-hud-pill ${gestureHud.kind}`}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="gesture-hud-head">
+              {gestureHud.kind === 'brightness' ? (
+                <Sun size={17} className="gesture-hud-icon" />
+              ) : gestureHud.valuePct === 0 ? (
+                <VolumeX size={17} className="gesture-hud-icon" />
+              ) : (
+                <Volume2 size={17} className="gesture-hud-icon" />
+              )}
+              <span>
+                {gestureHud.kind === 'brightness' ? 'Brightness' : 'Volume'}
+              </span>
+              <strong className="mono">{gestureHud.valuePct}%</strong>
+            </div>
+            <div className="gesture-hud-bar-track">
+              <div
+                className="gesture-hud-bar-fill"
+                style={{
+                  width: `${
+                    gestureHud.kind === 'brightness'
+                      ? Math.min(100, Math.max(0, ((gestureHud.valuePct - 20) / 130) * 100))
+                      : Math.min(100, Math.max(0, gestureHud.valuePct))
+                  }%`,
+                }}
+              />
+            </div>
+          </div>
+        )}
         {/* Auto-Failover Notification Banner */}
         {failoverToast && (
           <div className="failover-toast-banner" onClick={(e) => e.stopPropagation()}>
@@ -1411,6 +1703,9 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
             <video
               ref={videoRef}
               className={`player-video-element fit-${aspectMode}`}
+              style={{
+                filter: brightness !== 1 ? `brightness(${brightness})` : undefined,
+              }}
               poster={media.background || media.poster}
               playsInline
               onLoadStart={() => setIsBuffering(true)}
@@ -1547,6 +1842,9 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
             <canvas
               ref={freezeCanvasRef}
               className={`player-freeze-canvas fit-${aspectMode} ${hasFreezeFrame && isBuffering ? 'visible' : ''}`}
+              style={{
+                filter: brightness !== 1 ? `brightness(${brightness})` : undefined,
+              }}
               aria-hidden="true"
             />
           </>
@@ -2269,18 +2567,18 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
             <button
               type="button"
               className="player-icon-btn"
-              onClick={() => seekTo(currentTimeSec - 10)}
+              onClick={() => triggerZoneSeek('left')}
               disabled={activeStream?.kind !== 'direct'}
-              title="Rewind 10s (←)"
+              title="Rewind 10s (← or Double-Click Left)"
             >
               <Rewind size={18} />
             </button>
             <button
               type="button"
               className="player-icon-btn"
-              onClick={() => seekTo(currentTimeSec + 10)}
+              onClick={() => triggerZoneSeek('right')}
               disabled={activeStream?.kind !== 'direct'}
-              title="Forward 10s (→)"
+              title="Forward 10s (→ or Double-Click Right)"
             >
               <FastForward size={18} />
             </button>
@@ -2298,8 +2596,9 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                   } else if (videoRef.current) {
                     videoRef.current.muted = next;
                   }
+                  showGestureHudBanner('volume', next ? 0 : volume * 100);
                 }}
-                title="Mute / Unmute (M)"
+                title="Mute / Unmute (M · Right Vertical Drag or Scroll)"
               >
                 {isMuted || volume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
               </button>
@@ -2311,19 +2610,31 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                 step={0.05}
                 value={isMuted ? 0 : volume}
                 onChange={(e) => {
-                  const v = Number(e.target.value);
-                  setVolume(v);
-                  setIsMuted(v === 0);
-                  if (isSplitAudioMode) {
-                    if (videoRef.current) videoRef.current.muted = true;
-                    if (audioRef.current) {
-                      audioRef.current.volume = v;
-                      audioRef.current.muted = v === 0;
-                    }
-                  } else if (videoRef.current) {
-                    videoRef.current.volume = v;
-                    videoRef.current.muted = v === 0;
-                  }
+                  applyVolumeLevel(Number(e.target.value), true);
+                }}
+              />
+            </div>
+
+            <div className="brightness-cluster">
+              <button
+                type="button"
+                className="player-icon-btn"
+                onClick={() => applyBrightnessLevel(1, true)}
+                title={`Brightness ${Math.round(brightness * 100)}% (Click to Reset · Left Vertical Drag or Scroll · Shift+↑/↓)`}
+                aria-label="Reset Brightness"
+              >
+                <Sun size={17} />
+              </button>
+              <input
+                type="range"
+                className="brightness-slider"
+                min={0.2}
+                max={1.5}
+                step={0.05}
+                value={brightness}
+                aria-label="Video Brightness"
+                onChange={(e) => {
+                  applyBrightnessLevel(Number(e.target.value), true);
                 }}
               />
             </div>

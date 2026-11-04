@@ -173,9 +173,9 @@ const PosterCard: React.FC<PosterCardProps> = React.memo(({
             className="poster-play-orb"
             onClick={(e) => {
               e.stopPropagation();
-              onPlay(item);
+              onOpenDossier(item);
             }}
-            title={`Play ${item.name}`}
+            title={`View details & play ${item.name}`}
           >
             <Play size={20} fill="currentColor" />
           </button>
@@ -188,7 +188,7 @@ const PosterCard: React.FC<PosterCardProps> = React.memo(({
                 onOpenDossier(item);
               }}
             >
-              {item.type === 'series' ? 'Episodes' : 'Streams'}
+              Details &amp; Play
             </button>
             <button
               type="button"
@@ -483,12 +483,17 @@ export const App: React.FC = () => {
   const [activeHeroIndex, setActiveHeroIndex] = useState<number>(0);
   const [heroAutoPlay, setHeroAutoPlay] = useState<boolean>(true);
 
-  // Dossier drawer state
+  // Dossier / Full Movie & Series Details Page state
   const [dossierItem, setDossierItem] = useState<StremioMediaItem | null>(null);
   const [dossierLoadingMeta, setDossierLoadingMeta] = useState(false);
   const [dossierStreams, setDossierStreams] = useState<StremioStreamItem[]>([]);
   const [dossierLoadingStreams, setDossierLoadingStreams] = useState(false);
   const [dossierSelectedSeason, setDossierSelectedSeason] = useState<number>(1);
+  const [dossierEpisodeQuery, setDossierEpisodeQuery] = useState<string>('');
+  const [dossierShowStreams, setDossierShowStreams] = useState<boolean>(false);
+  const [dossierActiveTrailerYtId, setDossierActiveTrailerYtId] = useState<string | null>(null);
+  const [dossierSimilarPool, setDossierSimilarPool] = useState<StremioMediaItem[]>([]);
+  const dossierScrollRef = useRef<HTMLDivElement | null>(null);
 
   // Active player modal state
   const [playingSession, setPlayingSession] = useState<{
@@ -1256,7 +1261,7 @@ export const App: React.FC = () => {
     };
   }, [searchQuery, addons, catalogShelves]);
 
-  // Open Dossier & enrich with episodes + sorted streams
+  // Open Movie / Series Details Page & enrich with episodes, sorted streams, and similar titles
   const openItemDossier = useCallback(
     async (item: StremioMediaItem) => {
       if (!currentUser) {
@@ -1265,9 +1270,15 @@ export const App: React.FC = () => {
       }
       setDossierItem(item);
       setDossierSelectedSeason(1);
+      setDossierEpisodeQuery('');
+      setDossierShowStreams(false);
+      setDossierActiveTrailerYtId(null);
       setDossierLoadingMeta(true);
       setDossierLoadingStreams(true);
       setDossierStreams([]);
+      if (dossierScrollRef.current) {
+        dossierScrollRef.current.scrollTo({ top: 0, behavior: 'smooth' });
+      }
 
       const enriched = await fetchMetaFromAddons(addons, item.type, item.id, item);
       const finalItem = enriched || item;
@@ -1276,6 +1287,32 @@ export const App: React.FC = () => {
         setDossierSelectedSeason(finalItem.videos[0].season);
       }
       setDossierLoadingMeta(false);
+
+      // Hydrate similar movies/series from Cinemeta for the primary genre so "More Like This" is always rich
+      const primaryGenre = finalItem.genres[0];
+      if (primaryGenre) {
+        fetchAddonCatalog(
+          'https://v3-cinemeta.strem.io/manifest.json',
+          finalItem.type === 'series' ? 'series' : 'movie',
+          'top',
+          { genre: primaryGenre },
+          {
+            addonId: 'com.linvo.cinemeta',
+            addonName: 'Cinemeta',
+            catalogName: `Similar ${primaryGenre}`,
+          },
+        )
+          .then((fetchedSimilar) => {
+            if (Array.isArray(fetchedSimilar) && fetchedSimilar.length > 0) {
+              setDossierSimilarPool(
+                fetchedSimilar.map((sim) =>
+                  sim.genres.length > 0 ? sim : { ...sim, genres: [primaryGenre] },
+                ),
+              );
+            }
+          })
+          .catch(() => {});
+      }
 
       const targetVideoId =
         finalItem.type === 'series' && finalItem.videos.length > 0
@@ -2010,6 +2047,86 @@ export const App: React.FC = () => {
     dossierItem.videos.forEach((v) => set.add(v.season));
     return Array.from(set).sort((a, b) => a - b);
   }, [dossierItem]);
+
+  // Compute Similar Movies / Series ("More Like This") for the active Details Page item
+  const similarDossierItems = useMemo<StremioMediaItem[]>(() => {
+    if (!dossierItem) return [];
+    const targetGenres = new Set(
+      dossierItem.genres.map((g) => g.trim().toLowerCase()).filter(Boolean),
+    );
+    const targetCast = new Set(
+      dossierItem.cast.map((c) => c.trim().toLowerCase()).filter(Boolean),
+    );
+    const targetDirectors = new Set(
+      dossierItem.director.map((d) => d.trim().toLowerCase()).filter(Boolean),
+    );
+
+    const candidateMap = new Map<string, StremioMediaItem>();
+    for (const shelf of catalogShelves) {
+      for (const item of shelf.items) {
+        if (item.id !== dossierItem.id && !candidateMap.has(item.id)) {
+          candidateMap.set(item.id, item);
+        }
+      }
+    }
+    for (const extraList of Object.values(genreExtraItemsByKey)) {
+      for (const item of extraList) {
+        if (item.id !== dossierItem.id && !candidateMap.has(item.id)) {
+          candidateMap.set(item.id, item);
+        }
+      }
+    }
+    for (const simItem of dossierSimilarPool) {
+      if (simItem.id !== dossierItem.id && !candidateMap.has(simItem.id)) {
+        candidateMap.set(simItem.id, simItem);
+      }
+    }
+
+    const scored = Array.from(candidateMap.values()).map((candidate) => {
+      let score = 0;
+      if (candidate.type === dossierItem.type) {
+        score += 3;
+      }
+      for (const g of candidate.genres) {
+        if (targetGenres.has(g.trim().toLowerCase())) {
+          score += 4;
+        }
+      }
+      for (const c of candidate.cast) {
+        if (targetCast.has(c.trim().toLowerCase())) {
+          score += 3;
+        }
+      }
+      for (const d of candidate.director) {
+        if (targetDirectors.has(d.trim().toLowerCase())) {
+          score += 4;
+        }
+      }
+      const ratingNum = Number.parseFloat(candidate.imdbRating || '0');
+      if (Number.isFinite(ratingNum) && ratingNum > 0) {
+        score += ratingNum * 0.25;
+      }
+      return { candidate, score };
+    });
+
+    return scored
+      .filter((entry) => entry.score > 1)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 12)
+      .map((entry) => entry.candidate);
+  }, [catalogShelves, dossierItem, dossierSimilarPool, genreExtraItemsByKey]);
+
+  // Close Movie/Series Details Page on Escape key when player is not active
+  useEffect(() => {
+    if (!dossierItem || playingSession) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setDossierItem(null);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [dossierItem, playingSession]);
 
   const effectiveNav: NavSection = currentUser ? activeNav : 'discover';
 
@@ -3363,241 +3480,491 @@ export const App: React.FC = () => {
       )}
       */}
 
-      {/* Slide-Over Film / Series Dossier & Decreasing Quality Stream Picker (Authenticated Only) */}
+      {/* Full-Screen Movie & Series Details Page + Decreasing Quality Stream Picker + Similar Titles (Authenticated Only) */}
       {currentUser && dossierItem && (
-        <div className="dossier-backdrop" onClick={() => setDossierItem(null)}>
-          <aside className="dossier-drawer" onClick={(e) => e.stopPropagation()}>
-            <div
-              className="dossier-hero-banner"
-              style={{
-                backgroundImage: `linear-gradient(180deg, rgba(10,12,20,0.15) 0%, #0C0E17 100%), url(${dossierItem.background || dossierItem.poster || ''})`,
-              }}
-            >
+        <div
+          className="dossier-backdrop details-page-backdrop"
+          onClick={() => setDossierItem(null)}
+        >
+          <aside
+            ref={dossierScrollRef}
+            className="dossier-drawer details-page-container"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Sticky Top Bar inside Details Page */}
+            <header className="details-page-topbar">
+              <button
+                type="button"
+                className="details-back-btn"
+                onClick={() => setDossierItem(null)}
+              >
+                <ChevronLeft size={18} />
+                <span>Back to Browse</span>
+              </button>
+              <div className="details-breadcrumb mono">
+                <span>{dossierItem.type === 'series' ? 'TV SERIES' : 'MOVIE'}</span>
+                {dossierItem.genres[0] && (
+                  <>
+                    <span>·</span>
+                    <span>{dossierItem.genres[0].toUpperCase()}</span>
+                  </>
+                )}
+                <span>·</span>
+                <span className="breadcrumb-current">{dossierItem.name}</span>
+              </div>
               <button
                 type="button"
                 className="player-icon-btn dossier-close"
                 onClick={() => setDossierItem(null)}
+                title="Close Details (Esc)"
               >
                 <X size={18} />
               </button>
-              <div className="dossier-banner-title">
-                <span className="mono">
-                  {dossierItem.type.toUpperCase()} · {dossierItem.releaseInfo || dossierItem.id}
-                  {dossierItem.imdbRating ? ` · ★ IMDb ${dossierItem.imdbRating}` : ''}
-                </span>
-                <h2>{dossierItem.name}</h2>
-              </div>
-            </div>
+            </header>
 
-            <div className="dossier-body">
-              {dossierItem.description && (
-                <p className="dossier-synopsis">{dossierItem.description}</p>
-              )}
-
-              <div className="dossier-credits-grid">
-                {dossierItem.director.length > 0 && (
-                  <div>
-                    <span className="drawer-label">Director</span>
-                    <strong>{dossierItem.director.join(', ')}</strong>
-                  </div>
-                )}
-                {dossierItem.cast.length > 0 && (
-                  <div>
-                    <span className="drawer-label">Cast</span>
-                    <strong>{dossierItem.cast.slice(0, 6).join(', ')}</strong>
-                  </div>
-                )}
-                {dossierItem.genres.length > 0 && (
-                  <div>
-                    <span className="drawer-label">Genres</span>
-                    <strong>{dossierItem.genres.join(', ')}</strong>
-                  </div>
-                )}
-              </div>
-
-              {/* Action Bar */}
-              <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-                <button
-                  type="button"
-                  className="neon-primary-btn"
-                  onClick={() => {
-                    const target = dossierItem;
-                    const bestStream =
-                      dossierStreams.find((s) => s.kind === 'direct' && !s.isPromo) ??
-                      dossierStreams[0];
-                    setDossierItem(null);
-                    startScreeningItem(
-                      target,
-                      target.videos[0],
-                      bestStream,
-                      progressMap[target.id]?.positionSec ?? 0,
-                    );
-                  }}
-                >
-                  <Play size={16} fill="currentColor" />
-                  <span>
-                    Play Best Quality ({dossierStreams[0]?.qualityBadge || 'Auto'})
-                  </span>
-                </button>
-                <button
-                  type="button"
-                  className="glass-secondary-btn"
-                  onClick={() => toggleLibraryItem(dossierItem)}
-                >
-                  {isInLibrary(dossierItem.id) ? (
-                    <>
-                      <BookmarkCheck size={15} />
-                      <span>In Watchlist</span>
-                    </>
+            {/* Cinematic Hero Banner with Poster + Rating + One Play Button + Actions */}
+            <div
+              className="dossier-hero-banner details-hero-banner"
+              style={{
+                backgroundImage: `linear-gradient(180deg, rgba(8,10,16,0.45) 0%, rgba(10,12,20,0.92) 78%, #0a0c14 100%), url(${dossierItem.background || dossierItem.poster || ''})`,
+              }}
+            >
+              <div className="details-hero-inner">
+                {/* Left Crisp 2:3 Poster Card */}
+                <div className="details-poster-frame">
+                  {dossierItem.poster ? (
+                    <img src={dossierItem.poster} alt={dossierItem.name} />
                   ) : (
-                    <>
-                      <Plus size={15} />
-                      <span>Add to Watchlist</span>
-                    </>
+                    <div className="poster-fallback-art">
+                      <Clapperboard size={36} />
+                      <span>{dossierItem.name}</span>
+                    </div>
                   )}
-                </button>
-              </div>
+                </div>
 
-              {/* TV Series Seasons & Episodes Section */}
-              {dossierItem.type === 'series' && (
-                <div className="dossier-section">
-                  <div
-                    style={{
-                      display: 'flex',
-                      justifyContent: 'space-between',
-                      alignItems: 'center',
-                      flexWrap: 'wrap',
-                      gap: 8,
-                    }}
-                  >
-                    <span className="drawer-label">
-                      <Tv size={13} style={{ marginRight: 5, verticalAlign: 'middle' }} />
-                      {dossierLoadingMeta
-                        ? 'Loading episodes…'
-                        : `Episodes (${dossierItem.videos.length})`}
+                {/* Right Details Metadata & Primary Controls */}
+                <div className="details-hero-copy">
+                  <div className="details-badge-strip">
+                    <span
+                      className={`poster-type-pill ${dossierItem.type === 'series' ? 'series' : 'movie'}`}
+                    >
+                      {dossierItem.type === 'series' ? 'TV SERIES' : 'MOVIE'}
                     </span>
-
-                    {dossierSeasons.length > 1 && (
-                      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-                        {dossierSeasons.map((seasonNum) => (
-                          <button
-                            key={seasonNum}
-                            type="button"
-                            className={`mini-refresh-btn ${dossierSelectedSeason === seasonNum ? 'active-chip-btn' : ''}`}
-                            onClick={() => setDossierSelectedSeason(seasonNum)}
-                          >
-                            S{seasonNum}
-                          </button>
-                        ))}
-                      </div>
+                    <span className="details-imdb-badge mono">
+                      <Star size={13} fill="currentColor" />
+                      <strong>
+                        {dossierItem.imdbRating ? `${dossierItem.imdbRating} / 10` : 'IMDb Rated'}
+                      </strong>
+                    </span>
+                    {(dossierItem.releaseInfo || dossierItem.year) && (
+                      <span className="details-meta-pill mono">
+                        {dossierItem.releaseInfo || dossierItem.year}
+                      </span>
+                    )}
+                    {dossierItem.runtime && (
+                      <span className="details-meta-pill mono">{dossierItem.runtime}</span>
+                    )}
+                    {dossierStreams[0]?.qualityBadge && (
+                      <span className="quality-tier-badge tier-4k">
+                        {dossierStreams[0].qualityBadge}
+                      </span>
+                    )}
+                    {dossierStreams.some((s) => s.audioBadge) && (
+                      <span className="multi-audio-badge">Multi-Audio</span>
                     )}
                   </div>
 
-                  <div className="dossier-episodes-list">
-                    {dossierItem.videos
-                      .filter((ep) => ep.season === dossierSelectedSeason)
-                      .map((ep) => (
-                        <div key={ep.id} className="dossier-stream-row">
-                          <div style={{ flex: 1 }}>
-                            <strong>
-                              S{ep.season}:E{ep.episode} — {ep.name}
-                            </strong>
-                            {ep.overview && <p className="episode-mini-desc">{ep.overview}</p>}
-                          </div>
+                  <h1 className="details-main-title">{dossierItem.name}</h1>
+
+                  {/* Clickable Genre Pills */}
+                  {dossierItem.genres.length > 0 && (
+                    <div className="details-genre-pills">
+                      {dossierItem.genres.map((g) => (
+                        <button
+                          key={g}
+                          type="button"
+                          className="details-genre-chip"
+                          onClick={() => {
+                            setSelectedGenre(g);
+                            setDossierItem(null);
+                          }}
+                          title={`Explore ${g} titles`}
+                        >
+                          {g}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
+                  {dossierItem.description && (
+                    <p className="dossier-synopsis details-synopsis">
+                      {dossierItem.description}
+                    </p>
+                  )}
+
+                  {/* Primary Action Bar: One Prominent Play Button + Secondary Controls */}
+                  <div className="details-action-bar">
+                    <button
+                      type="button"
+                      className="neon-primary-btn details-play-main-btn"
+                      onClick={() => {
+                        const target = dossierItem;
+                        const bestStream =
+                          dossierStreams.find((s) => s.kind === 'direct' && !s.isPromo) ??
+                          dossierStreams[0];
+                        const resumePos = progressMap[target.id]?.positionSec ?? 0;
+                        setDossierItem(null);
+                        startScreeningItem(target, target.videos[0], bestStream, resumePos);
+                      }}
+                    >
+                      <Play size={18} fill="currentColor" />
+                      <span>
+                        {(progressMap[dossierItem.id]?.positionSec ?? 0) > 15
+                          ? `Resume (${Math.floor((progressMap[dossierItem.id]?.positionSec ?? 0) / 60)}m)`
+                          : dossierItem.type === 'series'
+                            ? 'Play Episode 1'
+                            : 'Play Movie'}
+                      </span>
+                    </button>
+
+                    {(progressMap[dossierItem.id]?.positionSec ?? 0) > 15 && (
+                      <button
+                        type="button"
+                        className="glass-secondary-btn"
+                        onClick={() => {
+                          const target = dossierItem;
+                          const bestStream =
+                            dossierStreams.find((s) => s.kind === 'direct' && !s.isPromo) ??
+                            dossierStreams[0];
+                          setDossierItem(null);
+                          startScreeningItem(target, target.videos[0], bestStream, 0);
+                        }}
+                      >
+                        <RefreshCw size={15} />
+                        <span>Start Over</span>
+                      </button>
+                    )}
+
+                    {(dossierItem.trailers[0]?.source ||
+                      dossierStreams.find((s) => s.kind === 'youtube' && s.ytId)?.ytId) && (
+                      <button
+                        type="button"
+                        className={`glass-secondary-btn ${dossierActiveTrailerYtId ? 'active-chip-btn' : ''}`}
+                        onClick={() => {
+                          const ytId =
+                            dossierItem.trailers[0]?.source ||
+                            dossierStreams.find((s) => s.kind === 'youtube' && s.ytId)?.ytId ||
+                            null;
+                          setDossierActiveTrailerYtId((prev) => (prev ? null : ytId));
+                        }}
+                      >
+                        <Film size={15} />
+                        <span>{dossierActiveTrailerYtId ? 'Hide Trailer' : 'Watch Trailer'}</span>
+                      </button>
+                    )}
+
+                    <button
+                      type="button"
+                      className="glass-secondary-btn"
+                      onClick={() => toggleLibraryItem(dossierItem)}
+                    >
+                      {isInLibrary(dossierItem.id) ? (
+                        <>
+                          <BookmarkCheck size={15} />
+                          <span>In Watchlist</span>
+                        </>
+                      ) : (
+                        <>
+                          <Plus size={15} />
+                          <span>Add to Watchlist</span>
+                        </>
+                      )}
+                    </button>
+
+                    <button
+                      type="button"
+                      className={`glass-secondary-btn ${dossierShowStreams ? 'active-chip-btn' : ''}`}
+                      onClick={() => setDossierShowStreams((prev) => !prev)}
+                    >
+                      <Layers size={15} />
+                      <span>
+                        {dossierLoadingStreams
+                          ? 'Loading Servers…'
+                          : `Servers & Quality (${dossierStreams.length})`}
+                      </span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="dossier-body details-page-body">
+              {/* Inline Trailer Player (when Watch Trailer is clicked) */}
+              {dossierActiveTrailerYtId && (
+                <div className="details-trailer-box">
+                  <div className="details-section-head">
+                    <span className="drawer-label">Official Trailer Preview</span>
+                    <button
+                      type="button"
+                      className="mini-refresh-btn"
+                      onClick={() => setDossierActiveTrailerYtId(null)}
+                    >
+                      <X size={13} />
+                      <span>Close Trailer</span>
+                    </button>
+                  </div>
+                  <div className="details-trailer-embed">
+                    <iframe
+                      title={`${dossierItem.name} Trailer`}
+                      src={`https://www.youtube-nocookie.com/embed/${encodeURIComponent(dossierActiveTrailerYtId)}?autoplay=1&rel=0`}
+                      allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                      allowFullScreen
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* Cast & Director Interactive Credits Grid */}
+              {(dossierItem.director.length > 0 || dossierItem.cast.length > 0) && (
+                <div className="dossier-credits-grid details-credits-panel">
+                  {dossierItem.director.length > 0 && (
+                    <div className="details-credit-group">
+                      <span className="drawer-label">Director</span>
+                      <div className="details-people-pills">
+                        {dossierItem.director.map((dir) => (
                           <button
+                            key={dir}
                             type="button"
-                            className="neon-primary-btn compact-btn"
+                            className="person-search-pill"
                             onClick={() => {
+                              setSearchInput(dir);
+                              setSearchQuery(dir);
+                              setDossierItem(null);
+                            }}
+                            title={`Search titles directed by ${dir}`}
+                          >
+                            {dir}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {dossierItem.cast.length > 0 && (
+                    <div className="details-credit-group">
+                      <span className="drawer-label">Starring Cast</span>
+                      <div className="details-people-pills">
+                        {dossierItem.cast.slice(0, 10).map((actor) => (
+                          <button
+                            key={actor}
+                            type="button"
+                            className="person-search-pill"
+                            onClick={() => {
+                              setSearchInput(actor);
+                              setSearchQuery(actor);
+                              setDossierItem(null);
+                            }}
+                            title={`Search titles starring ${actor}`}
+                          >
+                            {actor}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* TV Series Seasons & Episodes Browser with Episode Search */}
+              {dossierItem.type === 'series' && (
+                <div className="dossier-section details-episodes-section">
+                  <div className="details-section-head">
+                    <span className="drawer-label">
+                      <Tv size={14} style={{ marginRight: 6, verticalAlign: 'middle' }} />
+                      {dossierLoadingMeta
+                        ? 'Loading episodes…'
+                        : `Seasons & Episodes (${dossierItem.videos.length})`}
+                    </span>
+
+                    <div className="details-episodes-controls">
+                      {dossierSeasons.length > 1 && (
+                        <div className="details-season-tabs">
+                          {dossierSeasons.map((seasonNum) => (
+                            <button
+                              key={seasonNum}
+                              type="button"
+                              className={`mini-refresh-btn ${dossierSelectedSeason === seasonNum ? 'active-chip-btn' : ''}`}
+                              onClick={() => setDossierSelectedSeason(seasonNum)}
+                            >
+                              Season {seasonNum}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                      {dossierItem.videos.length > 4 && (
+                        <input
+                          type="search"
+                          className="directory-search-input episode-filter-input"
+                          placeholder="Filter episodes…"
+                          value={dossierEpisodeQuery}
+                          onChange={(e) => setDossierEpisodeQuery(e.target.value)}
+                        />
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="dossier-episodes-list details-episodes-grid">
+                    {dossierItem.videos
+                      .filter((ep) => {
+                        if (ep.season !== dossierSelectedSeason) return false;
+                        const q = dossierEpisodeQuery.trim().toLowerCase();
+                        if (!q) return true;
+                        return (
+                          ep.name.toLowerCase().includes(q) ||
+                          `e${ep.episode}`.includes(q) ||
+                          String(ep.episode).includes(q) ||
+                          Boolean(ep.overview && ep.overview.toLowerCase().includes(q))
+                        );
+                      })
+                      .map((ep) => (
+                        <div
+                          key={ep.id}
+                          className="dossier-stream-row details-episode-card"
+                          onClick={() => {
+                            const target = dossierItem;
+                            setDossierItem(null);
+                            startScreeningItem(target, ep, undefined, 0);
+                          }}
+                          role="button"
+                          tabIndex={0}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' || e.key === ' ') {
+                              e.preventDefault();
                               const target = dossierItem;
                               setDossierItem(null);
                               startScreeningItem(target, ep, undefined, 0);
-                            }}
-                          >
+                            }
+                          }}
+                        >
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div className="details-episode-title-row">
+                              <span className="episode-num-badge mono">
+                                S{ep.season}:E{ep.episode}
+                              </span>
+                              <strong>{ep.name}</strong>
+                            </div>
+                            {ep.overview && <p className="episode-mini-desc">{ep.overview}</p>}
+                          </div>
+                          <span className="episode-play-indicator">
                             <Play size={14} fill="currentColor" />
-                            <span>Play</span>
-                          </button>
+                          </span>
                         </div>
                       ))}
                   </div>
                 </div>
               )}
 
-              {/* Resolved Streams Section (Sorted by Quality First, Then Multi-Audio Priority) */}
-              <div className="dossier-section">
-                <span className="drawer-label">
-                  {dossierLoadingStreams
-                    ? 'Finding best quality streams…'
-                    : `Available Streams (${dossierStreams.length})`}
-                </span>
-                <div className="dossier-streams-list">
-                  {dossierStreams.map((st) => {
-                    const tierClass =
-                      (st.qualityScore ?? 0) >= 2160
-                        ? 'tier-4k'
-                        : (st.qualityScore ?? 0) >= 1080
-                          ? 'tier-1080p'
-                          : (st.qualityScore ?? 0) >= 720
-                            ? 'tier-720p'
-                            : 'tier-sd';
-                    return (
-                      <div key={st.id} className="dossier-stream-row">
-                        <div style={{ flex: 1, minWidth: 0 }}>
-                          <div
-                            style={{
-                              display: 'flex',
-                              alignItems: 'center',
-                              gap: 8,
-                              flexWrap: 'wrap',
-                              marginBottom: 4,
-                            }}
-                          >
-                            <span className={`quality-tier-badge ${tierClass}`}>
-                              {st.qualityBadge || st.kind.toUpperCase()}
-                            </span>
-                            {st.audioBadge && (
-                              <span className="multi-audio-badge">
-                                {st.audioBadge}
+              {/* Collapsible / Expandable Server & Quality Picker */}
+              {dossierShowStreams && (
+                <div className="dossier-section">
+                  <span className="drawer-label">
+                    {dossierLoadingStreams
+                      ? 'Finding best quality streams…'
+                      : `Available Servers & Quality (${dossierStreams.length})`}
+                  </span>
+                  <div className="dossier-streams-list">
+                    {dossierStreams.map((st) => {
+                      const tierClass =
+                        (st.qualityScore ?? 0) >= 2160
+                          ? 'tier-4k'
+                          : (st.qualityScore ?? 0) >= 1080
+                            ? 'tier-1080p'
+                            : (st.qualityScore ?? 0) >= 720
+                              ? 'tier-720p'
+                              : 'tier-sd';
+                      return (
+                        <div
+                          key={st.id}
+                          className="dossier-stream-row"
+                          style={{ cursor: 'pointer' }}
+                          onClick={() => {
+                            if (st.kind === 'external' && st.externalUrl) {
+                              window.open(st.externalUrl, '_blank', 'noopener,noreferrer');
+                              return;
+                            }
+                            const target = dossierItem;
+                            setDossierItem(null);
+                            startScreeningItem(target, undefined, st, 0);
+                          }}
+                        >
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div
+                              style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: 8,
+                                flexWrap: 'wrap',
+                                marginBottom: 4,
+                              }}
+                            >
+                              <span className={`quality-tier-badge ${tierClass}`}>
+                                {st.qualityBadge || st.kind.toUpperCase()}
                               </span>
-                            )}
-                            <strong>{st.name}</strong>
-                            {st.sizeLabel && (
-                              <span className="mono size-pill">{st.sizeLabel}</span>
-                            )}
-                            <span className="addon-origin-tag">{st.addonName}</span>
+                              {st.audioBadge && (
+                                <span className="multi-audio-badge">
+                                  {st.audioBadge}
+                                </span>
+                              )}
+                              <strong>{st.name}</strong>
+                              {st.sizeLabel && (
+                                <span className="mono size-pill">{st.sizeLabel}</span>
+                              )}
+                              <span className="addon-origin-tag">{st.addonName}</span>
+                            </div>
+                            <div className="stream-choice-meta">
+                              <span>{st.title}</span>
+                            </div>
                           </div>
-                          <div className="stream-choice-meta">
-                            <span>{st.title}</span>
-                          </div>
-                        </div>
-                        {st.kind === 'external' && st.externalUrl ? (
-                          <a
-                            href={st.externalUrl}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="glass-secondary-btn compact-btn"
-                            style={{ textDecoration: 'none' }}
-                          >
-                            <ExternalLink size={14} />
-                            <span>Open</span>
-                          </a>
-                        ) : (
-                          <button
-                            type="button"
-                            className="neon-primary-btn compact-btn"
-                            onClick={() => {
-                              const target = dossierItem;
-                              setDossierItem(null);
-                              startScreeningItem(target, undefined, st, 0);
-                            }}
-                          >
+                          <span className="episode-play-indicator">
                             <Play size={14} fill="currentColor" />
-                            <span>Play</span>
-                          </button>
-                        )}
-                      </div>
-                    );
-                  })}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
                 </div>
+              )}
+
+              {/* Similar Movies / Series ("More Like This") Section Below */}
+              <div className="dossier-section details-similar-section">
+                <div className="details-section-head">
+                  <div>
+                    <h3 className="details-similar-heading">
+                      Similar {dossierItem.type === 'series' ? 'TV Series' : 'Movies'} You May Like
+                    </h3>
+                    <span className="shelf-subtitle mono">
+                      MATCHED BY GENRE ({dossierItem.genres.slice(0, 3).join(' · ') || 'TRENDING'}) &amp; IMDb RATING
+                    </span>
+                  </div>
+                </div>
+
+                {similarDossierItems.length > 0 ? (
+                  <div className="poster-grid details-similar-grid">
+                    {similarDossierItems.map((simItem) => (
+                      <PosterCard
+                        key={`similar-${simItem.id}`}
+                        item={simItem}
+                        inLibrary={isInLibrary(simItem.id)}
+                        onPlay={(i) => openItemDossier(i)}
+                        onOpenDossier={(i) => openItemDossier(i)}
+                        onToggleLibrary={toggleLibraryItem}
+                      />
+                    ))}
+                  </div>
+                ) : (
+                  <div className="empty-state-box">
+                    <p>Loading similar recommendations…</p>
+                  </div>
+                )}
               </div>
             </div>
           </aside>
