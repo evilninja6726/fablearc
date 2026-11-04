@@ -1510,39 +1510,6 @@ export async function fetchStreamsFromAddons(
                 ...qualityInfo,
               });
             }
-          } else if (typeof raw.infoHash === 'string' && raw.infoHash.trim()) {
-            const hash = raw.infoHash.trim().toLowerCase();
-            if (/^[a-f0-9]{40}$/i.test(hash)) {
-              const rawSources = Array.isArray(raw.sources) ? raw.sources : [];
-              const sourceTrackers = rawSources
-                .filter((s): s is string => typeof s === 'string' && s.startsWith('tracker:'))
-                .map((s) => s.slice('tracker:'.length).trim())
-                .filter(Boolean);
-              const seedMatch = `${title} ${extraDesc}`.match(/👤\s*(\d+)/);
-              const seedCount = seedMatch ? parseInt(seedMatch[1], 10) : 0;
-              const displayName = hintFilename || mediaItem?.name || videoId;
-              const enrichedMagnetUrl = buildP2pMagnetUri(
-                hash,
-                displayName,
-                sourceTrackers,
-              );
-              results.push({
-                id: `${addon.manifest.id}-magnet-${idx}`,
-                addonId: addon.manifest.id,
-                addonName: addon.manifest.name,
-                name,
-                title,
-                kind: 'magnet',
-                infoHash: hash,
-                fileIdx: typeof raw.fileIdx === 'number' ? raw.fileIdx : undefined,
-                filename: hintFilename || undefined,
-                trackers: sourceTrackers,
-                seeders: seedCount,
-                url: enrichedMagnetUrl,
-                serverStatusBadge: seedCount > 0 ? `P2P · 👤 ${seedCount}` : 'P2P',
-                ...qualityInfo,
-              });
-            }
           }
         });
       }),
@@ -2264,21 +2231,14 @@ export async function fetchCommunityAddonsDirectory(): Promise<CommunityAddonDir
 export const DEFAULT_PENGUPLAY_MANIFEST_URL =
   'https://pengu.uk/%7B%22auth_token%22%3A%22jBIrOxA27mMz_WvoR_ZCAMR72uZegRCgWJzw9P0IIUQ%22%7D/manifest.json';
 
-export const DEFAULT_TORRENTIO_HINDI_MANIFEST_URL =
-  'https://torrentio.strem.fun/language=hindi/manifest.json';
-
 /**
  * Automatically upgrades any legacy unauthenticated PenguPlay URL (`https://pengu.uk/manifest.json`)
- * or bare Torrentio URL (`https://torrentio.strem.fun/manifest.json`) stored in localStorage or SQLite DB
- * to the configured default URL.
+ * stored in localStorage or SQLite DB to the authenticated PenguPlay URL.
  */
 export function upgradeLegacyDefaultAddonUrl(manifestUrl: string): string {
   const trimmed = manifestUrl.trim();
   if (/^https?:\/\/pengu\.uk\/manifest\.json$/i.test(trimmed)) {
     return DEFAULT_PENGUPLAY_MANIFEST_URL;
-  }
-  if (/^https?:\/\/torrentio\.strem\.fun\/manifest\.json$/i.test(trimmed)) {
-    return DEFAULT_TORRENTIO_HINDI_MANIFEST_URL;
   }
   return trimmed;
 }
@@ -2295,7 +2255,6 @@ export const DEFAULT_BOOTSTRAP_MANIFEST_URLS: string[] = [
   DEFAULT_PENGUPLAY_MANIFEST_URL,
   'https://st.111477.xyz/config/aHR0cHM6Ly9hLjExMTQ3Ny54eXov/manifest.json',
   'https://hdhub.thevolecitor.qzz.io/eyJ0b3Jib3giOiJ1bnNldCIsInF1YWxpdGllcyI6IjIxNjBwLDEwODBwLDcyMHAiLCJzb3J0IjoiZGVzYyJ9/manifest.json',
-  DEFAULT_TORRENTIO_HINDI_MANIFEST_URL,
   'https://opensubtitlesv3-pro.dexter21767.com/manifest.json',
   'https://v3-cinemeta.strem.io/manifest.json',
   'https://opensubtitles-v3.strem.io/manifest.json',

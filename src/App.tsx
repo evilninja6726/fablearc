@@ -489,8 +489,10 @@ export const App: React.FC = () => {
               typeof a.manifestUrl === 'string' &&
               !a.manifestUrl.includes('streamz.local-builtin') &&
               !a.manifestUrl.includes('stremio-addons.net/manifest.json') &&
+              !a.manifestUrl.includes('torrentio.strem.fun') &&
               a.manifest &&
               typeof a.manifest.id === 'string' &&
+              a.manifest.id !== 'com.stremio.torrentio.addon' &&
               // Streaming Catalogs addon disabled/commented out for now:
               a.manifest.id !== 'pw.ers.netflix-catalog',
           )
@@ -802,8 +804,13 @@ export const App: React.FC = () => {
             manifest: p.manifest as unknown as InstalledAddon['manifest'],
             lastCheckedIso: p.lastCheckedIso,
           }))
-          // Streaming Catalogs addon disabled/commented out for now:
-          .filter((a) => a.manifest.id !== 'pw.ers.netflix-catalog');
+          // Streaming Catalogs & raw P2P Torrentio addons excluded:
+          .filter(
+            (a) =>
+              a.manifest.id !== 'pw.ers.netflix-catalog' &&
+              a.manifest.id !== 'com.stremio.torrentio.addon' &&
+              !a.manifestUrl.includes('torrentio.strem.fun'),
+          );
         setAddons(restoredAddons);
         /* Streaming Catalogs config restore commented out (code preserved):
         const scAddon = restoredAddons.find(

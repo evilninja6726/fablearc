@@ -16,7 +16,6 @@ import {
   buildStreamingCatalogsManifestUrl,
   DEFAULT_BOOTSTRAP_MANIFEST_URLS,
   DEFAULT_PENGUPLAY_MANIFEST_URL,
-  DEFAULT_TORRENTIO_HINDI_MANIFEST_URL,
   extractStreamQualityInfo,
   normalizeStremioMeta,
   parseStreamingCatalogsConfig,
@@ -116,14 +115,8 @@ describe('Default Addons & Decreasing Stream Quality Sorting', () => {
     expect(DEFAULT_BOOTSTRAP_MANIFEST_URLS).toContain(
       'https://hdhub.thevolecitor.qzz.io/eyJ0b3Jib3giOiJ1bnNldCIsInF1YWxpdGllcyI6IjIxNjBwLDEwODBwLDcyMHAiLCJzb3J0IjoiZGVzYyJ9/manifest.json',
     );
-    expect(DEFAULT_BOOTSTRAP_MANIFEST_URLS).toContain(
-      DEFAULT_TORRENTIO_HINDI_MANIFEST_URL,
-    );
-    expect(DEFAULT_TORRENTIO_HINDI_MANIFEST_URL).toBe(
+    expect(DEFAULT_BOOTSTRAP_MANIFEST_URLS).not.toContain(
       'https://torrentio.strem.fun/language=hindi/manifest.json',
-    );
-    expect(upgradeLegacyDefaultAddonUrl('https://torrentio.strem.fun/manifest.json')).toBe(
-      DEFAULT_TORRENTIO_HINDI_MANIFEST_URL,
     );
     const enrichedMagnet = buildP2pMagnetUri(
       'b1d85d08e0db92e03e1c0f26e74cf86db9538213',
