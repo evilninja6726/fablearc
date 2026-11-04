@@ -12,6 +12,7 @@ import {
 } from '../src/player/subtitleEngine';
 import {
   addonSupportsResource,
+  buildP2pMagnetUri,
   buildStreamingCatalogsManifestUrl,
   DEFAULT_BOOTSTRAP_MANIFEST_URLS,
   DEFAULT_PENGUPLAY_MANIFEST_URL,
@@ -124,6 +125,15 @@ describe('Default Addons & Decreasing Stream Quality Sorting', () => {
     expect(upgradeLegacyDefaultAddonUrl('https://torrentio.strem.fun/manifest.json')).toBe(
       DEFAULT_TORRENTIO_HINDI_MANIFEST_URL,
     );
+    const enrichedMagnet = buildP2pMagnetUri(
+      'b1d85d08e0db92e03e1c0f26e74cf86db9538213',
+      'The.Batman.2022.mkv',
+      ['udp://tracker.opentrackr.org:1337/announce'],
+    );
+    expect(enrichedMagnet).toContain('magnet:?xt=urn:btih:b1d85d08e0db92e03e1c0f26e74cf86db9538213');
+    expect(enrichedMagnet).toContain('dn=The.Batman.2022.mkv');
+    expect(enrichedMagnet).toContain(encodeURIComponent('udp://tracker.opentrackr.org:1337/announce'));
+    expect(enrichedMagnet).toContain(encodeURIComponent('wss://tracker.openwebtorrent.com'));
     // Streaming Catalogs addon commented out for now:
     // expect(DEFAULT_BOOTSTRAP_MANIFEST_URLS).toContain(
     //   'https://7a82163c306e-stremio-netflix-catalog-addon.baby-beamup.club/manifest.json',

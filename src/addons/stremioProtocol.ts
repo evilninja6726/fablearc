@@ -104,6 +104,9 @@ export interface StremioStreamItem {
   externalUrl?: string;
   infoHash?: string;
   fileIdx?: number;
+  filename?: string;
+  trackers?: string[];
+  seeders?: number;
   isHls?: boolean;
   qualityScore?: number;
   qualityBadge?: string;
@@ -340,6 +343,16 @@ export function sortStreamsByDecreasingQuality(
     const audioB = b.audioScore ?? (b.isMultiAudio ? 1 : 0);
     if (audioB !== audioA) return audioB - audioA;
 
+    // 2b. For P2P magnet streams in the same quality + audio tier, prioritize healthy swarms (seeders)
+    if (a.kind === 'magnet' && b.kind === 'magnet') {
+      const seedsA = a.seeders ?? 0;
+      const seedsB = b.seeders ?? 0;
+      const healthyA = seedsA >= 5 ? 1 : 0;
+      const healthyB = seedsB >= 5 ? 1 : 0;
+      if (healthyB !== healthyA) return healthyB - healthyA;
+      if (seedsB !== seedsA) return seedsB - seedsA;
+    }
+
     // 3. Decreasing file size / bitrate
     const sizeA = a.sizeBytes ?? 0;
     const sizeB = b.sizeBytes ?? 0;
@@ -347,6 +360,46 @@ export function sortStreamsByDecreasingQuality(
 
     return 0;
   });
+}
+
+/**
+ * Default BitTorrent & WebTorrent trackers (from Nuvio P2pStreamingEngine + WebSocket WebRTC trackers)
+ * used to enrich `infoHash` magnet URIs so P2P engines (WebTor, local Stremio 127.0.0.1:11470, native clients)
+ * discover peers immediately.
+ */
+export const DEFAULT_P2P_TRACKERS: string[] = [
+  'udp://tracker.opentrackr.org:1337/announce',
+  'udp://open.demonii.com:1337/announce',
+  'udp://open.stealth.si:80/announce',
+  'udp://tracker.torrent.eu.org:451/announce',
+  'udp://tracker.qu.ax:6969/announce',
+  'udp://tracker.tryhackx.org:6969/announce',
+  'udp://tracker.nyaa.vc:6969/announce',
+  'udp://tracker.gmi.gd:6969/announce',
+  'udp://tracker.ducks.party:1984/announce',
+  'udp://zer0day.ch:1337/announce',
+  'udp://tracker.publictracker.xyz:6969/announce',
+  'http://tracker.renfei.net:8080/announce',
+  'wss://tracker.openwebtorrent.com',
+  'wss://tracker.btorrent.xyz',
+  'wss://tracker.webtorrent.dev',
+];
+
+export function buildP2pMagnetUri(
+  infoHash: string,
+  displayName?: string,
+  extraTrackers: string[] = [],
+): string {
+  const canonicalHash = infoHash.trim().toLowerCase();
+  const dnParam = displayName ? `&dn=${encodeURIComponent(displayName)}` : '';
+  const allTrackers = Array.from(
+    new Set([...extraTrackers, ...DEFAULT_P2P_TRACKERS].map((t) => t.trim()).filter(Boolean)),
+  );
+  const trParams = allTrackers
+    .slice(0, 20)
+    .map((tr) => `&tr=${encodeURIComponent(tr)}`)
+    .join('');
+  return `magnet:?xt=urn:btih:${canonicalHash}${dnParam}${trParams}`;
 }
 
 /**
@@ -1438,9 +1491,19 @@ export async function fetchStreamsFromAddons(
           } else if (typeof raw.infoHash === 'string' && raw.infoHash.trim()) {
             const hash = raw.infoHash.trim().toLowerCase();
             if (/^[a-f0-9]{40}$/i.test(hash)) {
-              const dn = encodeURIComponent(mediaItem?.name || videoId);
+              const rawSources = Array.isArray(raw.sources) ? raw.sources : [];
+              const sourceTrackers = rawSources
+                .filter((s): s is string => typeof s === 'string' && s.startsWith('tracker:'))
+                .map((s) => s.slice('tracker:'.length).trim())
+                .filter(Boolean);
               const seedMatch = `${title} ${extraDesc}`.match(/👤\s*(\d+)/);
               const seedCount = seedMatch ? parseInt(seedMatch[1], 10) : 0;
+              const displayName = hintFilename || mediaItem?.name || videoId;
+              const enrichedMagnetUrl = buildP2pMagnetUri(
+                hash,
+                displayName,
+                sourceTrackers,
+              );
               results.push({
                 id: `${addon.manifest.id}-magnet-${idx}`,
                 addonId: addon.manifest.id,
@@ -1450,7 +1513,10 @@ export async function fetchStreamsFromAddons(
                 kind: 'magnet',
                 infoHash: hash,
                 fileIdx: typeof raw.fileIdx === 'number' ? raw.fileIdx : undefined,
-                url: `magnet:?xt=urn:btih:${hash}&dn=${dn}`,
+                filename: hintFilename || undefined,
+                trackers: sourceTrackers,
+                seeders: seedCount,
+                url: enrichedMagnetUrl,
                 serverStatusBadge: seedCount > 0 ? `P2P · 👤 ${seedCount}` : 'P2P',
                 ...qualityInfo,
               });
