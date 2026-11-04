@@ -33,11 +33,14 @@ import {
   Zap,
 } from 'lucide-react';
 import {
+  applyCachedServerHealth,
   buildTranscodedStreamUrl,
   fetchStreamsFromAddons,
   fetchSubtitlesFromAddons,
   getAudioTrackLanguagePriority,
+  getCachedMediaProbe,
   InstalledAddon,
+  MediaProbeResponse,
   pingStreamBatch,
   ProbedAudioTrack,
   probeMediaStream,
@@ -48,6 +51,7 @@ import {
   StremioMediaItem,
   StremioStreamItem,
   StremioSubtitleTrack,
+  warmBrowserCdnConnection,
 } from '../addons/stremioProtocol';
 import {
   computeAutoSyncDelayMs,
@@ -584,10 +588,11 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         initialStreams.length > 0 &&
         activeVideoId === initialTargetId
       ) {
-        const hasRankedWinner = initialStreams.some((s) => s.isTopResponsive);
+        const hydratedInitial = applyCachedServerHealth(initialStreams);
+        const hasRankedWinner = hydratedInitial.some((s) => s.isTopResponsive);
         const orderedInitial = hasRankedWinner
-          ? initialStreams
-          : sortStreamsByDecreasingQuality(initialStreams);
+          ? hydratedInitial
+          : applyCachedServerHealth(sortStreamsByDecreasingQuality(hydratedInitial));
         setStreams(orderedInitial);
         setActiveStream((prev) => {
           if (prev) return prev;
@@ -943,6 +948,74 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       return;
     }
 
+    const applyProbeDecision = (probe: MediaProbeResponse | null) => {
+      const targetCdnUrl =
+        probe?.resolvedUrl && /^https?:\/\//i.test(probe.resolvedUrl)
+          ? probe.resolvedUrl
+          : preResolvedCdn;
+
+      // 1. Auto-skip dead (404 / 451 / signin.mp4) upstream servers immediately
+      if (
+        probe?.unreachable ||
+        /\/signin\.mp4(\?|$)/i.test(targetCdnUrl) ||
+        (probe && probe.durationSec === 0 && probe.audioTracks.length === 0)
+      ) {
+        switchToNextStreamRef.current('Server offline or file removed');
+        return;
+      }
+
+      // 2. Auto-skip plain HTTP servers (e.g. http://usa7-as04.shegu.net) on HTTPS pages so we never proxy 20 GB video through Render
+      const isInsecureHttpCdn =
+        typeof window !== 'undefined' &&
+        window.location?.protocol === 'https:' &&
+        targetCdnUrl.startsWith('http://');
+      if (isInsecureHttpCdn) {
+        switchToNextStreamRef.current('Skipped insecure HTTP server');
+        return;
+      }
+
+      warmBrowserCdnConnection(targetCdnUrl);
+      setResolvedDirectUrl(targetCdnUrl);
+
+      let shouldUseFfmpeg = true;
+      if (probe) {
+        if (probe.durationSec > 0) {
+          setProbedDurationSec(probe.durationSec);
+        }
+        if (probe.audioTracks.length > 0) {
+          // Sort tracks with English first, then Hindi, then any other language
+          const sortedTracks = sortAudioTracksByLanguagePriority(probe.audioTracks);
+          setProbedAudioTracks(sortedTracks);
+          // Automatically prefer the top-priority language track (English -> Hindi -> first track)
+          const preferredTrack = sortedTracks[0];
+          const targetAudioIndex = preferredTrack ? preferredTrack.audioIndex : 0;
+          setSelectedAudioTrackIndex(targetAudioIndex);
+
+          // Direct-play from source CDN (0 MB Render bandwidth) when default track 0 already uses a browser-native audio codec
+          const isBrowserNativeAudio = Boolean(
+            preferredTrack &&
+              /^(aac|mp3|mp4a|opus|vorbis|flac)$/i.test(preferredTrack.codec),
+          );
+          if (targetAudioIndex === 0 && isBrowserNativeAudio) {
+            shouldUseFfmpeg = false;
+          }
+        }
+      }
+      setUseFfmpegAudioEngine(shouldUseFfmpeg);
+      setProbingAudio(false);
+      setProbedStreamUrl(streamUrl);
+    };
+
+    // Layer 3 (Synchronous Probe Fast-Path):
+    // If the Details Page already pre-warmed `/api/media-probe` for this server, apply the cached probe
+    // synchronously in 0ms without showing "Loading..." or waiting for an async fetch tick!
+    const cachedProbe =
+      getCachedMediaProbe(streamUrl) ?? getCachedMediaProbe(preResolvedCdn);
+    if (cachedProbe) {
+      applyProbeDecision(cachedProbe);
+      return;
+    }
+
     let cancelled = false;
     setProbingAudio(true);
     setProbedAudioTracks([]);
@@ -951,60 +1024,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     probeMediaStream(streamUrl)
       .then((probe) => {
         if (cancelled) return;
-        const targetCdnUrl =
-          probe?.resolvedUrl && /^https?:\/\//i.test(probe.resolvedUrl)
-            ? probe.resolvedUrl
-            : streamUrl;
-
-        // 1. Auto-skip dead (404 / 451 / signin.mp4) upstream servers immediately
-        if (
-          probe?.unreachable ||
-          /\/signin\.mp4(\?|$)/i.test(targetCdnUrl) ||
-          (probe && probe.durationSec === 0 && probe.audioTracks.length === 0)
-        ) {
-          switchToNextStreamRef.current('Server offline or file removed');
-          return;
-        }
-
-        // 2. Auto-skip plain HTTP servers (e.g. http://usa7-as04.shegu.net) on HTTPS pages so we never proxy 20 GB video through Render
-        const isInsecureHttpCdn =
-          typeof window !== 'undefined' &&
-          window.location?.protocol === 'https:' &&
-          targetCdnUrl.startsWith('http://');
-        if (isInsecureHttpCdn) {
-          switchToNextStreamRef.current('Skipped insecure HTTP server');
-          return;
-        }
-
-        setResolvedDirectUrl(targetCdnUrl);
-
-        let shouldUseFfmpeg = true;
-        if (probe) {
-          if (probe.durationSec > 0) {
-            setProbedDurationSec(probe.durationSec);
-          }
-          if (probe.audioTracks.length > 0) {
-            // Sort tracks with English first, then Hindi, then any other language
-            const sortedTracks = sortAudioTracksByLanguagePriority(probe.audioTracks);
-            setProbedAudioTracks(sortedTracks);
-            // Automatically prefer the top-priority language track (English -> Hindi -> first track)
-            const preferredTrack = sortedTracks[0];
-            const targetAudioIndex = preferredTrack ? preferredTrack.audioIndex : 0;
-            setSelectedAudioTrackIndex(targetAudioIndex);
-
-            // Direct-play from source CDN (0 MB Render bandwidth) when default track 0 already uses a browser-native audio codec
-            const isBrowserNativeAudio = Boolean(
-              preferredTrack &&
-                /^(aac|mp3|mp4a|opus|vorbis|flac)$/i.test(preferredTrack.codec),
-            );
-            if (targetAudioIndex === 0 && isBrowserNativeAudio) {
-              shouldUseFfmpeg = false;
-            }
-          }
-        }
-        setUseFfmpegAudioEngine(shouldUseFfmpeg);
-        setProbingAudio(false);
-        setProbedStreamUrl(streamUrl);
+        applyProbeDecision(probe);
       })
       .catch(() => {
         if (!cancelled) {

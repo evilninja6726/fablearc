@@ -1258,9 +1258,16 @@ export async function fetchMetaFromAddons(
   return initialItem ?? null;
 }
 
+const streamListCache = new Map<
+  string,
+  { data: StremioStreamItem[]; expiresAt: number }
+>();
+const inFlightStreamFetches = new Map<string, Promise<StremioStreamItem[]>>();
+
 /**
  * Queries all enabled `stream` addons for `/stream/<type>/<videoId>.json`, parses resolution quality & file size,
  * merges trailers, and returns streams sorted in strictly decreasing order of quality.
+ * Uses single-flight request coalescing + a 5-minute in-memory cache so card-hover prefetching makes Details/Player load in 0ms.
  */
 export async function fetchStreamsFromAddons(
   addons: InstalledAddon[],
@@ -1274,167 +1281,218 @@ export async function fetchStreamsFromAddons(
       addonSupportsResource(a.manifest, 'stream', mediaType, videoId),
   );
 
-  const results: StremioStreamItem[] = [];
+  const addonSignature = streamAddons
+    .map((a) => a.manifest.id)
+    .sort()
+    .join(',');
+  const cacheKey = `${addonSignature}::${mediaType}::${videoId}`;
 
-  await Promise.allSettled(
-    streamAddons.map(async (addon) => {
-      const effectiveManifestUrl = upgradeLegacyDefaultAddonUrl(addon.manifestUrl);
-      const baseUrl = effectiveManifestUrl.replace(/\/manifest\.json$/i, '');
-      const endpoint = `${baseUrl}/stream/${encodeURIComponent(mediaType)}/${encodeURIComponent(videoId)}.json`;
-      const check = validateAddonOrStreamUrl(endpoint, {
-        requireHttps: true,
-        allowExplicitLanMediaServer: false,
-      });
-      if (!check.allowed || !check.normalizedUrl) return;
+  const cached = streamListCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return applyCachedServerHealth(cached.data);
+  }
 
-      const payload = await cachedJsonFetch<{
-        streams?: Array<Record<string, unknown>>;
-      }>(check.normalizedUrl, 600_000);
-      if (!Array.isArray(payload?.streams)) return;
+  const existingInFlight = inFlightStreamFetches.get(cacheKey);
+  if (existingInFlight) {
+    const list = await existingInFlight;
+    return applyCachedServerHealth(list);
+  }
 
-      payload.streams.forEach((raw, idx) => {
-        if (!raw || typeof raw !== 'object') return;
-        const name =
-          typeof raw.name === 'string' && raw.name.trim()
-            ? raw.name.trim()
-            : addon.manifest.name;
-        const rawDesc =
-          typeof raw.description === 'string' && raw.description.trim()
-            ? raw.description.trim()
-            : '';
-        const behaviorHints =
-          raw.behaviorHints && typeof raw.behaviorHints === 'object'
-            ? (raw.behaviorHints as Record<string, unknown>)
-            : undefined;
-        const hintFilename =
-          behaviorHints && typeof behaviorHints.filename === 'string'
-            ? behaviorHints.filename
-            : '';
-        const extraDesc = `${rawDesc} ${hintFilename}`.trim();
-        const title =
-          typeof raw.title === 'string' && raw.title.trim()
-            ? raw.title.trim()
-            : rawDesc || name;
+  const fetchPromise = (async (): Promise<StremioStreamItem[]> => {
+    const results: StremioStreamItem[] = [];
 
-        const qualityInfo = extractStreamQualityInfo(name, title, extraDesc);
-        if (
-          qualityInfo.sizeBytes === 0 &&
-          behaviorHints &&
-          typeof behaviorHints.videoSize === 'number' &&
-          behaviorHints.videoSize > 0
-        ) {
-          qualityInfo.sizeBytes = behaviorHints.videoSize;
-          const gb = behaviorHints.videoSize / (1024 * 1024 * 1024);
-          qualityInfo.sizeLabel =
-            gb >= 1
-              ? `${gb.toFixed(gb >= 10 ? 1 : 2)} GB`
-              : `${Math.round(behaviorHints.videoSize / (1024 * 1024))} MB`;
-        }
-        const rawUrlStr = typeof raw.url === 'string' ? raw.url : '';
-        const rawExtStr = typeof raw.externalUrl === 'string' ? raw.externalUrl : '';
+    await Promise.allSettled(
+      streamAddons.map(async (addon) => {
+        const effectiveManifestUrl = upgradeLegacyDefaultAddonUrl(addon.manifestUrl);
+        const baseUrl = effectiveManifestUrl.replace(/\/manifest\.json$/i, '');
+        const endpoint = `${baseUrl}/stream/${encodeURIComponent(mediaType)}/${encodeURIComponent(videoId)}.json`;
+        const check = validateAddonOrStreamUrl(endpoint, {
+          requireHttps: true,
+          allowExplicitLanMediaServer: false,
+        });
+        if (!check.allowed || !check.normalizedUrl) return;
 
-        // Completely drop any "Join Discord Server" or promotional spam entries
-        if (
-          qualityInfo.isPromo ||
-          isDiscordOrPromoSpam(rawUrlStr) ||
-          isDiscordOrPromoSpam(rawExtStr)
-        ) {
-          return;
-        }
+        const payload = await cachedJsonFetch<{
+          streams?: Array<Record<string, unknown>>;
+        }>(check.normalizedUrl, 600_000);
+        if (!Array.isArray(payload?.streams)) return;
 
-        if (typeof raw.url === 'string' && raw.url.trim()) {
-          const urlCheck = validateAddonOrStreamUrl(raw.url.trim(), {
-            requireHttps: false,
-            allowExplicitLanMediaServer: false,
-          });
-          if (urlCheck.allowed && urlCheck.normalizedUrl) {
+        payload.streams.forEach((raw, idx) => {
+          if (!raw || typeof raw !== 'object') return;
+          const name =
+            typeof raw.name === 'string' && raw.name.trim()
+              ? raw.name.trim()
+              : addon.manifest.name;
+          const rawDesc =
+            typeof raw.description === 'string' && raw.description.trim()
+              ? raw.description.trim()
+              : '';
+          const behaviorHints =
+            raw.behaviorHints && typeof raw.behaviorHints === 'object'
+              ? (raw.behaviorHints as Record<string, unknown>)
+              : undefined;
+          const hintFilename =
+            behaviorHints && typeof behaviorHints.filename === 'string'
+              ? behaviorHints.filename
+              : '';
+          const extraDesc = `${rawDesc} ${hintFilename}`.trim();
+          const title =
+            typeof raw.title === 'string' && raw.title.trim()
+              ? raw.title.trim()
+              : rawDesc || name;
+
+          const qualityInfo = extractStreamQualityInfo(name, title, extraDesc);
+          if (
+            qualityInfo.sizeBytes === 0 &&
+            behaviorHints &&
+            typeof behaviorHints.videoSize === 'number' &&
+            behaviorHints.videoSize > 0
+          ) {
+            qualityInfo.sizeBytes = behaviorHints.videoSize;
+            const gb = behaviorHints.videoSize / (1024 * 1024 * 1024);
+            qualityInfo.sizeLabel =
+              gb >= 1
+                ? `${gb.toFixed(gb >= 10 ? 1 : 2)} GB`
+                : `${Math.round(behaviorHints.videoSize / (1024 * 1024))} MB`;
+          }
+          const rawUrlStr = typeof raw.url === 'string' ? raw.url : '';
+          const rawExtStr = typeof raw.externalUrl === 'string' ? raw.externalUrl : '';
+
+          // Completely drop any "Join Discord Server" or promotional spam entries
+          if (
+            qualityInfo.isPromo ||
+            isDiscordOrPromoSpam(rawUrlStr) ||
+            isDiscordOrPromoSpam(rawExtStr)
+          ) {
+            return;
+          }
+
+          if (typeof raw.url === 'string' && raw.url.trim()) {
+            const urlCheck = validateAddonOrStreamUrl(raw.url.trim(), {
+              requireHttps: false,
+              allowExplicitLanMediaServer: false,
+            });
+            if (urlCheck.allowed && urlCheck.normalizedUrl) {
+              results.push({
+                id: `${addon.manifest.id}-direct-${idx}`,
+                addonId: addon.manifest.id,
+                addonName: addon.manifest.name,
+                name,
+                title,
+                kind: 'direct',
+                url: urlCheck.normalizedUrl,
+                isHls: urlCheck.normalizedUrl.includes('.m3u8'),
+                ...qualityInfo,
+              });
+            }
+          } else if (typeof raw.ytId === 'string' && raw.ytId.trim()) {
             results.push({
-              id: `${addon.manifest.id}-direct-${idx}`,
+              id: `${addon.manifest.id}-yt-${idx}`,
               addonId: addon.manifest.id,
               addonName: addon.manifest.name,
               name,
               title,
-              kind: 'direct',
-              url: urlCheck.normalizedUrl,
-              isHls: urlCheck.normalizedUrl.includes('.m3u8'),
-              ...qualityInfo,
+              kind: 'youtube',
+              ytId: raw.ytId.trim(),
+              qualityScore: 720,
+              qualityBadge: 'Trailer',
+              sizeBytes: 0,
+              isPromo: qualityInfo.isPromo,
             });
+          } else if (typeof raw.externalUrl === 'string' && raw.externalUrl.trim()) {
+            const extCheck = validateAddonOrStreamUrl(raw.externalUrl.trim(), {
+              requireHttps: true,
+              allowExplicitLanMediaServer: false,
+            });
+            if (extCheck.allowed && extCheck.normalizedUrl) {
+              results.push({
+                id: `${addon.manifest.id}-ext-${idx}`,
+                addonId: addon.manifest.id,
+                addonName: addon.manifest.name,
+                name,
+                title,
+                kind: 'external',
+                externalUrl: extCheck.normalizedUrl,
+                ...qualityInfo,
+              });
+            }
+          } else if (typeof raw.infoHash === 'string' && raw.infoHash.trim()) {
+            const hash = raw.infoHash.trim().toLowerCase();
+            if (/^[a-f0-9]{40}$/i.test(hash)) {
+              const dn = encodeURIComponent(mediaItem?.name || videoId);
+              results.push({
+                id: `${addon.manifest.id}-magnet-${idx}`,
+                addonId: addon.manifest.id,
+                addonName: addon.manifest.name,
+                name,
+                title,
+                kind: 'magnet',
+                infoHash: hash,
+                fileIdx: typeof raw.fileIdx === 'number' ? raw.fileIdx : undefined,
+                url: `magnet:?xt=urn:btih:${hash}&dn=${dn}`,
+                ...qualityInfo,
+              });
+            }
           }
-        } else if (typeof raw.ytId === 'string' && raw.ytId.trim()) {
+        });
+      }),
+    );
+
+    // Include official trailers from the item's metadata (e.g. from Streaming Catalogs or Cinemeta)
+    if (mediaItem?.trailers && mediaItem.trailers.length > 0) {
+      mediaItem.trailers.forEach((tr, idx) => {
+        if (!results.some((r) => r.kind === 'youtube' && r.ytId === tr.source)) {
           results.push({
-            id: `${addon.manifest.id}-yt-${idx}`,
-            addonId: addon.manifest.id,
-            addonName: addon.manifest.name,
-            name,
-            title,
+            id: `meta-trailer-${idx}-${tr.source}`,
+            addonId: mediaItem.sourceAddonId || 'meta.trailer',
+            addonName: mediaItem.sourceAddonName || 'Official Trailer',
+            name: tr.type || 'Official Trailer',
+            title: tr.title || `${mediaItem.name} — Official Trailer #${idx + 1}`,
             kind: 'youtube',
-            ytId: raw.ytId.trim(),
+            ytId: tr.source,
             qualityScore: 720,
             qualityBadge: 'Trailer',
             sizeBytes: 0,
-            isPromo: qualityInfo.isPromo,
+            isPromo: false,
           });
-        } else if (typeof raw.externalUrl === 'string' && raw.externalUrl.trim()) {
-          const extCheck = validateAddonOrStreamUrl(raw.externalUrl.trim(), {
-            requireHttps: true,
-            allowExplicitLanMediaServer: false,
-          });
-          if (extCheck.allowed && extCheck.normalizedUrl) {
-            results.push({
-              id: `${addon.manifest.id}-ext-${idx}`,
-              addonId: addon.manifest.id,
-              addonName: addon.manifest.name,
-              name,
-              title,
-              kind: 'external',
-              externalUrl: extCheck.normalizedUrl,
-              ...qualityInfo,
-            });
-          }
-        } else if (typeof raw.infoHash === 'string' && raw.infoHash.trim()) {
-          const hash = raw.infoHash.trim().toLowerCase();
-          if (/^[a-f0-9]{40}$/i.test(hash)) {
-            const dn = encodeURIComponent(mediaItem?.name || videoId);
-            results.push({
-              id: `${addon.manifest.id}-magnet-${idx}`,
-              addonId: addon.manifest.id,
-              addonName: addon.manifest.name,
-              name,
-              title,
-              kind: 'magnet',
-              infoHash: hash,
-              fileIdx: typeof raw.fileIdx === 'number' ? raw.fileIdx : undefined,
-              url: `magnet:?xt=urn:btih:${hash}&dn=${dn}`,
-              ...qualityInfo,
-            });
-          }
         }
       });
-    }),
-  );
+    }
 
-  // Include official trailers from the item's metadata (e.g. from Streaming Catalogs or Cinemeta)
-  if (mediaItem?.trailers && mediaItem.trailers.length > 0) {
-    mediaItem.trailers.forEach((tr, idx) => {
-      if (!results.some((r) => r.kind === 'youtube' && r.ytId === tr.source)) {
-        results.push({
-          id: `meta-trailer-${idx}-${tr.source}`,
-          addonId: mediaItem.sourceAddonId || 'meta.trailer',
-          addonName: mediaItem.sourceAddonName || 'Official Trailer',
-          name: tr.type || 'Official Trailer',
-          title: tr.title || `${mediaItem.name} — Official Trailer #${idx + 1}`,
-          kind: 'youtube',
-          ytId: tr.source,
-          qualityScore: 720,
-          qualityBadge: 'Trailer',
-          sizeBytes: 0,
-          isPromo: false,
-        });
-      }
-    });
+    const sorted = sortStreamsByDecreasingQuality(results);
+    if (sorted.length > 0) {
+      streamListCache.set(cacheKey, {
+        data: sorted,
+        expiresAt: Date.now() + 5 * 60 * 1000,
+      });
+    }
+    return applyCachedServerHealth(sorted);
+  })();
+
+  inFlightStreamFetches.set(cacheKey, fetchPromise);
+  try {
+    return await fetchPromise;
+  } finally {
+    inFlightStreamFetches.delete(cacheKey);
   }
+}
 
-  return sortStreamsByDecreasingQuality(results);
+/**
+ * Layer 1 (Hover Intent Prefetch): Silently prefetches addon streams for a media card
+ * so opening the Details Page or clicking Play resolves the stream list in 0ms.
+ */
+export function prefetchStreamsForMedia(
+  addons: InstalledAddon[],
+  mediaItem: StremioMediaItem,
+): void {
+  const targetVideoId =
+    mediaItem.type === 'series' && mediaItem.videos?.length > 0
+      ? mediaItem.videos[0].id
+      : mediaItem.imdbId || mediaItem.id;
+  if (!targetVideoId) return;
+  fetchStreamsFromAddons(addons, mediaItem.type, targetVideoId, mediaItem).catch(
+    () => {},
+  );
 }
 
 export interface ProbedAudioTrack {
@@ -1523,6 +1581,56 @@ const clientProbeCache = new Map<
   { data: MediaProbeResponse; expiresAt: number }
 >();
 
+const preconnectedOrigins = new Set<string>();
+
+/**
+ * Layer 2 (Browser Preconnect & DNS-Prefetch Warmup):
+ * Injects `<link rel="dns-prefetch">` and `<link rel="preconnect" crossorigin>` into `document.head`
+ * for the winning direct CDN origin so the user's browser completes DNS + TCP + TLS 1.3 handshakes
+ * BEFORE the user clicks Play Now (0 MB Render bandwidth).
+ */
+export function warmBrowserCdnConnection(targetUrl?: string | null): void {
+  if (!targetUrl || typeof document === 'undefined' || !document.head) return;
+  try {
+    const parsed = new URL(targetUrl);
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return;
+    const origin = parsed.origin;
+    if (!origin || preconnectedOrigins.has(origin)) return;
+    if (preconnectedOrigins.size >= 32) {
+      const oldest = preconnectedOrigins.values().next().value;
+      if (oldest) preconnectedOrigins.delete(oldest);
+    }
+    preconnectedOrigins.add(origin);
+
+    const dnsLink = document.createElement('link');
+    dnsLink.rel = 'dns-prefetch';
+    dnsLink.href = origin;
+    document.head.appendChild(dnsLink);
+
+    const preconnectLink = document.createElement('link');
+    preconnectLink.rel = 'preconnect';
+    preconnectLink.href = origin;
+    preconnectLink.crossOrigin = 'anonymous';
+    document.head.appendChild(preconnectLink);
+  } catch {
+    // Ignore invalid URLs
+  }
+}
+
+/**
+ * Layer 3 (Synchronous Probe Cache Lookup):
+ * Returns a previously pre-warmed `/api/media-probe` result synchronously in 0ms
+ * so opening CinemaPlayerModal from the Details Page skips the async probe round-trip completely!
+ */
+export function getCachedMediaProbe(streamUrl?: string | null): MediaProbeResponse | null {
+  if (!streamUrl) return null;
+  const cached = clientProbeCache.get(streamUrl);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.data;
+  }
+  return null;
+}
+
 export async function probeMediaStream(
   streamUrl: string,
   explicitToken?: string,
@@ -1530,6 +1638,7 @@ export async function probeMediaStream(
   try {
     const cached = clientProbeCache.get(streamUrl);
     if (cached && cached.expiresAt > Date.now()) {
+      warmBrowserCdnConnection(cached.data.resolvedUrl || streamUrl);
       return cached.data;
     }
 
@@ -1556,6 +1665,13 @@ export async function probeMediaStream(
       data: normalized,
       expiresAt: Date.now() + 10 * 60 * 1000,
     });
+    if (normalized.resolvedUrl) {
+      clientProbeCache.set(normalized.resolvedUrl, {
+        data: normalized,
+        expiresAt: Date.now() + 10 * 60 * 1000,
+      });
+    }
+    warmBrowserCdnConnection(normalized.resolvedUrl || streamUrl);
     return normalized;
   } catch {
     return null;
@@ -1589,6 +1705,37 @@ export interface ServerHealthMetric {
   statusBadge: string;
 }
 
+const clientServerHealthCache = new Map<
+  string,
+  { metric: ServerHealthMetric; expiresAt: number }
+>();
+
+/**
+ * Layer 4 (Client-Side Ping & Resolution Cache):
+ * Applies any cached server ping/health metrics synchronously so re-opening the Details Page
+ * or Player displays `ms` badges and unwrapped CDN URLs in 0ms without re-pinging.
+ */
+export function applyCachedServerHealth(
+  streams: StremioStreamItem[],
+): StremioStreamItem[] {
+  const now = Date.now();
+  return streams.map((s) => {
+    if (!s.url) return s;
+    const cached = clientServerHealthCache.get(s.url);
+    if (!cached || cached.expiresAt <= now) return s;
+    const m = cached.metric;
+    return {
+      ...s,
+      ttfbMs: m.ttfbMs,
+      speedMbps: m.speedMbps || s.speedMbps,
+      responsivenessScore: m.responsivenessScore || s.responsivenessScore,
+      serverStatusBadge: m.statusBadge || s.serverStatusBadge,
+      unreachable: m.unreachable || !m.ok,
+      resolvedDirectUrl: m.resolvedUrl || s.resolvedDirectUrl || s.url,
+    };
+  });
+}
+
 /**
  * Benchmarks up to 6 candidate stream servers in the background with a partial 64 KB Range check
  * via `/api/media-health-batch` (costs ~400 bytes of JSON on Render outbound HTTP Responses),
@@ -1600,7 +1747,7 @@ export async function rankStreamsByResponsiveness(
   streams: StremioStreamItem[],
   explicitToken?: string,
 ): Promise<StremioStreamItem[]> {
-  const sortedBase = sortStreamsByDecreasingQuality(streams);
+  const sortedBase = applyCachedServerHealth(sortStreamsByDecreasingQuality(streams));
   const directCandidates = sortedBase
     .filter((s) => s.kind === 'direct' && !s.isPromo && Boolean(s.url))
     .slice(0, 6);
@@ -1610,39 +1757,58 @@ export async function rankStreamsByResponsiveness(
   }
 
   try {
-    const authToken = explicitToken ?? getClientAuthToken();
-    const backendOrigin = getCloudBackendOrigin();
-    const resp = await fetch(`${backendOrigin}/api/media-health-batch`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-        ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
-      },
-      body: JSON.stringify({
-        candidates: directCandidates.map((c) => ({
-          id: c.id,
-          url: c.url,
-          sizeBytes: c.sizeBytes ?? 0,
-        })),
-      }),
-    });
-
-    if (!resp.ok) {
-      return sortedBase;
-    }
-
-    const payload = (await resp.json()) as { results?: ServerHealthMetric[] };
-    const metrics = Array.isArray(payload?.results) ? payload.results : [];
-    if (metrics.length === 0) {
-      return sortedBase;
-    }
-
+    const now = Date.now();
     const metricById = new Map<string, ServerHealthMetric>();
-    for (const m of metrics) {
-      if (m && typeof m.id === 'string') {
-        metricById.set(m.id, m);
+    const uncachedCandidates: StremioStreamItem[] = [];
+
+    for (const c of directCandidates) {
+      const cached = c.url ? clientServerHealthCache.get(c.url) : undefined;
+      if (cached && cached.expiresAt > now && cached.metric.speedMbps > 0) {
+        metricById.set(c.id, { ...cached.metric, id: c.id });
+      } else {
+        uncachedCandidates.push(c);
       }
+    }
+
+    const authToken = explicitToken ?? getClientAuthToken();
+    if (uncachedCandidates.length > 0) {
+      const backendOrigin = getCloudBackendOrigin();
+      const resp = await fetch(`${backendOrigin}/api/media-health-batch`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+        },
+        body: JSON.stringify({
+          candidates: uncachedCandidates.map((c) => ({
+            id: c.id,
+            url: c.url,
+            sizeBytes: c.sizeBytes ?? 0,
+          })),
+        }),
+      });
+
+      if (resp.ok) {
+        const payload = (await resp.json()) as { results?: ServerHealthMetric[] };
+        const metrics = Array.isArray(payload?.results) ? payload.results : [];
+        for (const m of metrics) {
+          if (m && typeof m.id === 'string') {
+            metricById.set(m.id, m);
+            const matchedCandidate = uncachedCandidates.find((c) => c.id === m.id);
+            if (matchedCandidate?.url) {
+              clientServerHealthCache.set(matchedCandidate.url, {
+                metric: m,
+                expiresAt: Date.now() + 5 * 60 * 1000,
+              });
+            }
+          }
+        }
+      }
+    }
+
+    if (metricById.size === 0) {
+      return sortedBase;
     }
 
     // Annotate streams with measured TTFB, speed, and reachability
@@ -1662,7 +1828,7 @@ export async function rankStreamsByResponsiveness(
     });
 
     // Identify the best healthy server among the benchmarked candidates
-    // Combine responsivenessScore with a slight quality tie-breaker so high-res fast servers win
+    // Combine responsivenessScore with quality + multi-audio + Layer 3 Native/Fast-Start container bonus
     let bestStreamId: string | null = null;
     let bestCompositeScore = -Infinity;
 
@@ -1671,7 +1837,12 @@ export async function rankStreamsByResponsiveness(
       if (!m || !m.ok || m.unreachable || !m.isHttps) continue;
       const qualityBonus = Math.min(180, ((s.qualityScore ?? 720) / 2160) * 180);
       const audioBonus = (s.audioScore ?? 0) * 35;
-      const composite = m.responsivenessScore + qualityBonus + audioBonus;
+      const combinedMeta = `${s.name} ${s.title} ${s.url || ''}`.toLowerCase();
+      // Layer 3: Reward fast-seek MP4/HLS containers and browser-native AAC/Opus audio codecs
+      const nativeContainerBonus =
+        s.isHls || /\b(mp4|m3u8|aac|opus|faststart)\b/i.test(combinedMeta) ? 45 : 0;
+      const composite =
+        m.responsivenessScore + qualityBonus + audioBonus + nativeContainerBonus;
       if (composite > bestCompositeScore) {
         bestCompositeScore = composite;
         bestStreamId = s.id;
@@ -1698,7 +1869,8 @@ export async function rankStreamsByResponsiveness(
     const healthyOrUntested = others.filter((s) => !s.unreachable);
     const demotedDead = others.filter((s) => s.unreachable);
 
-    // Pre-warm /api/media-probe for the winning #1 server in the background so audio tracks load in 0ms on Play!
+    // Layer 2 & 3: Immediately preconnect browser TLS to the winning CDN origin AND pre-warm /api/media-probe!
+    warmBrowserCdnConnection(topWinner.resolvedDirectUrl || topWinner.url);
     if (topWinner.url) {
       probeMediaStream(topWinner.url, authToken ?? undefined).catch(() => {});
     }
@@ -1713,6 +1885,7 @@ export async function rankStreamsByResponsiveness(
  * Progressively pings a batch of direct streams (up to 18 per request, 1 KB Range check)
  * via `/api/media-health-batch` (`pingOnly: true`) so every stream in the Quality dropdown
  * and Details page displays its live `ms` ping without re-sorting or interrupting playback.
+ * Reuses `clientServerHealthCache` (5-min TTL) so previously pinged streams resolve in 0ms!
  */
 export async function pingStreamBatch(
   candidates: StremioStreamItem[],
@@ -1724,6 +1897,21 @@ export async function pingStreamBatch(
     .slice(0, 18);
 
   if (validCandidates.length === 0) {
+    return resultMap;
+  }
+
+  const now = Date.now();
+  const uncachedCandidates: StremioStreamItem[] = [];
+  for (const c of validCandidates) {
+    const cached = c.url ? clientServerHealthCache.get(c.url) : undefined;
+    if (cached && cached.expiresAt > now) {
+      resultMap.set(c.id, { ...cached.metric, id: c.id });
+    } else {
+      uncachedCandidates.push(c);
+    }
+  }
+
+  if (uncachedCandidates.length === 0) {
     return resultMap;
   }
 
@@ -1739,7 +1927,7 @@ export async function pingStreamBatch(
       },
       body: JSON.stringify({
         pingOnly: true,
-        candidates: validCandidates.map((c) => ({
+        candidates: uncachedCandidates.map((c) => ({
           id: c.id,
           url: c.url,
           sizeBytes: c.sizeBytes ?? 0,
@@ -1756,6 +1944,13 @@ export async function pingStreamBatch(
     for (const m of metrics) {
       if (m && typeof m.id === 'string') {
         resultMap.set(m.id, m);
+        const matchedCandidate = uncachedCandidates.find((c) => c.id === m.id);
+        if (matchedCandidate?.url) {
+          clientServerHealthCache.set(matchedCandidate.url, {
+            metric: m,
+            expiresAt: Date.now() + 5 * 60 * 1000,
+          });
+        }
       }
     }
     return resultMap;

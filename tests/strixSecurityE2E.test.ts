@@ -1040,5 +1040,21 @@ describe('Strix-Style E2E & Security Audit Suite', () => {
     const pingBatchBody = await pingBatchResp.json();
     expect(pingBatchBody.results).toHaveLength(12);
     expect(pingBatchBody.results[0].statusBadge).toBeDefined();
+
+    // Edge Case 6: 4-Layer Instant-Play Pipeline (Hover Prefetch, Browser Preconnect, Sync Probe Fast-Path & Client Ping Cache)
+    const {
+      applyCachedServerHealth,
+      getCachedMediaProbe,
+      prefetchStreamsForMedia,
+      warmBrowserCdnConnection,
+    } = await import('../src/addons/stremioProtocol');
+    expect(typeof prefetchStreamsForMedia).toBe('function');
+    expect(typeof warmBrowserCdnConnection).toBe('function');
+    expect(typeof getCachedMediaProbe).toBe('function');
+    expect(typeof applyCachedServerHealth).toBe('function');
+    expect(getCachedMediaProbe('')).toBeNull();
+    // Safe no-op in non-DOM/invalid-URL environments
+    expect(() => warmBrowserCdnConnection('https://cdn.example.com/movie.mp4')).not.toThrow();
+    expect(() => warmBrowserCdnConnection('not-a-valid-url')).not.toThrow();
   });
 });

@@ -33,6 +33,7 @@ import {
 } from 'lucide-react';
 import {
   addonSupportsResource,
+  applyCachedServerHealth,
   buildApiUrl,
   buildStreamingCatalogsManifestUrl,
   CommunityAddonDirectoryEntry,
@@ -45,6 +46,7 @@ import {
   InstalledAddon,
   parseStreamingCatalogsConfig,
   pingStreamBatch,
+  prefetchStreamsForMedia,
   rankStreamsByResponsiveness,
   sortStreamsByDecreasingQuality,
   STREAMING_CATALOG_COUNTRIES,
@@ -124,6 +126,8 @@ interface PosterCardProps {
   onToggleLibrary: (item: StremioMediaItem) => void;
 }
 
+let latestAddonsForHoverPrefetch: InstalledAddon[] = [];
+
 const PosterCard: React.FC<PosterCardProps> = React.memo(({
   item,
   rankIndex,
@@ -133,9 +137,42 @@ const PosterCard: React.FC<PosterCardProps> = React.memo(({
   onToggleLibrary,
 }) => {
   const [imgFailed, setImgFailed] = useState(false);
+  const hoverTimerRef = useRef<number | null>(null);
+
+  const handleMouseEnter = () => {
+    if (hoverTimerRef.current !== null) {
+      window.clearTimeout(hoverTimerRef.current);
+    }
+    hoverTimerRef.current = window.setTimeout(() => {
+      hoverTimerRef.current = null;
+      if (latestAddonsForHoverPrefetch.length > 0) {
+        prefetchStreamsForMedia(latestAddonsForHoverPrefetch, item);
+      }
+    }, 260);
+  };
+
+  const handleMouseLeave = () => {
+    if (hoverTimerRef.current !== null) {
+      window.clearTimeout(hoverTimerRef.current);
+      hoverTimerRef.current = null;
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      if (hoverTimerRef.current !== null) {
+        window.clearTimeout(hoverTimerRef.current);
+      }
+    };
+  }, []);
 
   return (
-    <article className="poster-card" onClick={() => onOpenDossier(item)}>
+    <article
+      className="poster-card"
+      onClick={() => onOpenDossier(item)}
+      onMouseEnter={handleMouseEnter}
+      onMouseLeave={handleMouseLeave}
+    >
       <div className="poster-image-wrap">
         {item.poster && !imgFailed ? (
           <img
@@ -1374,7 +1411,9 @@ export const App: React.FC = () => {
         targetVideoId,
         finalItem,
       );
-      const initialSorted = sortStreamsByDecreasingQuality(streams);
+      const initialSorted = applyCachedServerHealth(
+        sortStreamsByDecreasingQuality(streams),
+      );
       setDossierStreams(initialSorted);
       setDossierLoadingStreams(false);
 
@@ -1832,6 +1871,20 @@ export const App: React.FC = () => {
     if (heroMovingCards.length === 0) return null;
     return heroMovingCards[activeHeroIndex] ?? heroMovingCards[0];
   }, [activeHeroIndex, heroMovingCards]);
+
+  // Keep module-level hover prefetch reference synced with user's installed addons
+  useEffect(() => {
+    latestAddonsForHoverPrefetch = addons;
+  }, [addons]);
+
+  // Layer 1: Silently prefetch streams for the active Hero spotlight title after 900ms
+  useEffect(() => {
+    if (!activeHeroItem || addons.length === 0) return;
+    const t = window.setTimeout(() => {
+      prefetchStreamsForMedia(addons, activeHeroItem);
+    }, 900);
+    return () => window.clearTimeout(t);
+  }, [activeHeroItem, addons]);
 
   // Auto-glide the Top Moving Cards Deck every 5 seconds (resets cleanly after Next/Prev/Card clicks)
   useEffect(() => {
