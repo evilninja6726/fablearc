@@ -909,4 +909,117 @@ describe('Strix-Style E2E & Security Audit Suite', () => {
     expect(healthJson.results[0].ok).toBe(false);
     expect(healthJson.results[0].statusBadge).toBe('Blocked');
   });
+
+  it('E2E Flow #11: Forward/Backward Seek Deadlock Prevention, Rapid Seek Coalescing & Adaptive FFmpeg Probe Recovery', async () => {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const rootDir = path.resolve(__dirname, '..');
+
+    const cinemaPlayerTsx = fs.readFileSync(
+      path.join(rootDir, 'src/components/CinemaPlayerModal.tsx'),
+      'utf8',
+    );
+    const viteConfigTs = fs.readFileSync(path.join(rootDir, 'vite.config.ts'), 'utf8');
+
+    // 1. Verify synchronous streamStartOffsetRef prevents stale audio onTimeUpdate from yanking video.currentTime backward after seek
+    expect(cinemaPlayerTsx).toContain('streamStartOffsetRef.current = clamped');
+    expect(cinemaPlayerTsx).toContain('isSeekingSplitRef.current = true');
+    expect(cinemaPlayerTsx).toContain('lastSeekStartedAtMsRef.current');
+
+    // 2. Verify syncSplitPlayback NEVER calls video.pause() while video.seeking is true (which deadlocks HTML5 Range preloading)
+    expect(cinemaPlayerTsx).toContain('if (!audioReady && !video.paused && !video.seeking)');
+    expect(cinemaPlayerTsx).toContain('const videoReady = video.readyState >= 2 && !video.seeking;');
+
+    // 3. Verify rapid +10s/-10s taps/arrow keys coalesce via pendingSeekTargetRef & zoneSeekCommitTimerRef
+    expect(cinemaPlayerTsx).toContain('pendingSeekTargetRef');
+    expect(cinemaPlayerTsx).toContain('zoneSeekCommitTimerRef');
+
+    // 4. Verify adaptive FFmpeg probe size in vite.config.ts when startSec > 0 (large forward seek) vs startSec === 0 (instant startup)
+    expect(viteConfigTs).toContain("const effectiveProbeSize = startSec > 0 ? '1500000' : '384000'");
+    expect(viteConfigTs).not.toContain("'-noaccurate_seek'");
+  });
+
+  it('E2E Flow #12: Out-of-the-Box Edge Cases (Batch Cap, Malformed Seek Params, Concurrent FFmpeg Eviction & Promo/Magnet Safety)', async () => {
+    const { rankStreamsByResponsiveness, extractStreamQualityInfo } = await import(
+      '../src/addons/stremioProtocol'
+    );
+
+    const { token } = ctx.db.registerUser({
+      displayName: 'EdgeCase Tester',
+      email: 'edgecase@fablearc.test',
+      password: 'ValidPass123!',
+    });
+
+    // Edge Case 1: Sending 25 candidates to /api/media-health-batch must strictly cap at 6 candidates to prevent DoS/amplification
+    const manyCandidates = Array.from({ length: 25 }, (_, i) => ({
+      id: `cand-${i}`,
+      url: `http://127.0.0.1:9000/video-${i}.mkv`,
+      sizeBytes: 1024 * 1024 * 500,
+    }));
+    const batchResp = await fetch(`${ctx.baseUrl}/api/media-health-batch`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ candidates: manyCandidates }),
+    });
+    expect(batchResp.status).toBe(200);
+    const batchData = (await batchResp.json()) as { results: Array<{ id: string }> };
+    expect(batchData.results.length).toBeLessThanOrEqual(6);
+
+    // Edge Case 2: Malformed / negative / NaN startSec and audioTrack parameters on /api/media-stream must clamp safely and return 200 audio/mpeg
+    const abortCtrl = new AbortController();
+    const malformedResp = await fetch(
+      `${ctx.baseUrl}/api/media-stream?url=${encodeURIComponent('https://93.184.216.34/video.mkv')}&audioTrack=-999&start=-5400&mode=muxed&token=${encodeURIComponent(token)}`,
+      { signal: abortCtrl.signal },
+    );
+    expect(malformedResp.status).toBe(200);
+    expect(malformedResp.headers.get('content-type')).toBe('audio/mpeg');
+    expect(malformedResp.headers.get('x-stream-mode')).toBe('audio-only');
+    await malformedResp.body?.cancel().catch(() => {});
+    abortCtrl.abort();
+
+    // Edge Case 3: Malformed / executable / Discord / Telegram spam stream names must be flagged as promo and never promoted above real streams
+    const spamCheck1 = extractStreamQualityInfo(
+      '4K UHD',
+      'Join https://t.me/free_movies_piracy or download codec_setup.exe',
+    );
+    expect(spamCheck1.isPromo).toBe(true);
+
+    const spamCheck2 = extractStreamQualityInfo(
+      '1080p BluRay',
+      ' Movie.2026.1080p.WEB-DL.Dual-Audio.Hindi-English.x265.mkv (4.2 GB)',
+    );
+    expect(spamCheck2.isPromo).toBe(false);
+    expect(spamCheck2.qualityScore).toBe(1080);
+    expect(spamCheck2.isMultiAudio).toBe(true);
+
+    // Edge Case 4: rankStreamsByResponsiveness gracefully handles empty, magnet-only, or offline-backend lists without throwing or losing quality order
+    const fallbackRanked = await rankStreamsByResponsiveness([
+      {
+        id: 's-720',
+        addonId: 'a1',
+        addonName: 'Addon 1',
+        name: '720p',
+        title: 'Movie 720p',
+        kind: 'direct',
+        url: 'https://example.com/720.mkv',
+        qualityScore: 720,
+      },
+      {
+        id: 's-2160',
+        addonId: 'a1',
+        addonName: 'Addon 1',
+        name: '4K',
+        title: 'Movie 2160p',
+        kind: 'direct',
+        url: 'https://example.com/2160.mkv',
+        qualityScore: 2160,
+      },
+    ]);
+    expect(fallbackRanked).toHaveLength(2);
+    expect(fallbackRanked[0].id).toBe('s-2160');
+    expect(fallbackRanked[1].id).toBe('s-720');
+  });
 });

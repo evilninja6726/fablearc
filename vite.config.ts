@@ -1799,6 +1799,13 @@ export function registerStreamzApiMiddlewares(
         }
       }
 
+      // Adaptive Probe Size:
+      // - At startSec === 0, 384 KB probe is ultra-fast (~0.4s) since MKV/MP4 headers are at byte 0.
+      // - When seeking (startSec > 0), allocate 1.5 MB probe buffer so FFmpeg can read Matroska Cues / MP4 moov
+      //   and locate the exact target audio cluster at large forward offsets (e.g. +20m / +60m) without stalling!
+      const effectiveAnalyzeDuration = startSec > 0 ? '1400000' : '400000';
+      const effectiveProbeSize = startSec > 0 ? '1500000' : '384000';
+
       const args: string[] = [
         '-hide_banner',
         '-loglevel',
@@ -1810,9 +1817,9 @@ export function registerStreamzApiMiddlewares(
         '-fflags',
         '+nobuffer+flush_packets+genpts+igndts+discardcorrupt',
         '-analyzeduration',
-        '400000',
+        effectiveAnalyzeDuration,
         '-probesize',
-        '384000',
+        effectiveProbeSize,
         '-user_agent',
         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
         '-reconnect',
@@ -1824,7 +1831,7 @@ export function registerStreamzApiMiddlewares(
       ];
 
       if (startSec > 0) {
-        args.push('-noaccurate_seek', '-ss', String(startSec));
+        args.push('-ss', String(startSec));
       }
 
       // Strictly enforce Audio-Only (-vn) streaming MP3 output on the server:

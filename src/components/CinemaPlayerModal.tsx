@@ -290,6 +290,14 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
   const [streamStartOffsetSec, setStreamStartOffsetSec] = useState<number>(
     Math.max(0, Math.floor(initialPositionSec)),
   );
+  const streamStartOffsetRef = useRef<number>(
+    Math.max(0, Math.floor(initialPositionSec)),
+  );
+  streamStartOffsetRef.current = streamStartOffsetSec;
+  const isSeekingSplitRef = useRef<boolean>(false);
+  const lastSeekStartedAtMsRef = useRef<number>(0);
+  const zoneSeekCommitTimerRef = useRef<number | null>(null);
+  const pendingSeekTargetRef = useRef<number | null>(null);
   const [seekNonce, setSeekNonce] = useState<number>(0);
   const [probedDurationSec, setProbedDurationSec] = useState<number>(0);
 
@@ -697,16 +705,21 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     const audio = audioRef.current;
     if (!video || !audio) return;
 
-    const videoReady = video.readyState >= 2;
-    const audioReady = audio.readyState >= 2;
+    const videoReady = video.readyState >= 2 && !video.seeking;
+    const audioReady = audio.readyState >= 2 && !audio.seeking;
 
     if (videoReady && audioReady) {
-      const expectedVideoSec = streamStartOffsetSec + audio.currentTime;
+      isSeekingSplitRef.current = false;
+      const expectedVideoSec = streamStartOffsetRef.current + audio.currentTime;
+      const driftSec = Math.abs(video.currentTime - expectedVideoSec);
+      const msSinceLastSeek = Date.now() - lastSeekStartedAtMsRef.current;
+      // Avoid yanking video.currentTime during the initial 1.2s after a forward seek unless drift is huge (> 2.5s)
+      const driftThreshold = msSinceLastSeek < 1200 ? 2.5 : 0.45;
       if (
         !video.seeking &&
         Number.isFinite(expectedVideoSec) &&
         expectedVideoSec >= 0 &&
-        Math.abs(video.currentTime - expectedVideoSec) > 0.42
+        driftSec > driftThreshold
       ) {
         try {
           video.currentTime = expectedVideoSec;
@@ -745,14 +758,84 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       setHasFreezeFrame(false);
     } else {
       setIsBuffering(true);
+      // If video is not ready yet, pause audio so dialogue never plays ahead of a frozen frame
       if (!videoReady && !audio.paused) {
         audio.pause();
       }
-      if (!audioReady && !video.paused) {
+      // CRITICAL: Never call video.pause() while video.seeking is true!
+      // Pausing an HTML5 <video> element in the middle of an HTTP Range seek causes Chromium/WebKit
+      // to suspend byte-range preloading and deadlock at readyState 1. Only pause video if it has
+      // already finished seeking (video.seeking === false) and audio is still buffering.
+      if (!audioReady && !video.paused && !video.seeking) {
         video.pause();
       }
     }
-  }, [isMuted, isSplitAudioMode, streamStartOffsetSec, volume]);
+  }, [isMuted, isSplitAudioMode, volume]);
+
+  // Active Lockstep & Seek Stall Recovery Poll:
+  // 1. Every 250ms while buffering in split mode, re-checks syncSplitPlayback() so if an event was missed
+  //    while the other element was seeking, playback resumes immediately with zero deadlock.
+  // 2. If <video> gets stuck on a mid-stream CDN byte-range socket for > 5.5s after a forward seek
+  //    (even though the server itself works when freshly opened), automatically re-opens a fresh
+  //    HTTP Range connection on <video> at the target timestamp (identical to re-selecting the stream in Quality)!
+  useEffect(() => {
+    if (!isSplitAudioMode || userPausedRef.current || !isBuffering) return;
+
+    const timer = window.setInterval(() => {
+      const video = videoRef.current;
+      const audio = audioRef.current;
+      if (!video || !audio || userPausedRef.current) return;
+
+      if (video.readyState >= 2 && !video.seeking && audio.readyState >= 2) {
+        syncSplitPlayback();
+        return;
+      }
+
+      const msSinceSeek = Date.now() - lastSeekStartedAtMsRef.current;
+      const effectiveCdnUrl = resolvedDirectUrl || activeStream?.url;
+      if (
+        isSeekingSplitRef.current &&
+        msSinceSeek > 5500 &&
+        effectiveCdnUrl &&
+        (video.seeking || video.readyState < 2)
+      ) {
+        // Reset lastSeekStartedAtMsRef so we only auto-reconnect once per 6s window
+        lastSeekStartedAtMsRef.current = Date.now();
+        const targetSec = Math.max(0, Math.floor(currentTimeRef.current));
+        streamStartOffsetRef.current = targetSec;
+        try {
+          video.src = effectiveCdnUrl;
+          video.muted = true;
+          video.playbackRate = playbackSpeed;
+          video.load();
+          video.addEventListener(
+            'loadedmetadata',
+            () => {
+              try {
+                video.currentTime = targetSec;
+              } catch {
+                // ignore
+              }
+              video.play().catch(() => {});
+              syncSplitPlayback();
+            },
+            { once: true },
+          );
+        } catch {
+          // ignore
+        }
+      }
+    }, 250);
+
+    return () => window.clearInterval(timer);
+  }, [
+    activeStream?.url,
+    isBuffering,
+    isSplitAudioMode,
+    playbackSpeed,
+    resolvedDirectUrl,
+    syncSplitPlayback,
+  ]);
 
   // Probe embedded multi-language audio tracks and container duration whenever activeStream changes
   useEffect(() => {
@@ -1019,12 +1102,16 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
           { once: true },
         );
       } else {
-        if (Math.abs(video.currentTime - streamStartOffsetSec) > 1.5) {
+        if (Math.abs(video.currentTime - streamStartOffsetSec) > 1.2) {
           try {
             video.currentTime = streamStartOffsetSec;
           } catch {
             // Ignore
           }
+        }
+        if (video.paused && !userPausedRef.current) {
+          video.muted = true;
+          video.play().catch(() => {});
         }
       }
 
@@ -1154,17 +1241,25 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       const video = videoRef.current;
       const audio = audioRef.current;
       if (!video || activeStream?.kind !== 'direct') return;
+      if (zoneSeekCommitTimerRef.current) {
+        window.clearTimeout(zoneSeekCommitTimerRef.current);
+        zoneSeekCommitTimerRef.current = null;
+      }
+      pendingSeekTargetRef.current = null;
       captureVideoFrameSnapshot();
       userPausedRef.current = false;
       const maxDur = effectiveDurationSec > 0 ? effectiveDurationSec : 14400;
       const clamped = Math.max(0, Math.min(maxDur, Math.floor(nextSec)));
+      currentTimeRef.current = clamped;
       setCurrentTimeSec(clamped);
       setScrubPreviewSec(null);
+      setFailoverCountdownSec(30);
 
       if (isSplitAudioMode) {
         setIsBuffering(true);
-        video.currentTime = clamped;
-        const targetRelativeSec = clamped - streamStartOffsetSec;
+        isSeekingSplitRef.current = true;
+        lastSeekStartedAtMsRef.current = Date.now();
+        const targetRelativeSec = clamped - streamStartOffsetRef.current;
         let isAudioBuffered = false;
         if (audio && targetRelativeSec >= 0 && audio.buffered && audio.buffered.length > 0) {
           for (let i = 0; i < audio.buffered.length; i++) {
@@ -1177,18 +1272,35 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
           }
         }
         if (audio && isAudioBuffered) {
-          audio.currentTime = targetRelativeSec;
+          try {
+            video.currentTime = clamped;
+            audio.currentTime = targetRelativeSec;
+          } catch {
+            // ignore
+          }
           syncSplitPlayback();
         } else {
-          if (!video.paused) {
-            video.pause();
+          // Immediately update streamStartOffsetRef synchronously & pause old <audio> BEFORE mutating video.currentTime
+          // so a stale onTimeUpdate from the previous <audio> stream can never yank video.currentTime backward!
+          streamStartOffsetRef.current = clamped;
+          if (audio && !audio.paused) {
+            audio.pause();
+          }
+          try {
+            video.currentTime = clamped;
+          } catch {
+            // ignore
           }
           setStreamStartOffsetSec(clamped);
           setSeekNonce((prev) => prev + 1);
         }
       } else {
         setIsBuffering(true);
-        video.currentTime = clamped;
+        try {
+          video.currentTime = clamped;
+        } catch {
+          // ignore
+        }
       }
     },
     [
@@ -1196,7 +1308,6 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       captureVideoFrameSnapshot,
       effectiveDurationSec,
       isSplitAudioMode,
-      streamStartOffsetSec,
       syncSplitPlayback,
     ],
   );
@@ -1279,8 +1390,32 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
   const triggerZoneSeek = useCallback(
     (side: 'left' | 'right') => {
       const stepSec = side === 'left' ? -10 : 10;
-      const targetSec = Math.max(0, currentTimeRef.current + stepSec);
-      seekTo(targetSec);
+      if (pendingSeekTargetRef.current === null) {
+        captureVideoFrameSnapshot();
+      }
+      const baseSec =
+        pendingSeekTargetRef.current !== null
+          ? pendingSeekTargetRef.current
+          : currentTimeRef.current;
+      const maxDur = effectiveDurationSec > 0 ? effectiveDurationSec : 14400;
+      const targetSec = Math.max(0, Math.min(maxDur, Math.floor(baseSec + stepSec)));
+      pendingSeekTargetRef.current = targetSec;
+      currentTimeRef.current = targetSec;
+      setCurrentTimeSec(targetSec);
+      setScrubPreviewSec(targetSec);
+
+      if (zoneSeekCommitTimerRef.current) {
+        window.clearTimeout(zoneSeekCommitTimerRef.current);
+      }
+      zoneSeekCommitTimerRef.current = window.setTimeout(() => {
+        zoneSeekCommitTimerRef.current = null;
+        const commitSec = pendingSeekTargetRef.current;
+        pendingSeekTargetRef.current = null;
+        if (commitSec !== null) {
+          seekTo(commitSec);
+        }
+      }, 220);
+
       setSeekRipple((prev) => {
         const nextDelta =
           prev && prev.side === side ? prev.deltaSec + stepSec : stepSec;
@@ -1297,7 +1432,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         setSeekRipple(null);
       }, 850);
     },
-    [seekTo],
+    [captureVideoFrameSnapshot, effectiveDurationSec, seekTo],
   );
 
   const [isScreenLocked, setIsScreenLocked] = useState(false);
@@ -1585,6 +1720,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       if (seekRippleTimerRef.current) window.clearTimeout(seekRippleTimerRef.current);
       if (singleTapTimerRef.current) window.clearTimeout(singleTapTimerRef.current);
       if (hold2xTimerRef.current) window.clearTimeout(hold2xTimerRef.current);
+      if (zoneSeekCommitTimerRef.current) window.clearTimeout(zoneSeekCommitTimerRef.current);
     };
   }, []);
 
