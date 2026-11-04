@@ -2729,9 +2729,8 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
               className="pause-synopsis"
               style={{ fontSize: '0.82rem', opacity: 0.78, marginTop: 4, maxWidth: 640 }}
             >
-              BitTorrent P2P stream ({activeStream.addonName}). Web browsers block raw UDP/DHT peer
-              sockets directly — switch to a direct HTTPS server below for instant in-browser playback,
-              or open this P2P swarm in Stremio / VLC / WebTor:
+              BitTorrent P2P stream ({activeStream.addonName}). Needs a P2P-to-HTTPS bridge or Debrid
+              resolver to play directly in the browser player.
             </p>
 
             <div className="hero-cta-row" style={{ marginTop: 14, flexWrap: 'wrap', gap: 10 }}>
@@ -2752,43 +2751,6 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                   <span>Play Fastest Direct Server</span>
                 </button>
               )}
-
-              <a
-                href={activeStream.url}
-                className={
-                  streams.some((s) => s.kind === 'direct' && !s.unreachable)
-                    ? 'secondary-outline-btn'
-                    : 'primary-amber-btn'
-                }
-                style={{ textDecoration: 'none' }}
-              >
-                <ExternalLink size={16} />
-                <span>Open in Stremio / Torrent App</span>
-              </a>
-
-              <a
-                href={`https://webtor.io/#/${encodeURIComponent(activeStream.infoHash || '')}`}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="secondary-outline-btn"
-                style={{ textDecoration: 'none' }}
-              >
-                <ExternalLink size={16} />
-                <span>Stream on WebTor (New Tab)</span>
-              </a>
-
-              <button
-                type="button"
-                className="secondary-outline-btn"
-                onClick={() => {
-                  navigator.clipboard?.writeText(activeStream.url!);
-                  setCopiedMagnet(true);
-                  window.setTimeout(() => setCopiedMagnet(false), 2000);
-                }}
-              >
-                {copiedMagnet ? <Check size={16} /> : <Copy size={16} />}
-                <span>{copiedMagnet ? 'Copied Magnet!' : 'Copy Magnet'}</span>
-              </button>
 
               <button
                 type="button"
