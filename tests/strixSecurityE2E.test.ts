@@ -822,12 +822,13 @@ describe('Strix-Style E2E & Security Audit Suite', () => {
 
     const controller = new AbortController();
     const streamResp = await fetch(
-      `${ctx.baseUrl}/api/media-stream?url=${encodeURIComponent('https://example.com/nonexistent-video.mkv')}&audioTrack=0&start=0&mode=muxed&token=${encodeURIComponent(token)}`,
+      `${ctx.baseUrl}/api/media-stream?url=${encodeURIComponent('https://93.184.216.34/nonexistent-video.mkv')}&audioTrack=0&start=0&mode=muxed&token=${encodeURIComponent(token)}`,
       { signal: controller.signal },
     );
     expect(streamResp.status).toBe(200);
     expect(streamResp.headers.get('content-type')).toBe('audio/mpeg');
     expect(streamResp.headers.get('x-stream-mode')).toBe('audio-only');
+    await streamResp.body?.cancel().catch(() => {});
     controller.abort();
   });
 
@@ -842,13 +843,14 @@ describe('Strix-Style E2E & Security Audit Suite', () => {
       'utf8',
     );
 
-    // 1. Verify PosterCard opens Details Page (onOpenDossier) rather than bypassing details
+    // 1. Verify PosterCard opens Details Page (onOpenDossier) rather than bypassing details, and Watch Trailer button is removed
     expect(appTsx).toContain('Details &amp; Play');
     expect(appTsx).toContain('details-page-container');
     expect(appTsx).toContain('details-imdb-badge');
     expect(appTsx).toContain('details-play-main-btn');
     expect(appTsx).toContain('similarDossierItems');
     expect(appTsx).toContain('details-similar-grid');
+    expect(appTsx).not.toContain('Watch Trailer');
 
     // 2. Verify Double-Click / Double-Tap ±10s zone seek in CinemaPlayerModal
     expect(cinemaPlayerTsx).toContain('triggerZoneSeek');
@@ -859,5 +861,19 @@ describe('Strix-Style E2E & Security Audit Suite', () => {
     expect(cinemaPlayerTsx).toContain('applyVolumeLevel');
     expect(cinemaPlayerTsx).toContain('gesture-hud-pill');
     expect(cinemaPlayerTsx).toContain('brightness-slider');
+
+    // 4. Verify all Part 4 features (Auto-Play Next Episode, Mini/PiP Player, Hold-to-2x Speed, Screen Lock, Ambilight + Audio Boost, Watchlist Collections + 1-5★ Rating, Surprise Me Roulette, Screenshot & Scene Bookmarks)
+    expect(cinemaPlayerTsx).toContain('advanceToNextEpisode');
+    expect(cinemaPlayerTsx).toContain('next-episode-card-overlay');
+    expect(cinemaPlayerTsx).toContain('mini-floating-player');
+    expect(cinemaPlayerTsx).toContain('startHold2xSpeed');
+    expect(cinemaPlayerTsx).toContain('hold-2x-pill');
+    expect(cinemaPlayerTsx).toContain('screen-locked-pill');
+    expect(cinemaPlayerTsx).toContain('ambilight-stage-glow');
+    expect(cinemaPlayerTsx).toContain('cycleAudioBoost');
+    expect(cinemaPlayerTsx).toContain('captureScreenshotFrame');
+    expect(cinemaPlayerTsx).toContain('sceneBookmarks');
+    expect(appTsx).toContain('watchlist-collection-tabs');
+    expect(appTsx).toContain('handleSurpriseMePick');
   });
 });

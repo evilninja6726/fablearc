@@ -6172,5 +6172,288 @@ select {
   }
 }
 
+/* =========================================================
+   PART 4 FEATURES: AMBILIGHT, HOLD-2X, SCREEN LOCK, MINI PLAYER,
+   NEXT EPISODE BINGE CARD, WATCHLIST COLLECTIONS & SURPRISE ME
+   ========================================================= */
+.player-top-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.player-icon-btn.active-utility-btn {
+  color: #fbbf24;
+  border-color: rgba(251, 191, 36, 0.45);
+  background: rgba(251, 191, 36, 0.14);
+}
+
+.ambilight-stage-glow {
+  position: absolute;
+  inset: -6%;
+  pointer-events: none;
+  z-index: 1;
+  filter: blur(48px);
+  transition: background 900ms ease;
+}
+
+.player-video-element {
+  position: relative;
+  z-index: 2;
+}
+
+@keyframes shutterFlashAnim {
+  0% {
+    opacity: 0.85;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+.shutter-flash-overlay {
+  position: absolute;
+  inset: 0;
+  background: #ffffff;
+  z-index: 45;
+  pointer-events: none;
+  animation: shutterFlashAnim 260ms ease-out forwards;
+}
+
+.hold-2x-pill {
+  position: absolute;
+  top: 78px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 35;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 16px;
+  border-radius: 999px;
+  background: rgba(10, 12, 20, 0.9);
+  border: 1px solid rgba(251, 191, 36, 0.65);
+  color: #fbbf24;
+  font-size: 13px;
+  font-weight: 700;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.65);
+  pointer-events: none;
+}
+
+.screen-locked-pill {
+  position: absolute;
+  bottom: 42px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 50;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 11px 20px;
+  border-radius: 999px;
+  background: rgba(10, 12, 20, 0.92);
+  border: 1.5px solid rgba(255, 255, 255, 0.32);
+  color: #ffffff;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 14px 38px rgba(0, 0, 0, 0.78);
+}
+
+/* Floating Corner Mini Player Mode */
+.player-modal-backdrop.mini-floating-player {
+  inset: auto 22px 22px auto;
+  width: 360px;
+  height: 204px;
+  border-radius: 14px;
+  border: 1.5px solid rgba(255, 255, 255, 0.26);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.88);
+  z-index: 95;
+}
+
+.mini-player-controls-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 32;
+  background: linear-gradient(
+    180deg,
+    rgba(6, 8, 14, 0.78) 0%,
+    transparent 40%,
+    rgba(6, 8, 14, 0.82) 100%
+  );
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  opacity: 0;
+  transition: opacity 180ms ease;
+}
+
+.player-modal-backdrop.mini-floating-player:hover .mini-player-controls-overlay {
+  opacity: 1;
+}
+
+.mini-player-title-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  color: #ffffff;
+}
+
+.mini-player-title-bar strong {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mini-player-bottom-btns {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+}
+
+/* Auto-Play Next Episode Countdown Card */
+.next-episode-card-overlay {
+  position: absolute;
+  right: 32px;
+  bottom: 106px;
+  z-index: 30;
+  width: min(360px, calc(100vw - 32px));
+  padding: 16px 18px;
+  border-radius: 14px;
+  background: rgba(10, 12, 20, 0.94);
+  border: 1px solid rgba(251, 191, 36, 0.5);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.82);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.next-episode-card-head {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.next-episode-card-title {
+  font-size: 14px;
+  color: #ffffff;
+  line-height: 1.35;
+}
+
+.next-episode-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Watchlist Collections & Personal 1-5★ Rating Controls */
+.watchlist-collection-tabs {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.watchlist-card-wrapper {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.watchlist-item-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 6px 8px;
+  border-radius: 9px;
+  background: var(--surface-card);
+  border: 1px solid var(--border-subtle);
+}
+
+.watchlist-status-select {
+  background: transparent;
+  border: none;
+  color: var(--text-bright);
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  outline: none;
+  min-width: 0;
+}
+
+.watchlist-status-select option {
+  background: #0d1018;
+  color: #ffffff;
+}
+
+.watchlist-star-picker,
+.details-star-rating-box {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.star-rate-btn {
+  border: none;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.24);
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px;
+  cursor: pointer;
+  transition: color 130ms ease, transform 130ms ease;
+}
+
+.star-rate-btn:hover,
+.star-rate-btn.filled {
+  color: #f5c518;
+  transform: scale(1.1);
+}
+
+.details-personal-rating-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-top: 6px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: rgba(12, 15, 24, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  width: fit-content;
+  max-width: 100%;
+}
+
+.details-collection-pills {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.surprise-roulette-btn {
+  border-color: rgba(251, 191, 36, 0.35);
+}
+
+@media (max-width: 768px) {
+  .player-modal-backdrop.mini-floating-player {
+    width: 256px;
+    height: 146px;
+    inset: auto 12px 12px auto;
+  }
+
+  .mini-player-controls-overlay {
+    opacity: 1;
+  }
+}
+
+
 
 

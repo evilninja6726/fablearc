@@ -1,6 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Hls from 'hls.js';
 import {
+  Bookmark,
+  Camera,
   Captions,
   Check,
   ChevronUp,
@@ -11,18 +13,24 @@ import {
   Gauge,
   Headphones,
   Layers,
+  Lock,
   Maximize2,
   Minimize2,
   Pause,
+  PictureInPicture2,
   Play,
   RefreshCw,
   Rewind,
+  SkipForward,
   Sparkles,
   Sun,
+  Trash2,
   Tv,
+  Unlock,
   Volume2,
   VolumeX,
   X,
+  Zap,
 } from 'lucide-react';
 import {
   buildTranscodedStreamUrl,
@@ -75,6 +83,13 @@ interface CinemaPlayerModalProps {
   onProgressUpdate: (entry: WatchProgressEntry, flushToDb?: boolean) => void;
 }
 
+export interface SceneBookmarkItem {
+  id: string;
+  timeSec: number;
+  label: string;
+  createdAtIso: string;
+}
+
 type BottomPopoverType =
   | null
   | 'quality'
@@ -82,7 +97,8 @@ type BottomPopoverType =
   | 'subtitles'
   | 'speed'
   | 'crop'
-  | 'episodes';
+  | 'episodes'
+  | 'bookmarks';
 
 type AspectCropMode =
   | 'contain'
@@ -1250,11 +1266,291 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     [seekTo],
   );
 
+  const [isScreenLocked, setIsScreenLocked] = useState(false);
+  const [isMiniPlayer, setIsMiniPlayer] = useState(false);
+  const [isPiPActive, setIsPiPActive] = useState(false);
+  const [isHold2xActive, setIsHold2xActive] = useState(false);
+  const hold2xTimerRef = useRef<number | null>(null);
+  const preHoldSpeedRef = useRef<number>(1);
+  const [ambilightEnabled, setAmbilightEnabled] = useState(true);
+  const [ambilightColor, setAmbilightColor] = useState<string>('56, 189, 248');
+  const [audioBoostPct, setAudioBoostPct] = useState<100 | 150 | 200>(100);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const gainNodeRef = useRef<GainNode | null>(null);
+  const connectedMediaElRef = useRef<HTMLMediaElement | null>(null);
+  const [shutterFlashActive, setShutterFlashActive] = useState(false);
+  const [bookmarkNoteInput, setBookmarkNoteInput] = useState('');
+  const [sceneBookmarks, setSceneBookmarks] = useState<SceneBookmarkItem[]>(() => {
+    try {
+      const raw = localStorage.getItem(`fablearc_scene_bookmarks_v1_${media.id}`);
+      return raw ? (JSON.parse(raw) as SceneBookmarkItem[]) : [];
+    } catch {
+      return [];
+    }
+  });
+  const [nextEpisodeDismissed, setNextEpisodeDismissed] = useState(false);
+
+  // Sync Scene Bookmarks when media.id changes
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(`fablearc_scene_bookmarks_v1_${media.id}`);
+      setSceneBookmarks(raw ? (JSON.parse(raw) as SceneBookmarkItem[]) : []);
+    } catch {
+      setSceneBookmarks([]);
+    }
+  }, [media.id]);
+
+  const persistSceneBookmarks = useCallback(
+    (nextList: SceneBookmarkItem[]) => {
+      setSceneBookmarks(nextList);
+      try {
+        localStorage.setItem(
+          `fablearc_scene_bookmarks_v1_${media.id}`,
+          JSON.stringify(nextList),
+        );
+      } catch {}
+    },
+    [media.id],
+  );
+
+  const addSceneBookmark = useCallback(
+    (customLabel?: string) => {
+      const tSec = Math.max(0, Math.floor(currentTimeRef.current));
+      const cleanLabel =
+        (customLabel ?? bookmarkNoteInput).trim() ||
+        (selectedEpisode
+          ? `S${selectedEpisode.season}:E${selectedEpisode.episode} @ ${formatTimecode(tSec)}`
+          : `Scene @ ${formatTimecode(tSec)}`);
+      const newEntry: SceneBookmarkItem = {
+        id: `${Date.now()}-${tSec}`,
+        timeSec: tSec,
+        label: cleanLabel,
+        createdAtIso: new Date().toISOString(),
+      };
+      const updated = [...sceneBookmarks, newEntry].sort((a, b) => a.timeSec - b.timeSec);
+      persistSceneBookmarks(updated);
+      setBookmarkNoteInput('');
+      setFailoverToast(`Saved bookmark "${cleanLabel}" (${formatTimecode(tSec)})`);
+    },
+    [bookmarkNoteInput, persistSceneBookmarks, sceneBookmarks, selectedEpisode],
+  );
+
+  const removeSceneBookmark = useCallback(
+    (id: string) => {
+      persistSceneBookmarks(sceneBookmarks.filter((b) => b.id !== id));
+    },
+    [persistSceneBookmarks, sceneBookmarks],
+  );
+
+  // Video Frame Screenshot Capture (Downloads PNG)
+  const captureScreenshotFrame = useCallback(() => {
+    const video = videoRef.current;
+    if (!video || video.videoWidth <= 0 || video.videoHeight <= 0) {
+      setFailoverToast('Wait for video frame to load before capturing screenshot.');
+      return;
+    }
+    setShutterFlashActive(true);
+    window.setTimeout(() => setShutterFlashActive(false), 260);
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const dataUrl = canvas.toDataURL('image/png');
+      const link = document.createElement('a');
+      const safeTitle = media.name.replace(/[^a-z0-9_-]+/gi, '_');
+      const timeStr = formatTimecode(currentTimeRef.current).replace(/:/g, '-');
+      link.download = `${safeTitle}_${timeStr}.png`;
+      link.href = dataUrl;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      setFailoverToast(`Screenshot saved (${formatTimecode(currentTimeRef.current)})`);
+    } catch {
+      // If cross-origin video frame prevents canvas export, bookmark the exact timestamp automatically
+      addSceneBookmark(`Captured Moment @ ${formatTimecode(currentTimeRef.current)}`);
+      setFailoverToast(
+        `Bookmarked frame at ${formatTimecode(currentTimeRef.current)} (Cross-Origin stream protected)`,
+      );
+    }
+  }, [addSceneBookmark, media.name]);
+
+  // Picture-in-Picture (PiP) Toggle
+  const togglePiP = useCallback(async () => {
+    const video = videoRef.current;
+    if (!video) return;
+    try {
+      if (document.pictureInPictureElement) {
+        await document.exitPictureInPicture();
+        setIsPiPActive(false);
+      } else if (typeof video.requestPictureInPicture === 'function') {
+        await video.requestPictureInPicture();
+        setIsPiPActive(true);
+      } else {
+        setIsMiniPlayer((prev) => !prev);
+      }
+    } catch {
+      // Fallback to in-app floating Mini Player
+      setIsMiniPlayer((prev) => !prev);
+    }
+  }, []);
+
+  // Hold-to-2x Speed helpers
+  const startHold2xSpeed = useCallback(() => {
+    if (isScreenLocked || activeStream?.kind !== 'direct') return;
+    preHoldSpeedRef.current = playbackSpeed;
+    setIsHold2xActive(true);
+    if (videoRef.current) videoRef.current.playbackRate = 2;
+    if (audioRef.current) audioRef.current.playbackRate = 2;
+  }, [activeStream?.kind, isScreenLocked, playbackSpeed]);
+
+  const stopHold2xSpeed = useCallback(() => {
+    if (hold2xTimerRef.current) {
+      window.clearTimeout(hold2xTimerRef.current);
+      hold2xTimerRef.current = null;
+    }
+    setIsHold2xActive((wasActive) => {
+      if (wasActive) {
+        const restoreRate = preHoldSpeedRef.current || 1;
+        if (videoRef.current) videoRef.current.playbackRate = restoreRate;
+        if (audioRef.current) audioRef.current.playbackRate = restoreRate;
+      }
+      return false;
+    });
+  }, []);
+
+  // Night Mode / Dialogue Audio Boost (100% -> 150% -> 200%) via Web Audio API Compressor + Gain
+  const cycleAudioBoost = useCallback(() => {
+    setAudioBoostPct((prev) => {
+      const next: 100 | 150 | 200 = prev === 100 ? 150 : prev === 150 ? 200 : 100;
+      const targetEl = isSplitAudioMode ? audioRef.current : videoRef.current;
+      try {
+        const AudioCtx =
+          window.AudioContext ||
+          (window as unknown as { webkitAudioContext?: typeof AudioContext })
+            .webkitAudioContext;
+        if (AudioCtx && targetEl && connectedMediaElRef.current !== targetEl) {
+          const ctx = audioCtxRef.current ?? new AudioCtx();
+          audioCtxRef.current = ctx;
+          const source = ctx.createMediaElementSource(targetEl);
+          const compressor = ctx.createDynamicsCompressor();
+          compressor.threshold.value = -28;
+          compressor.knee.value = 24;
+          compressor.ratio.value = 6;
+          compressor.attack.value = 0.005;
+          compressor.release.value = 0.2;
+          const gain = ctx.createGain();
+          gainNodeRef.current = gain;
+          source.connect(compressor);
+          compressor.connect(gain);
+          gain.connect(ctx.destination);
+          connectedMediaElRef.current = targetEl;
+        }
+        if (gainNodeRef.current) {
+          gainNodeRef.current.gain.value = next / 100;
+        }
+        if (audioCtxRef.current && audioCtxRef.current.state === 'suspended') {
+          audioCtxRef.current.resume().catch(() => {});
+        }
+      } catch {
+        // Safe fallback if browser blocks MediaElementSource on cross-origin stream
+      }
+      setFailoverToast(
+        next === 100
+          ? 'Audio Boost: 100% (Standard)'
+          : `Night Dialogue Audio Boost: ${next}%`,
+      );
+      return next;
+    });
+  }, [isSplitAudioMode]);
+
+  // Dynamic Cinema Ambilight color sampler
+  useEffect(() => {
+    if (!ambilightEnabled || !isPlaying) return;
+    const sampleColor = () => {
+      const video = videoRef.current;
+      if (!video || video.videoWidth <= 0 || video.videoHeight <= 0) return;
+      try {
+        const c = document.createElement('canvas');
+        c.width = 16;
+        c.height = 16;
+        const ctx = c.getContext('2d');
+        if (!ctx) return;
+        ctx.drawImage(video, 0, 0, 16, 16);
+        const data = ctx.getImageData(0, 0, 16, 16).data;
+        let r = 0;
+        let g = 0;
+        let b = 0;
+        let count = 0;
+        for (let i = 0; i < data.length; i += 16) {
+          r += data[i];
+          g += data[i + 1];
+          b += data[i + 2];
+          count++;
+        }
+        if (count > 0) {
+          setAmbilightColor(
+            `${Math.min(255, Math.round(r / count) + 25)}, ${Math.min(255, Math.round(g / count) + 25)}, ${Math.min(255, Math.round(b / count) + 25)}`,
+          );
+        }
+      } catch {
+        // Cross-origin video fallback keeps dynamic cinema aura
+      }
+    };
+    const id = window.setInterval(sampleColor, 1800);
+    return () => window.clearInterval(id);
+  }, [ambilightEnabled, isPlaying]);
+
+  // Compute Next Episode for Binge Auto-Play in TV Series
+  const nextEpisode = useMemo<StremioEpisodeVideo | null>(() => {
+    if (media.type !== 'series' || !selectedEpisode || media.videos.length <= 1) {
+      return null;
+    }
+    const sorted = [...media.videos].sort((a, b) =>
+      a.season !== b.season ? a.season - b.season : a.episode - b.episode,
+    );
+    const idx = sorted.findIndex((ep) => ep.id === selectedEpisode.id);
+    if (idx !== -1 && idx + 1 < sorted.length) {
+      return sorted[idx + 1] ?? null;
+    }
+    return null;
+  }, [media.type, media.videos, selectedEpisode]);
+
+  useEffect(() => {
+    setNextEpisodeDismissed(false);
+  }, [selectedEpisode?.id]);
+
+  const advanceToNextEpisode = useCallback(() => {
+    if (!nextEpisode) return;
+    setSelectedEpisode(nextEpisode);
+    setEpisodeSeasonFilter(nextEpisode.season);
+    setStreamStartOffsetSec(0);
+    setCurrentTimeSec(0);
+    setNextEpisodeDismissed(false);
+    setFailoverToast(
+      `Playing Next Episode: S${nextEpisode.season}:E${nextEpisode.episode} — ${nextEpisode.name}`,
+    );
+  }, [nextEpisode]);
+
+  const remainingEpisodeSec =
+    effectiveDurationSec > 60 && currentTimeSec > 10
+      ? Math.max(0, Math.ceil(effectiveDurationSec - currentTimeSec))
+      : null;
+  const showNextEpisodeCard =
+    Boolean(nextEpisode) &&
+    !nextEpisodeDismissed &&
+    remainingEpisodeSec !== null &&
+    remainingEpisodeSec <= 15 &&
+    remainingEpisodeSec > 0;
+
   useEffect(() => {
     return () => {
       if (gestureHudTimerRef.current) window.clearTimeout(gestureHudTimerRef.current);
       if (seekRippleTimerRef.current) window.clearTimeout(seekRippleTimerRef.current);
       if (singleTapTimerRef.current) window.clearTimeout(singleTapTimerRef.current);
+      if (hold2xTimerRef.current) window.clearTimeout(hold2xTimerRef.current);
     };
   }, []);
 
@@ -1378,13 +1674,13 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
 
   return (
     <div
-      className={`player-modal-backdrop ${showControlsHud ? 'hud-visible' : 'hud-hidden'}`}
+      className={`player-modal-backdrop ${showControlsHud && !isScreenLocked ? 'hud-visible' : 'hud-hidden'} ${isMiniPlayer ? 'mini-floating-player' : ''} ${isScreenLocked ? 'screen-locked' : ''}`}
       ref={containerRef}
       onMouseMove={resetHudTimer}
     >
       {/* Top Minimal Screening Header */}
       <header
-        className={`player-top-bar ${showControlsHud ? 'visible' : 'hidden'}`}
+        className={`player-top-bar ${showControlsHud && !isScreenLocked && !isMiniPlayer ? 'visible' : 'hidden'}`}
         onClick={(e) => {
           e.stopPropagation();
           resetHudTimer();
@@ -1444,14 +1740,54 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
             </div>
           </div>
         </div>
+
+        {/* Top-Right Quick Utility Actions (Ambilight, Screenshot, Mini Player, Screen Lock) */}
+        <div className="player-top-right">
+          <button
+            type="button"
+            className={`player-icon-btn ${ambilightEnabled ? 'active-utility-btn' : ''}`}
+            onClick={() => setAmbilightEnabled((prev) => !prev)}
+            title={ambilightEnabled ? 'Disable Cinema Ambilight Glow' : 'Enable Cinema Ambilight Glow'}
+          >
+            <Sparkles size={17} />
+          </button>
+          <button
+            type="button"
+            className="player-icon-btn"
+            onClick={captureScreenshotFrame}
+            title="Capture Video Frame Screenshot (PNG)"
+          >
+            <Camera size={17} />
+          </button>
+          <button
+            type="button"
+            className={`player-icon-btn ${isMiniPlayer || isPiPActive ? 'active-utility-btn' : ''}`}
+            onClick={() => setIsMiniPlayer((prev) => !prev)}
+            title="Toggle Floating Mini Player (Browse while watching)"
+          >
+            <PictureInPicture2 size={17} />
+          </button>
+          <button
+            type="button"
+            className="player-icon-btn"
+            onClick={() => {
+              setIsScreenLocked(true);
+              setActivePopover(null);
+            }}
+            title="Lock Touch Controls (Prevent accidental touches on phone)"
+          >
+            <Lock size={17} />
+          </button>
+        </div>
       </header>
 
-      {/* Main Video / Trailer Stage (Supports Left/Right Double-Tap ±10s Seek + Left Drag/Wheel Brightness + Right Drag/Wheel Volume) */}
+      {/* Main Video / Trailer Stage (Supports Left/Right Double-Tap ±10s Seek + Left Drag/Wheel Brightness + Right Drag/Wheel Volume + Hold 2x Speed) */}
       <div
         className="player-stage"
         onPointerDown={(e) => {
+          if (isScreenLocked) return;
           const target = e.target as HTMLElement | null;
-          if (target && target.closest('button, a, input, .pause-dossier-overlay, .player-buffer-overlay')) {
+          if (target && target.closest('button, a, input, .pause-dossier-overlay, .player-buffer-overlay, .next-episode-card-overlay')) {
             return;
           }
           const rect = e.currentTarget.getBoundingClientRect();
@@ -1467,18 +1803,33 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
             startValue: side === 'left' ? brightness : isMuted ? 0 : volume,
             isDragging: false,
           };
+          if (hold2xTimerRef.current) window.clearTimeout(hold2xTimerRef.current);
+          hold2xTimerRef.current = window.setTimeout(() => {
+            if (stageGestureRef.current && !stageGestureRef.current.isDragging) {
+              suppressNextClickRef.current = true;
+              startHold2xSpeed();
+            }
+          }, 420);
         }}
         onPointerMove={(e) => {
+          if (isScreenLocked) return;
           const g = stageGestureRef.current;
           if (!g || !g.active || g.pointerId !== e.pointerId) return;
           const dy = g.startY - e.clientY;
           const dx = e.clientX - g.startX;
+          if (Math.abs(dy) > 10 || Math.abs(dx) > 10) {
+            if (hold2xTimerRef.current) {
+              window.clearTimeout(hold2xTimerRef.current);
+              hold2xTimerRef.current = null;
+            }
+          }
           if (!g.isDragging) {
             if (Math.abs(dy) < 12 || Math.abs(dx) > Math.abs(dy) * 1.1) {
               return;
             }
             g.isDragging = true;
             suppressNextClickRef.current = true;
+            stopHold2xSpeed();
             if (singleTapTimerRef.current) {
               window.clearTimeout(singleTapTimerRef.current);
               singleTapTimerRef.current = null;
@@ -1495,14 +1846,17 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
           resetHudTimer();
         }}
         onPointerUp={(e) => {
+          stopHold2xSpeed();
           if (stageGestureRef.current && stageGestureRef.current.pointerId === e.pointerId) {
             stageGestureRef.current = null;
           }
         }}
         onPointerCancel={() => {
+          stopHold2xSpeed();
           stageGestureRef.current = null;
         }}
         onWheel={(e) => {
+          if (isScreenLocked) return;
           const target = e.target as HTMLElement | null;
           if (target && target.closest('.bottom-popover-panel, .pause-dossier-overlay')) {
             return;
@@ -1520,12 +1874,16 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
           resetHudTimer();
         }}
         onClick={(e) => {
+          if (isScreenLocked) {
+            resetHudTimer();
+            return;
+          }
           if (suppressNextClickRef.current) {
             suppressNextClickRef.current = false;
             return;
           }
           const target = e.target as HTMLElement | null;
-          if (target && target.closest('button, a, input, .pause-dossier-overlay, .player-buffer-overlay')) {
+          if (target && target.closest('button, a, input, .pause-dossier-overlay, .player-buffer-overlay, .next-episode-card-overlay')) {
             return;
           }
           const rect = e.currentTarget.getBoundingClientRect();
@@ -1571,6 +1929,96 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
           }, 230);
         }}
       >
+        {/* Dynamic Cinema Ambilight Glow Layer */}
+        {ambilightEnabled && (
+          <div
+            className="ambilight-stage-glow"
+            style={{
+              background: `radial-gradient(circle at 50% 50%, rgba(${ambilightColor}, 0.36) 0%, rgba(${ambilightColor}, 0.14) 52%, transparent 80%)`,
+            }}
+            aria-hidden="true"
+          />
+        )}
+
+        {/* Camera Shutter Flash Effect for Video Screenshot */}
+        {shutterFlashActive && <div className="shutter-flash-overlay" aria-hidden="true" />}
+
+        {/* Hold-to-2x Speed Indicator Pill */}
+        {isHold2xActive && (
+          <div className="hold-2x-pill">
+            <Zap size={15} fill="currentColor" />
+            <span>2x Speed · Hold</span>
+          </div>
+        )}
+
+        {/* Screen Lock Floating Unlock Button (Mobile Anti-Accidental Touch) */}
+        {isScreenLocked && (
+          <button
+            type="button"
+            className="screen-locked-pill"
+            onClick={(e) => {
+              e.stopPropagation();
+              setIsScreenLocked(false);
+              resetHudTimer();
+            }}
+          >
+            <Unlock size={16} />
+            <span>Screen Locked — Tap to Unlock</span>
+          </button>
+        )}
+
+        {/* Mini Floating Player Controls Overlay */}
+        {isMiniPlayer && (
+          <div className="mini-player-controls-overlay" onClick={(e) => e.stopPropagation()}>
+            <div className="mini-player-title-bar">
+              <strong>{media.name}</strong>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <button
+                  type="button"
+                  className="player-icon-btn small"
+                  onClick={() => setIsMiniPlayer(false)}
+                  title="Expand to Full Player"
+                >
+                  <Maximize2 size={14} />
+                </button>
+                <button
+                  type="button"
+                  className="player-icon-btn small"
+                  onClick={onClose}
+                  title="Close Player"
+                >
+                  <X size={14} />
+                </button>
+              </div>
+            </div>
+            <div className="mini-player-bottom-btns">
+              <button
+                type="button"
+                className="player-icon-btn small"
+                onClick={() => triggerZoneSeek('left')}
+                title="Rewind 10s"
+              >
+                <Rewind size={14} />
+              </button>
+              <button
+                type="button"
+                className="player-icon-btn small"
+                onClick={togglePlayPause}
+                title={isPlaying ? 'Pause' : 'Play'}
+              >
+                {isPlaying ? <Pause size={15} /> : <Play size={15} />}
+              </button>
+              <button
+                type="button"
+                className="player-icon-btn small"
+                onClick={() => triggerZoneSeek('right')}
+                title="Forward 10s"
+              >
+                <FastForward size={14} />
+              </button>
+            </div>
+          </div>
+        )}
         {/* Double-Click / Double-Tap ±10s Seek Ripple Overlay */}
         {seekRipple && (
           <div
@@ -1837,6 +2285,11 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                   updatedAtIso: new Date().toISOString(),
                 });
               }}
+              onEnded={() => {
+                if (nextEpisode && !nextEpisodeDismissed) {
+                  advanceToNextEpisode();
+                }
+              }}
             />
             {/* Freeze-Frame Canvas Overlay: Preserves the last decoded video frame during +10s/-10s seek & timeline scrubbing so the screen never turns black */}
             <canvas
@@ -2001,6 +2454,37 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
           </div>
         )}
 
+        {/* Auto-Play Next Episode Countdown Card (Binge Mode for TV Series) */}
+        {showNextEpisodeCard && nextEpisode && (
+          <div className="next-episode-card-overlay" onClick={(e) => e.stopPropagation()}>
+            <div className="next-episode-card-head">
+              <span className="pause-kicker">
+                Up Next in {remainingEpisodeSec}s
+              </span>
+              <strong className="next-episode-card-title">
+                S{nextEpisode.season}:E{nextEpisode.episode} — {nextEpisode.name}
+              </strong>
+            </div>
+            <div className="next-episode-card-actions">
+              <button
+                type="button"
+                className="primary-amber-btn compact-btn"
+                onClick={advanceToNextEpisode}
+              >
+                <SkipForward size={14} />
+                <span>Play Next Now</span>
+              </button>
+              <button
+                type="button"
+                className="secondary-outline-btn compact-btn"
+                onClick={() => setNextEpisodeDismissed(true)}
+              >
+                <span>Cancel</span>
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Custom Styled Subtitle Renderer */}
         {activeStream?.kind === 'direct' && activeSubtitleText && (
           <div
@@ -2029,7 +2513,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
 
       {/* Bottom Transport Deck with Upward Popover Dropdown Menus */}
       <footer
-        className={`player-bottom-deck ${showControlsHud ? 'visible' : 'hidden'}`}
+        className={`player-bottom-deck ${showControlsHud && !isScreenLocked && !isMiniPlayer ? 'visible' : 'hidden'}`}
         onClick={(e) => {
           e.stopPropagation();
           resetHudTimer();
@@ -2079,6 +2563,12 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                   <>
                     <Tv size={16} />
                     <span>Episodes ({media.videos.length})</span>
+                  </>
+                )}
+                {activePopover === 'bookmarks' && (
+                  <>
+                    <Bookmark size={16} />
+                    <span>Scene Bookmarks ({sceneBookmarks.length})</span>
                   </>
                 )}
               </div>
@@ -2531,6 +3021,75 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                 </div>
               </div>
             )}
+
+            {/* 7. SCENE TIMESTAMP BOOKMARKS DROPDOWN */}
+            {activePopover === 'bookmarks' && (
+              <div className="bottom-popover-body">
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                  <input
+                    type="text"
+                    className="directory-search-input"
+                    style={{ flex: 1, padding: '7px 11px', fontSize: 12.5 }}
+                    placeholder={`Bookmark note @ ${formatTimecode(currentTimeSec)}…`}
+                    value={bookmarkNoteInput}
+                    onChange={(e) => setBookmarkNoteInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        addSceneBookmark();
+                      }
+                    }}
+                  />
+                  <button
+                    type="button"
+                    className="primary-amber-btn compact-btn"
+                    onClick={() => addSceneBookmark()}
+                  >
+                    <Bookmark size={14} />
+                    <span>+ Save ({formatTimecode(currentTimeSec)})</span>
+                  </button>
+                </div>
+
+                <div className="popover-list-scroll">
+                  {sceneBookmarks.length === 0 ? (
+                    <p className="drawer-help-copy">
+                      No bookmarked scenes yet. Click + Save above to bookmark your favorite moments.
+                    </p>
+                  ) : (
+                    sceneBookmarks.map((bm) => (
+                      <div key={bm.id} className="popover-option-row">
+                        <div
+                          className="popover-option-main"
+                          style={{ cursor: 'pointer' }}
+                          onClick={() => {
+                            seekTo(bm.timeSec);
+                            setActivePopover(null);
+                          }}
+                        >
+                          <div className="popover-option-title-line">
+                            <span className="quality-tier-badge tier-1080p mono">
+                              {formatTimecode(bm.timeSec)}
+                            </span>
+                            <strong>{bm.label}</strong>
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          className="player-icon-btn small"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            removeSceneBookmark(bm.id);
+                          }}
+                          title="Delete Bookmark"
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            )}
           </div>
         )}
 
@@ -2638,10 +3197,47 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                 }}
               />
             </div>
+
+            {/* Night Dialogue Audio Boost Button (100% -> 150% -> 200%) */}
+            <button
+              type="button"
+              className={`bottom-dropdown-btn ${audioBoostPct > 100 ? 'active' : ''}`}
+              onClick={cycleAudioBoost}
+              title="Night Mode / Dialogue Audio Boost (Cycles 100% -> 150% -> 200%)"
+            >
+              <Zap size={14} />
+              <span className="mono">{audioBoostPct}%</span>
+            </button>
+
+            {/* Next Episode Quick Skip Button (when watching a TV Series with a next episode) */}
+            {nextEpisode && (
+              <button
+                type="button"
+                className="bottom-dropdown-btn"
+                onClick={advanceToNextEpisode}
+                title={`Play Next Episode: S${nextEpisode.season}:E${nextEpisode.episode} — ${nextEpisode.name}`}
+              >
+                <SkipForward size={14} />
+                <span>Next Ep</span>
+              </button>
+            )}
           </div>
 
           {/* Right Bottom Control Deck: Dropdown Triggers + Quick Resolution Cycle + Fullscreen */}
           <div className="transport-right">
+            {/* Scene Timestamp Bookmarks Dropdown Button */}
+            <button
+              type="button"
+              className={`bottom-dropdown-btn ${activePopover === 'bookmarks' ? 'active' : ''}`}
+              onClick={() => togglePopover('bookmarks')}
+              title="Scene Timestamp Bookmarks"
+            >
+              <Bookmark size={14} />
+              <span>
+                Scenes{sceneBookmarks.length > 0 ? ` (${sceneBookmarks.length})` : ''}
+              </span>
+              <ChevronUp size={13} className="chevron-icon" />
+            </button>
             {/* Series Episodes Dropdown Button */}
             {media.videos.length > 0 && (
               <button

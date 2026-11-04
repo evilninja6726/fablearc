@@ -1545,8 +1545,48 @@ export function registerStreamzApiMiddlewares(
         return;
       }
 
+      let clientDisconnected = false;
+      const markClientDisconnected = () => {
+        clientDisconnected = true;
+      };
+      req.once('close', markClientDisconnected);
+      res.once('close', markClientDisconnected);
+
+      res.statusCode = 200;
+      res.setHeader('Content-Type', 'audio/mpeg');
+      res.setHeader('X-Stream-Mode', 'audio-only');
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+
+      // Restrict CORS to trusted frontend origins (localhost, Vercel, Hugging Face, Railway, Render, or configured FRONTEND_ORIGIN)
+      const reqOrigin = req.headers.origin;
+      const configuredOrigin = (process.env.FRONTEND_ORIGIN || '').trim();
+      if (
+        typeof reqOrigin === 'string' &&
+        (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(reqOrigin) ||
+          /^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(reqOrigin) ||
+          /^https:\/\/[a-z0-9-]+\.hf\.space$/i.test(reqOrigin) ||
+          /^https:\/\/[a-z0-9-]+\.up\.railway\.app$/i.test(reqOrigin) ||
+          /^https:\/\/[a-z0-9-]+\.onrender\.com$/i.test(reqOrigin) ||
+          reqOrigin.includes('ngrok-free.dev') ||
+          (configuredOrigin && reqOrigin === configuredOrigin))
+      ) {
+        res.setHeader('Access-Control-Allow-Origin', reqOrigin);
+        res.setHeader('Vary', 'Origin');
+      }
+
+      if (typeof res.flushHeaders === 'function') {
+        res.flushHeaders();
+      }
+
       const resolvedUrl = await unwrapMediaStreamUrl(rawStreamUrl);
+      if (clientDisconnected || req.destroyed || res.writableEnded) {
+        return;
+      }
       const loopbackInputUrl = await createLoopbackMediaUrl(resolvedUrl);
+      if (clientDisconnected || req.destroyed || res.writableEnded) {
+        return;
+      }
 
       // Enforce per-user concurrent FFmpeg process limit (evict oldest process if exceeding limit)
       let userProcs = activeUserFfmpegStreams.get(userId);
@@ -1617,29 +1657,6 @@ export function registerStreamzApiMiddlewares(
         'pipe:1',
       );
 
-      res.statusCode = 200;
-      res.setHeader('Content-Type', 'audio/mpeg');
-      res.setHeader('X-Stream-Mode', 'audio-only');
-      res.setHeader('Cache-Control', 'no-store');
-      res.setHeader('X-Content-Type-Options', 'nosniff');
-
-      // Restrict CORS to trusted frontend origins (localhost, Vercel, Hugging Face, Railway, Render, or configured FRONTEND_ORIGIN)
-      const reqOrigin = req.headers.origin;
-      const configuredOrigin = (process.env.FRONTEND_ORIGIN || '').trim();
-      if (
-        typeof reqOrigin === 'string' &&
-        (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(reqOrigin) ||
-          /^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(reqOrigin) ||
-          /^https:\/\/[a-z0-9-]+\.hf\.space$/i.test(reqOrigin) ||
-          /^https:\/\/[a-z0-9-]+\.up\.railway\.app$/i.test(reqOrigin) ||
-          /^https:\/\/[a-z0-9-]+\.onrender\.com$/i.test(reqOrigin) ||
-          reqOrigin.includes('ngrok-free.dev') ||
-          (configuredOrigin && reqOrigin === configuredOrigin))
-      ) {
-        res.setHeader('Access-Control-Allow-Origin', reqOrigin);
-        res.setHeader('Vary', 'Origin');
-      }
-
       const ffmpegProc = spawn(ffmpegPath, args, {
         stdio: ['ignore', 'pipe', 'pipe'],
       });
@@ -1651,6 +1668,13 @@ export function registerStreamzApiMiddlewares(
         userProcs?.delete(ffmpegProc);
         if (!ffmpegProc.killed) {
           ffmpegProc.kill('SIGKILL');
+        }
+        if (!res.writableEnded) {
+          try {
+            res.end();
+          } catch {
+            // ignore
+          }
         }
       };
 

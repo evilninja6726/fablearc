@@ -491,9 +491,55 @@ export const App: React.FC = () => {
   const [dossierSelectedSeason, setDossierSelectedSeason] = useState<number>(1);
   const [dossierEpisodeQuery, setDossierEpisodeQuery] = useState<string>('');
   const [dossierShowStreams, setDossierShowStreams] = useState<boolean>(false);
-  const [dossierActiveTrailerYtId, setDossierActiveTrailerYtId] = useState<string | null>(null);
   const [dossierSimilarPool, setDossierSimilarPool] = useState<StremioMediaItem[]>([]);
   const dossierScrollRef = useRef<HTMLDivElement | null>(null);
+
+  // Custom Watchlist Collections ("plan", "watching", "completed", "favorites") & Personal 1-5 Star Ratings
+  const [watchlistFilterTab, setWatchlistFilterTab] = useState<
+    'all' | 'watching' | 'plan' | 'completed' | 'favorites'
+  >('all');
+  const [watchlistMetaById, setWatchlistMetaById] = useState<
+    Record<
+      string,
+      {
+        status: 'watching' | 'plan' | 'completed' | 'favorites';
+        userRating?: number;
+      }
+    >
+  >(() => {
+    try {
+      const raw = localStorage.getItem('fablearc_watchlist_meta_v1');
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
+    }
+  });
+
+  const updateWatchlistMeta = useCallback(
+    (
+      mediaId: string,
+      patch: Partial<{
+        status: 'watching' | 'plan' | 'completed' | 'favorites';
+        userRating?: number;
+      }>,
+    ) => {
+      setWatchlistMetaById((prev) => {
+        const current = prev[mediaId] ?? { status: 'plan' as const };
+        const next = {
+          ...prev,
+          [mediaId]: {
+            ...current,
+            ...patch,
+          },
+        };
+        try {
+          localStorage.setItem('fablearc_watchlist_meta_v1', JSON.stringify(next));
+        } catch {}
+        return next;
+      });
+    },
+    [],
+  );
 
   // Active player modal state
   const [playingSession, setPlayingSession] = useState<{
@@ -1272,7 +1318,6 @@ export const App: React.FC = () => {
       setDossierSelectedSeason(1);
       setDossierEpisodeQuery('');
       setDossierShowStreams(false);
-      setDossierActiveTrailerYtId(null);
       setDossierLoadingMeta(true);
       setDossierLoadingStreams(true);
       setDossierStreams([]);
@@ -2128,6 +2173,51 @@ export const App: React.FC = () => {
     return () => window.removeEventListener('keydown', onKey);
   }, [dossierItem, playingSession]);
 
+  // "Surprise Me" Smart Movie / Series Roulette Pick
+  const handleSurpriseMePick = useCallback(() => {
+    if (!currentUser) {
+      setAuthModalOpen(true);
+      return;
+    }
+    const poolMap = new Map<string, StremioMediaItem>();
+    for (const shelf of visibleShelves.length > 0 ? visibleShelves : catalogShelves) {
+      for (const item of shelf.items) {
+        if (item.id !== dossierItem?.id && !poolMap.has(item.id)) {
+          poolMap.set(item.id, item);
+        }
+      }
+    }
+    for (const gShelf of genreCatalogShelves) {
+      for (const item of gShelf.items) {
+        if (item.id !== dossierItem?.id && !poolMap.has(item.id)) {
+          poolMap.set(item.id, item);
+        }
+      }
+    }
+    const allCandidates = Array.from(poolMap.values());
+    if (allCandidates.length === 0) return;
+
+    const highRated = allCandidates.filter(
+      (i) => Number.parseFloat(i.imdbRating || '0') >= 7.2,
+    );
+    const pickPool = highRated.length > 0 ? highRated : allCandidates;
+    const chosen = pickPool[Math.floor(Math.random() * pickPool.length)];
+    if (chosen) {
+      setUserToastCard({
+        kind: 'success',
+        text: `Surprise Pick: "${chosen.name}"${chosen.imdbRating ? ` (★ ${chosen.imdbRating})` : ''}`,
+      });
+      openItemDossier(chosen);
+    }
+  }, [
+    catalogShelves,
+    currentUser,
+    dossierItem?.id,
+    genreCatalogShelves,
+    openItemDossier,
+    visibleShelves,
+  ]);
+
   const effectiveNav: NavSection = currentUser ? activeNav : 'discover';
 
   return (
@@ -2199,6 +2289,15 @@ export const App: React.FC = () => {
                 {addons.filter((a) => a.enabled).length}
               </span>
             )}
+          </button>
+          <button
+            type="button"
+            className="dock-nav-btn surprise-roulette-btn"
+            onClick={handleSurpriseMePick}
+            title="Pick a random top-rated Movie or Series for me!"
+          >
+            <Sparkles size={14} />
+            <span>Surprise Me</span>
           </button>
           {currentUser?.role === 'admin' && (
             <button
@@ -2974,16 +3073,46 @@ export const App: React.FC = () => {
           </div>
         )}
 
-        {/* WATCHLIST / LIBRARY VIEW (Authenticated Users Only) */}
+        {/* WATCHLIST / LIBRARY VIEW (Authenticated Users Only — With Custom Collection Tabs & Personal 1-5★ Ratings) */}
         {currentUser && effectiveNav === 'library' && (
           <div className="spatial-scroll-flow padded-top">
             <section className="catalog-shelf">
-              <div className="shelf-header">
+              <div className="shelf-header" style={{ flexWrap: 'wrap', gap: 12 }}>
                 <div className="shelf-title-group">
-                  <h2>My Watchlist</h2>
+                  <h2>My Watchlist &amp; Collections</h2>
                   <span className="shelf-subtitle mono">
                     {libraryItems.length} SAVED TITLES
                   </span>
+                </div>
+
+                {/* Custom Watchlist Collection Filter Tabs */}
+                <div className="watchlist-collection-tabs">
+                  {(
+                    [
+                      { id: 'all', label: 'All Saved' },
+                      { id: 'watching', label: 'Watching' },
+                      { id: 'plan', label: 'Plan to Watch' },
+                      { id: 'completed', label: 'Completed' },
+                      { id: 'favorites', label: '★ Favorites' },
+                    ] as const
+                  ).map((tab) => {
+                    const count =
+                      tab.id === 'all'
+                        ? libraryItems.length
+                        : libraryItems.filter(
+                            (i) => (watchlistMetaById[i.id]?.status ?? 'plan') === tab.id,
+                          ).length;
+                    return (
+                      <button
+                        key={tab.id}
+                        type="button"
+                        className={`genre-pill ${watchlistFilterTab === tab.id ? 'active' : ''}`}
+                        onClick={() => setWatchlistFilterTab(tab.id)}
+                      >
+                        {tab.label} ({count})
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
 
@@ -3000,23 +3129,61 @@ export const App: React.FC = () => {
                 </div>
               ) : (
                 <div className="poster-grid">
-                  {libraryItems.map((item) => (
-                    <PosterCard
-                      key={item.id}
-                      item={item}
-                      inLibrary={true}
-                      onPlay={(i) =>
-                        startScreeningItem(
-                          i,
-                          undefined,
-                          undefined,
-                          progressMap[i.id]?.positionSec ?? 0,
-                        )
-                      }
-                      onOpenDossier={openItemDossier}
-                      onToggleLibrary={toggleLibraryItem}
-                    />
-                  ))}
+                  {libraryItems
+                    .filter((item) => {
+                      if (watchlistFilterTab === 'all') return true;
+                      const st = watchlistMetaById[item.id]?.status ?? 'plan';
+                      return st === watchlistFilterTab;
+                    })
+                    .map((item) => {
+                      const itemMeta = watchlistMetaById[item.id] ?? { status: 'plan' as const };
+                      return (
+                        <div key={item.id} className="watchlist-card-wrapper">
+                          <PosterCard
+                            item={item}
+                            inLibrary={true}
+                            onPlay={(i) => openItemDossier(i)}
+                            onOpenDossier={openItemDossier}
+                            onToggleLibrary={toggleLibraryItem}
+                          />
+                          <div className="watchlist-item-controls">
+                            <select
+                              className="watchlist-status-select"
+                              value={itemMeta.status}
+                              aria-label={`Collection status for ${item.name}`}
+                              onChange={(e) =>
+                                updateWatchlistMeta(item.id, {
+                                  status: e.target.value as
+                                    | 'watching'
+                                    | 'plan'
+                                    | 'completed'
+                                    | 'favorites',
+                                })
+                              }
+                            >
+                              <option value="plan">Plan to Watch</option>
+                              <option value="watching">Watching</option>
+                              <option value="completed">Completed</option>
+                              <option value="favorites">★ Favorites</option>
+                            </select>
+                            <div className="watchlist-star-picker" title="Your Personal Rating">
+                              {[1, 2, 3, 4, 5].map((starVal) => (
+                                <button
+                                  key={starVal}
+                                  type="button"
+                                  className={`star-rate-btn ${(itemMeta.userRating ?? 0) >= starVal ? 'filled' : ''}`}
+                                  onClick={() =>
+                                    updateWatchlistMeta(item.id, { userRating: starVal })
+                                  }
+                                >
+                                  ★
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
                 </div>
               )}
             </section>
@@ -3645,24 +3812,6 @@ export const App: React.FC = () => {
                       </button>
                     )}
 
-                    {(dossierItem.trailers[0]?.source ||
-                      dossierStreams.find((s) => s.kind === 'youtube' && s.ytId)?.ytId) && (
-                      <button
-                        type="button"
-                        className={`glass-secondary-btn ${dossierActiveTrailerYtId ? 'active-chip-btn' : ''}`}
-                        onClick={() => {
-                          const ytId =
-                            dossierItem.trailers[0]?.source ||
-                            dossierStreams.find((s) => s.kind === 'youtube' && s.ytId)?.ytId ||
-                            null;
-                          setDossierActiveTrailerYtId((prev) => (prev ? null : ytId));
-                        }}
-                      >
-                        <Film size={15} />
-                        <span>{dossierActiveTrailerYtId ? 'Hide Trailer' : 'Watch Trailer'}</span>
-                      </button>
-                    )}
-
                     <button
                       type="button"
                       className="glass-secondary-btn"
@@ -3693,37 +3842,80 @@ export const App: React.FC = () => {
                           : `Servers & Quality (${dossierStreams.length})`}
                       </span>
                     </button>
+
+                    <button
+                      type="button"
+                      className="glass-secondary-btn"
+                      onClick={handleSurpriseMePick}
+                      title="Pick another random top-rated Movie or Series"
+                    >
+                      <Sparkles size={15} />
+                      <span>Surprise Me</span>
+                    </button>
+                  </div>
+
+                  {/* Personal Collection Status & 1-5★ Rating Bar inside Details Page */}
+                  <div className="details-personal-rating-bar">
+                    <div className="details-collection-pills">
+                      <span className="drawer-label" style={{ marginRight: 4 }}>
+                        Collection:
+                      </span>
+                      {(
+                        [
+                          { id: 'plan', label: 'Plan to Watch' },
+                          { id: 'watching', label: 'Watching' },
+                          { id: 'completed', label: 'Completed' },
+                          { id: 'favorites', label: '★ Favorite' },
+                        ] as const
+                      ).map((col) => {
+                        const activeCol =
+                          isInLibrary(dossierItem.id) &&
+                          (watchlistMetaById[dossierItem.id]?.status ?? 'plan') === col.id;
+                        return (
+                          <button
+                            key={col.id}
+                            type="button"
+                            className={`mini-refresh-btn ${activeCol ? 'active-chip-btn' : ''}`}
+                            onClick={() => {
+                              if (!isInLibrary(dossierItem.id)) {
+                                toggleLibraryItem(dossierItem);
+                              }
+                              updateWatchlistMeta(dossierItem.id, { status: col.id });
+                            }}
+                          >
+                            {col.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    <div className="details-star-rating-box">
+                      <span className="drawer-label" style={{ marginRight: 4 }}>
+                        Your Rating:
+                      </span>
+                      {[1, 2, 3, 4, 5].map((starVal) => (
+                        <button
+                          key={starVal}
+                          type="button"
+                          className={`star-rate-btn ${(watchlistMetaById[dossierItem.id]?.userRating ?? 0) >= starVal ? 'filled' : ''}`}
+                          onClick={() => {
+                            if (!isInLibrary(dossierItem.id)) {
+                              toggleLibraryItem(dossierItem);
+                            }
+                            updateWatchlistMeta(dossierItem.id, { userRating: starVal });
+                          }}
+                          title={`Rate ${starVal} of 5 stars`}
+                        >
+                          ★
+                        </button>
+                      ))}
+                    </div>
                   </div>
                 </div>
               </div>
             </div>
 
             <div className="dossier-body details-page-body">
-              {/* Inline Trailer Player (when Watch Trailer is clicked) */}
-              {dossierActiveTrailerYtId && (
-                <div className="details-trailer-box">
-                  <div className="details-section-head">
-                    <span className="drawer-label">Official Trailer Preview</span>
-                    <button
-                      type="button"
-                      className="mini-refresh-btn"
-                      onClick={() => setDossierActiveTrailerYtId(null)}
-                    >
-                      <X size={13} />
-                      <span>Close Trailer</span>
-                    </button>
-                  </div>
-                  <div className="details-trailer-embed">
-                    <iframe
-                      title={`${dossierItem.name} Trailer`}
-                      src={`https://www.youtube-nocookie.com/embed/${encodeURIComponent(dossierActiveTrailerYtId)}?autoplay=1&rel=0`}
-                      allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
-                      allowFullScreen
-                    />
-                  </div>
-                </div>
-              )}
-
               {/* Cast & Director Interactive Credits Grid */}
               {(dossierItem.director.length > 0 || dossierItem.cast.length > 0) && (
                 <div className="dossier-credits-grid details-credits-panel">
