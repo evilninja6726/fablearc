@@ -760,25 +760,41 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       setLoadingMoreProviders(true);
       let firstWaveStarted = false;
 
+      let firstWaveInProgress = false;
+
       const handleFirstWavePlayback = async (waveList: StremioStreamItem[]) => {
-        if (firstWaveStarted || cancelled) return;
-        const hasDirect = waveList.some((s) => s.kind === 'direct' && !s.isPromo);
+        if (firstWaveStarted || firstWaveInProgress || cancelled) return;
+        const hasDirect = waveList.some(
+          (s) => s.kind === 'direct' && !s.isPromo && !isUnreachableOrSlowStream(s),
+        );
         if (!hasDirect) return;
-        firstWaveStarted = true;
-        setLoadingStreams(false);
+        firstWaveInProgress = true;
 
         if (initialStream) {
+          firstWaveStarted = true;
+          setLoadingStreams(false);
           setActiveStream((prev) => prev ?? initialStream);
           return;
         }
 
         const rankedWave = await rankWithTimeout(waveList, 4500);
-        if (cancelled) return;
-        const bestWave = rankedWave.length > 0 ? rankedWave : waveList;
+        firstWaveInProgress = false;
+        if (cancelled || firstWaveStarted) return;
+        const healthyWave = rankedWave.filter((s) => !isUnreachableOrSlowStream(s));
+        if (healthyWave.length === 0) {
+          // All streams in this early wave were dead; keep waiting for the next provider wave!
+          setStreams((prev) => prev.filter((s) => !isUnreachableOrSlowStream(s)));
+          return;
+        }
+        firstWaveStarted = true;
+        setLoadingStreams(false);
         setStreams((prev) =>
-          mergeWithMeasuredMetrics(bestWave, prev.length > bestWave.length ? prev : bestWave),
+          mergeWithMeasuredMetrics(
+            healthyWave,
+            prev.length > healthyWave.length ? prev : healthyWave,
+          ),
         );
-        setActiveStream((prev) => prev ?? pickBestPlayableStream(bestWave));
+        setActiveStream((prev) => prev ?? pickBestPlayableStream(healthyWave));
       };
 
       try {

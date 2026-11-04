@@ -329,22 +329,26 @@ export function sortStreamsByDecreasingQuality(
     const metaLower = `${s.name} ${s.title} ${urlLower}`.toLowerCase();
     let score = 0;
 
-    // 1. Prefer verified direct HTTP Range CDNs with CORS (PixelDrain, FSL, BunnyCDN, 111477, 2Peckle)
-    if (
-      urlLower.includes('pixeldrain.dev') ||
-      urlLower.includes('pixeldrain.com') ||
-      /\b(fsldownload|fsl(?:-v2)?|b-cdn\.net|111477\.xyz|2peckle)\b/i.test(metaLower)
+    // 1. Strongly prefer verified direct HTTP Range CDNs with CORS by actual URL host (PixelDrain, 111477, BunnyCDN, FSLDownload)
+    if (urlLower.includes('pixeldrain.dev') || urlLower.includes('pixeldrain.com')) {
+      score += 65;
+    } else if (
+      urlLower.includes('111477.xyz') ||
+      urlLower.includes('b-cdn.net') ||
+      urlLower.includes('fsldownload') ||
+      urlLower.includes('fsl-v2')
     ) {
-      score += 40;
+      score += 50;
     } else if (
       urlLower.includes('hubcloud.ist') ||
       urlLower.includes('rohitkiskk.workers.dev') ||
       urlLower.includes('/resolve/cj/')
     ) {
-      // Penalize broken redirect wrappers / dead HLS proxies so direct CDN mirrors rank first
-      score -= 50;
+      score -= 80;
+    } else if (urlLower.includes('.workers.dev')) {
+      score -= 25;
     } else if (urlLower.includes('.r2.cloudflarestorage.com')) {
-      score -= 10;
+      score -= 15;
     }
 
     // 2. Penalize Dolby Vision (DV / DoVi) streams that fail native HTML5 <video> decode in browsers
@@ -352,7 +356,7 @@ export function sortStreamsByDecreasingQuality(
       /\b(dv|dolby[\s._-]*vision|dovi)\b/i.test(metaLower) &&
       !/\b(hdr10|hdr)\b/i.test(metaLower)
     ) {
-      score -= 35;
+      score -= 40;
     } else if (/\b(dv|dolby[\s._-]*vision|dovi)\b/i.test(metaLower)) {
       score -= 20;
     }
@@ -362,7 +366,7 @@ export function sortStreamsByDecreasingQuality(
     if (gb >= 1.0 && gb <= 22.0) {
       score += 15;
     } else if (gb > 30.0) {
-      score -= 25;
+      score -= 30;
     }
 
     return score;
@@ -382,12 +386,24 @@ export function sortStreamsByDecreasingQuality(
     const scoreB = b.qualityScore ?? 0;
     if (scoreB !== scoreA) return scoreB - scoreA;
 
-    // 2. Priority to Multi-Audio / Dual-Audio within the same quality tier
+    // 2. Priority to Multi-Audio / Dual-Audio over Single-Audio within the same quality tier
+    const hasMultiA = (a.audioScore ?? (a.isMultiAudio ? 1 : 0)) > 0 ? 1 : 0;
+    const hasMultiB = (b.audioScore ?? (b.isMultiAudio ? 1 : 0)) > 0 ? 1 : 0;
+    if (hasMultiB !== hasMultiA) return hasMultiB - hasMultiA;
+
+    // 2b. For direct streams in the same quality + multi-audio tier, prefer verified CORS-enabled CDNs (PixelDrain, 111477, BunnyCDN)
+    if (a.kind === 'direct' && b.kind === 'direct') {
+      const compatA = getBrowserStreamCompatibilityScore(a);
+      const compatB = getBrowserStreamCompatibilityScore(b);
+      if (compatB !== compatA) return compatB - compatA;
+    }
+
+    // 2c. Sub-sort Multi-Audio (3+ langs) above Dual-Audio (2 langs) when on the same CDN tier
     const audioA = a.audioScore ?? (a.isMultiAudio ? 1 : 0);
     const audioB = b.audioScore ?? (b.isMultiAudio ? 1 : 0);
     if (audioB !== audioA) return audioB - audioA;
 
-    // 2b. For P2P magnet streams in the same quality + audio tier, prioritize healthy swarms (seeders)
+    // 2d. For P2P magnet streams in the same quality + audio tier, prioritize healthy swarms (seeders)
     if (a.kind === 'magnet' && b.kind === 'magnet') {
       const seedsA = a.seeders ?? 0;
       const seedsB = b.seeders ?? 0;
@@ -395,13 +411,6 @@ export function sortStreamsByDecreasingQuality(
       const healthyB = seedsB >= 5 ? 1 : 0;
       if (healthyB !== healthyA) return healthyB - healthyA;
       if (seedsB !== seedsA) return seedsB - seedsA;
-    }
-
-    // 2c. For direct streams in the same quality + audio tier, prefer fast CORS-enabled CDNs and non-DV streams
-    if (a.kind === 'direct' && b.kind === 'direct') {
-      const compatA = getBrowserStreamCompatibilityScore(a);
-      const compatB = getBrowserStreamCompatibilityScore(b);
-      if (compatB !== compatA) return compatB - compatA;
     }
 
     // 3. Decreasing file size / bitrate
@@ -1984,6 +1993,17 @@ const clientServerHealthCache = new Map<
  */
 export function isUnreachableOrSlowStream(stream: StremioStreamItem): boolean {
   if (stream.unreachable) return true;
+  if (stream.url) {
+    const urlLower = stream.url.toLowerCase();
+    if (
+      urlLower.includes('hubcloud.ist') ||
+      urlLower.includes('rohitkiskk.workers.dev') ||
+      urlLower.includes('video-downloads.googleusercontent.com') ||
+      urlLower.includes('/resolve/cj/')
+    ) {
+      return true;
+    }
+  }
   if (
     stream.serverStatusBadge &&
     /^(Slow\s*\/\s*Timeout|Offline|Blocked|HTTP Only)$/i.test(
@@ -2098,17 +2118,25 @@ export async function rankStreamsByResponsiveness(
     preferCompactSize = false,
   ): StremioStreamItem[] => {
     const scored = [...list].sort((a, b) => {
-      const metaA = `${a.name} ${a.title} ${a.url || ''}`;
-      const metaB = `${b.name} ${b.title} ${b.url || ''}`;
-      const hostScore = (meta: string): number => {
-        if (/\b(pixeldrain|fsl(?:-v2)?|2peckle|b-cdn\.net|fsldownload|111477\.xyz)\b/i.test(meta))
-          return 4;
-        if (/\b(arctic)\b/i.test(meta)) return 2;
-        if (/\b(r2|cloudflarestorage)\b/i.test(meta)) return 1;
-        if (/\b(hubcloud\.ist|rohitkiskk)\b/i.test(meta)) return -3;
+      const urlA = (a.url || '').toLowerCase();
+      const urlB = (b.url || '').toLowerCase();
+      const metaA = `${a.name} ${a.title} ${urlA}`;
+      const metaB = `${b.name} ${b.title} ${urlB}`;
+      const hostScore = (urlLower: string, meta: string): number => {
+        if (urlLower.includes('pixeldrain.dev') || urlLower.includes('pixeldrain.com')) return 6;
+        if (
+          urlLower.includes('111477.xyz') ||
+          urlLower.includes('b-cdn.net') ||
+          urlLower.includes('fsldownload') ||
+          urlLower.includes('fsl-v2')
+        )
+          return 5;
+        if (/\b(2peckle|arctic)\b/i.test(meta) && !urlLower.includes('.workers.dev')) return 3;
+        if (urlLower.includes('.r2.cloudflarestorage.com')) return 2;
+        if (urlLower.includes('.workers.dev')) return 1;
         return 0;
       };
-      const hDiff = hostScore(metaB) - hostScore(metaA);
+      const hDiff = hostScore(urlB, metaB) - hostScore(urlA, metaA);
       if (hDiff !== 0) return hDiff;
 
       // Prefer non-Dolby-Vision streams over 4K DV profiles that often fail hardware decode in HTML5 <video>
