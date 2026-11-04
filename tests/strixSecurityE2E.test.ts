@@ -995,6 +995,14 @@ describe('Strix-Style E2E & Security Audit Suite', () => {
     expect(spamCheck2.qualityScore).toBe(1080);
     expect(spamCheck2.isMultiAudio).toBe(true);
 
+    // Verify bitrate strings like "~12.9 Mbps" or "~19.4 Mbps" never misparse as "13 MB" / "19 MB" file sizes
+    const bitrateAndGbCheck = extractStreamQualityInfo(
+      '🐧 PenguPlay ❄️ 4K • VegaMovies · FSL-v2',
+      '🍿 The Batman (2022) 🎞️ 4K • MKV • WEB-DL • FSL-v2 • ~12.9 Mbps 🛰️ Source: VegaMovies · FSL-v2 💾 16.00 GB 🎧 Audio: English, Hindi',
+    );
+    expect(bitrateAndGbCheck.sizeLabel).toBe('16.0 GB');
+    expect(bitrateAndGbCheck.sizeBytes).toBeGreaterThan(16_000_000_000);
+
     // Edge Case 4: rankStreamsByResponsiveness gracefully handles empty, magnet-only, or offline-backend lists without throwing or losing quality order
     const fallbackRanked = await rankStreamsByResponsiveness([
       {

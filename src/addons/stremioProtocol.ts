@@ -269,7 +269,7 @@ export function extractStreamQualityInfo(
 
   let sizeBytes = 0;
   let sizeLabel: string | undefined;
-  const sizeMatch = combined.match(/(\d+(?:\.\d+)?)\s*(GB|GiB|MB|MiB)/i);
+  const sizeMatch = combined.match(/(\d+(?:\.\d+)?)\s*(GB|GiB|MB|MiB)\b/i);
   if (sizeMatch) {
     const val = parseFloat(sizeMatch[1]);
     const unit = sizeMatch[2].toUpperCase();
@@ -280,6 +280,14 @@ export function extractStreamQualityInfo(
       } else {
         sizeBytes = Math.round(val * 1024 * 1024);
         sizeLabel = `${Math.round(val)} MB`;
+      }
+    }
+  } else {
+    const bitrateMatch = combined.match(/(\d+(?:\.\d+)?)\s*Mbps\b/i);
+    if (bitrateMatch) {
+      const mbps = parseFloat(bitrateMatch[1]);
+      if (!Number.isNaN(mbps) && mbps > 0) {
+        sizeBytes = Math.round(((mbps * 1_000_000) / 8) * 7200);
       }
     }
   }
@@ -1381,7 +1389,9 @@ export async function fetchStreamsFromAddons(
                 title,
                 kind: 'direct',
                 url: urlCheck.normalizedUrl,
-                isHls: urlCheck.normalizedUrl.includes('.m3u8'),
+                isHls: /\.m3u8(\?|$)|\/hls\/|\/playlist\//i.test(
+                  urlCheck.normalizedUrl,
+                ),
                 ...qualityInfo,
               });
             }
@@ -1748,12 +1758,94 @@ export async function rankStreamsByResponsiveness(
   explicitToken?: string,
 ): Promise<StremioStreamItem[]> {
   const sortedBase = applyCachedServerHealth(sortStreamsByDecreasingQuality(streams));
-  const directCandidates = sortedBase
-    .filter((s) => s.kind === 'direct' && !s.isPromo && Boolean(s.url))
-    .slice(0, 6);
+  const allDirect = sortedBase.filter(
+    (s) => s.kind === 'direct' && !s.isPromo && Boolean(s.url),
+  );
 
-  if (directCandidates.length === 0) {
+  if (allDirect.length === 0) {
     return sortedBase;
+  }
+
+  // Pick up to 6 diverse, high-probability zero-buffer candidates across BOTH 4K and 1080p tiers:
+  // - Up to 3 direct file streams from 4K (preferring FSL/R2/2Peckle/PixelDrain with known sizeBytes)
+  // - Up to 3 direct file streams from 1080p (fast 1.5–4 GB Dual-Audio files that start in <1s with zero buffering)
+  // - Fill any remaining slots up to 6 from the rest of allDirect
+  const selectedIds = new Set<string>();
+  const directCandidates: StremioStreamItem[] = [];
+  const addCandidate = (item?: StremioStreamItem) => {
+    if (item && !selectedIds.has(item.id) && directCandidates.length < 6) {
+      selectedIds.add(item.id);
+      directCandidates.push(item);
+    }
+  };
+
+  const nonHlsDirect = allDirect.filter((s) => !s.isHls);
+  const tier4kFiles = nonHlsDirect.filter((s) => (s.qualityScore ?? 0) >= 2160);
+  const tier1080pFiles = nonHlsDirect.filter(
+    (s) => (s.qualityScore ?? 0) >= 1080 && (s.qualityScore ?? 0) < 2160,
+  );
+
+  // Prefer FSL / R2 / 2Peckle servers with distinct mirror names and sweet-spot file sizes for instant zero-buffer start
+  const pickDistinctMirrors = (
+    list: StremioStreamItem[],
+    count: number,
+    preferCompactSize = false,
+  ): StremioStreamItem[] => {
+    const scored = [...list].sort((a, b) => {
+      const metaA = `${a.name} ${a.title}`;
+      const metaB = `${b.name} ${b.title}`;
+      const hostScore = (meta: string): number => {
+        if (/\b(fsl(?:-v2)?|r2|2peckle)\b/i.test(meta)) return 3;
+        if (/\b(pixeldrain)\b/i.test(meta)) return 2;
+        if (/\b(arctic)\b/i.test(meta)) return 1;
+        return 0;
+      };
+      const hDiff = hostScore(metaB) - hostScore(metaA);
+      if (hDiff !== 0) return hDiff;
+
+      const audioA = a.audioScore ?? (a.isMultiAudio ? 1 : 0);
+      const audioB = b.audioScore ?? (b.isMultiAudio ? 1 : 0);
+      if (audioB !== audioA) return audioB - audioA;
+
+      if (preferCompactSize) {
+        const gbA = (a.sizeBytes ?? 0) / (1024 * 1024 * 1024);
+        const gbB = (b.sizeBytes ?? 0) / (1024 * 1024 * 1024);
+        const sweetA = gbA >= 1.0 && gbA <= 4.5 ? 1 : 0;
+        const sweetB = gbB >= 1.0 && gbB <= 4.5 ? 1 : 0;
+        if (sweetB !== sweetA) return sweetB - sweetA;
+        if (gbA > 0 && gbB > 0) return gbA - gbB;
+      }
+      return 0;
+    });
+
+    const picked: StremioStreamItem[] = [];
+    const seenNames = new Set<string>();
+    for (const item of scored) {
+      if (picked.length >= count) break;
+      const mirrorKey = item.name.toLowerCase().trim();
+      if (!seenNames.has(mirrorKey)) {
+        seenNames.add(mirrorKey);
+        picked.push(item);
+      }
+    }
+    for (const item of scored) {
+      if (picked.length >= count) break;
+      if (!picked.some((p) => p.id === item.id)) {
+        picked.push(item);
+      }
+    }
+    return picked;
+  };
+
+  for (const c of pickDistinctMirrors(tier4kFiles, 3, false)) {
+    addCandidate(c);
+  }
+  for (const c of pickDistinctMirrors(tier1080pFiles, 3, true)) {
+    addCandidate(c);
+  }
+  for (const c of allDirect) {
+    if (directCandidates.length >= 6) break;
+    addCandidate(c);
   }
 
   try {
@@ -1835,8 +1927,12 @@ export async function rankStreamsByResponsiveness(
     for (const s of annotated) {
       const m = metricById.get(s.id);
       if (!m || !m.ok || m.unreachable || !m.isHttps) continue;
-      const qualityBonus = Math.min(180, ((s.qualityScore ?? 720) / 2160) * 180);
-      const audioBonus = (s.audioScore ?? 0) * 35;
+      // Only award quality bonus if the server has genuine zero-buffer throughput (responsivenessScore >= 500)
+      const qualityBonus =
+        m.responsivenessScore >= 500
+          ? Math.min(90, ((s.qualityScore ?? 720) / 2160) * 90)
+          : Math.min(35, ((s.qualityScore ?? 720) / 2160) * 35);
+      const audioBonus = (s.audioScore ?? 0) * 30;
       const combinedMeta = `${s.name} ${s.title} ${s.url || ''}`.toLowerCase();
       // Layer 3: Reward fast-seek MP4/HLS containers and browser-native AAC/Opus audio codecs
       const nativeContainerBonus =

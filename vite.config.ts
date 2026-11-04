@@ -1613,7 +1613,7 @@ export function registerStreamzApiMiddlewares(
             // If it succeeded or if we only need a 1-byte ping, measure TTFB without downloading 64 KB.
             const targetByteRange = isPingOnly ? 'bytes=0-1023' : 'bytes=0-65535';
             const minTargetBytes = isPingOnly ? 1 : 65536;
-            const timeoutMs = isPingOnly ? 2400 : 3200;
+            const timeoutMs = isPingOnly ? 2000 : 2600;
 
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -1629,15 +1629,28 @@ export function registerStreamzApiMiddlewares(
               signal: controller.signal,
             });
 
-            const ttfbMs = Math.max(8, Math.min(unwrapMs, Date.now() - fetchStart));
-            const statusOk = resp.status >= 200 && resp.status < 300;
+            const cdnFirstByteMs = Math.max(8, Date.now() - fetchStart);
+            // True end-to-end TTFB: use cdnFirstByteMs + a capped unwrap overhead so concurrent batch contention doesn't distort CDN ping
+            const ttfbMs =
+              resolvedUrl !== rawUrl && unwrapMs > 25
+                ? cdnFirstByteMs + Math.min(unwrapMs, 650)
+                : cdnFirstByteMs;
+            let statusOk = resp.status >= 200 && resp.status < 300;
+            const contentType = (resp.headers.get('content-type') || '').toLowerCase();
             let bytesRead = 0;
+            let firstChunkText = '';
+            const bodyTransferStart = Date.now();
 
             if (statusOk && resp.body) {
               const reader = resp.body.getReader();
               while (bytesRead < minTargetBytes) {
                 const { done, value } = await reader.read();
                 if (done || !value) break;
+                if (bytesRead === 0 && value.byteLength > 0) {
+                  firstChunkText = Buffer.from(
+                    value.subarray(0, Math.min(2048, value.byteLength)),
+                  ).toString('utf8');
+                }
                 bytesRead += value.byteLength;
                 if (bytesRead >= minTargetBytes) break;
               }
@@ -1645,12 +1658,54 @@ export function registerStreamzApiMiddlewares(
             } else {
               await resp.body?.cancel().catch(() => {});
             }
+
+            // If this is an HLS M3U8 playlist (#EXTM3U), verify its first segment URL is actually reachable (not 403 Forbidden like broken Vidy nodes)
+            if (
+              !isPingOnly &&
+              statusOk &&
+              (contentType.includes('mpegurl') || firstChunkText.trimStart().startsWith('#EXTM3U'))
+            ) {
+              const segMatch = firstChunkText.match(/https?:\/\/[^\s"',\r\n]+/);
+              if (segMatch && isSafePublicUrl(segMatch[0], false)) {
+                try {
+                  const segResp = await fetch(segMatch[0], {
+                    method: 'GET',
+                    headers: {
+                      'User-Agent':
+                        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+                      Range: 'bytes=0-32767',
+                    },
+                    redirect: 'follow',
+                    signal: controller.signal,
+                  });
+                  if (segResp.status < 200 || segResp.status >= 300) {
+                    statusOk = false;
+                  } else if (segResp.body) {
+                    const segReader = segResp.body.getReader();
+                    while (bytesRead < 32768) {
+                      const { done, value } = await segReader.read();
+                      if (done || !value) break;
+                      bytesRead += value.byteLength;
+                    }
+                    await segReader.cancel().catch(() => {});
+                  }
+                } catch {
+                  statusOk = false;
+                }
+              }
+            }
             clearTimeout(timeoutId);
 
-            const totalElapsedSec = Math.max(0.015, (Date.now() - fetchStart) / 1000);
+            // Measure pure payload transfer throughput (after HTTP headers arrive) + blend with total response time
+            const bodyTransferSec = Math.max(0.012, (Date.now() - bodyTransferStart) / 1000);
+            const totalFetchSec = Math.max(0.025, (Date.now() - fetchStart) / 1000);
+            const burstMbps =
+              bytesRead > 0 ? (bytesRead * 8) / (bodyTransferSec * 1_000_000) : 0;
+            const sustainedMbps =
+              bytesRead > 0 ? (bytesRead * 8) / (totalFetchSec * 1_000_000) : 0;
             const speedMbps =
               bytesRead > 0
-                ? Number(((bytesRead * 8) / (totalElapsedSec * 1_000_000)).toFixed(2))
+                ? Number((burstMbps * 0.65 + sustainedMbps * 0.35).toFixed(2))
                 : 0;
 
             if (!statusOk || bytesRead === 0) {
@@ -1673,21 +1728,30 @@ export function registerStreamzApiMiddlewares(
             const estimatedRequiredMbps =
               sizeBytes > 0
                 ? Math.max(1.5, (sizeBytes * 8) / (7200 * 1_000_000))
-                : 4.0;
+                : 6.0;
             const headroomRatio = speedMbps / estimatedRequiredMbps;
 
-            // Compute responsiveness score: reward low TTFB, high throughput headroom, and HTTPS
-            const latencyBonus = Math.max(0, 600 - Math.min(600, ttfbMs * 0.45));
-            const throughputBonus = Math.min(450, headroomRatio * 140 + speedMbps * 10);
+            // Continuous latency curve (never flattens at 1700ms so a 900ms server ALWAYS beats a 2200ms or 6000ms server!)
+            const latencyScore = Math.round(900 - Math.min(850, ttfbMs * 0.22));
+            const throughputBonus = Math.min(480, Math.round(headroomRatio * 150 + speedMbps * 12));
+            const zeroBufferAdjustment = isPingOnly
+              ? 0
+              : headroomRatio >= 1.15
+                ? 240
+                : headroomRatio < 0.45
+                  ? -360
+                  : headroomRatio < 0.85
+                    ? -160
+                    : 0;
             const httpsBonus = isHttps ? 200 : -350;
             const responsivenessScore = Math.round(
-              latencyBonus + throughputBonus + httpsBonus,
+              latencyScore + throughputBonus + zeroBufferAdjustment + httpsBonus,
             );
 
             const statusBadge = !isHttps
               ? 'HTTP Only'
-              : ttfbMs <= 420 && headroomRatio >= 1.1
-                ? `⚡ ${ttfbMs}ms · Fast`
+              : !isPingOnly && ttfbMs <= 1100 && headroomRatio >= 1.1
+                ? `⚡ ${ttfbMs}ms`
                 : `${ttfbMs}ms`;
 
             const okRes = {

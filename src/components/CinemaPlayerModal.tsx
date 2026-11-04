@@ -276,13 +276,19 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     return media.imdbId || media.id;
   }, [media.id, media.imdbId, media.type, selectedEpisode]);
 
-  const [streams, setStreams] = useState<StremioStreamItem[]>(() =>
-    initialStreams ? sortStreamsByDecreasingQuality(initialStreams) : [],
-  );
+  const [streams, setStreams] = useState<StremioStreamItem[]>(() => {
+    if (!initialStreams) return [];
+    const hydrated = applyCachedServerHealth(initialStreams);
+    return hydrated.some((s) => s.isTopResponsive)
+      ? hydrated
+      : applyCachedServerHealth(sortStreamsByDecreasingQuality(hydrated));
+  });
   const [loadingStreams, setLoadingStreams] = useState(false);
-  const [activeStream, setActiveStream] = useState<StremioStreamItem | null>(
-    initialStream ?? initialStreams?.[0] ?? null,
-  );
+  const [activeStream, setActiveStream] = useState<StremioStreamItem | null>(() => {
+    if (initialStream) return initialStream;
+    const preRanked = initialStreams?.find((s) => s.isTopResponsive && !s.unreachable);
+    return preRanked ?? null;
+  });
 
   // Audio Track / Multi-Language state (probed via FFmpeg or HLS audioTracks)
   const [probedAudioTracks, setProbedAudioTracks] = useState<ProbedAudioTrack[]>([]);
@@ -582,6 +588,31 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       }
     };
 
+    const rankWithTimeout = async (
+      candidateList: StremioStreamItem[],
+    ): Promise<StremioStreamItem[]> => {
+      try {
+        return await Promise.race([
+          rankStreamsByResponsiveness(candidateList),
+          new Promise<StremioStreamItem[]>((resolve) =>
+            window.setTimeout(() => resolve(candidateList), 3800),
+          ),
+        ]);
+      } catch {
+        return candidateList;
+      }
+    };
+
+    const pickBestPlayableStream = (
+      list: StremioStreamItem[],
+    ): StremioStreamItem | null =>
+      list.find((s) => s.isTopResponsive && !s.unreachable) ??
+      list.find((s) => s.kind === 'direct' && !s.isPromo && !s.unreachable) ??
+      list.find((s) => s.kind === 'direct' && !s.isPromo) ??
+      list.find((s) => s.kind === 'youtube') ??
+      list[0] ??
+      null;
+
     const loadStreams = async () => {
       if (
         initialStreams &&
@@ -593,43 +624,37 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         const orderedInitial = hasRankedWinner
           ? hydratedInitial
           : applyCachedServerHealth(sortStreamsByDecreasingQuality(hydratedInitial));
+
+        if (hasRankedWinner || initialStream) {
+          setStreams(orderedInitial);
+          setActiveStream((prev) => prev ?? initialStream ?? pickBestPlayableStream(orderedInitial));
+          if (!hasRankedWinner) {
+            rankStreamsByResponsiveness(orderedInitial)
+              .then((ranked) => {
+                if (cancelled || ranked.length === 0) return;
+                setStreams(ranked);
+                void pingRemainingServersInPlace(ranked);
+              })
+              .catch(() => {});
+          } else {
+            void pingRemainingServersInPlace(orderedInitial);
+          }
+          return;
+        }
+
+        // Wait for server benchmark to crown the ⚡ Fastest zero-buffer server BEFORE starting playback
+        // so the player never starts on an un-ranked stream and never restarts buffering a few seconds later!
+        setLoadingStreams(true);
         setStreams(orderedInitial);
-        setActiveStream((prev) => {
-          if (prev) return prev;
-          if (initialStream) return initialStream;
-          return (
-            orderedInitial.find((s) => s.isTopResponsive && !s.unreachable) ??
-            orderedInitial.find(
-              (s) => s.kind === 'direct' && !s.isPromo && !s.unreachable,
-            ) ??
-            orderedInitial.find((s) => s.kind === 'direct' && !s.isPromo) ??
-            orderedInitial.find((s) => s.kind === 'youtube') ??
-            orderedInitial[0] ??
-            null
-          );
-        });
-        if (!hasRankedWinner) {
-          rankStreamsByResponsiveness(orderedInitial)
-            .then((ranked) => {
-              if (cancelled || ranked.length === 0) return;
-              setStreams(ranked);
-              // Only promote activeStream to the ⚡ Fastest winner if playback hasn't started yet
-              // and the user didn't manually pick a specific server. Never interrupt active playback!
-              const topFastest = ranked.find((s) => s.isTopResponsive && !s.unreachable);
-              if (
-                topFastest &&
-                !hasStartedPlaybackRef.current &&
-                !userManuallySelectedStreamRef.current
-              ) {
-                setActiveStream((prev) =>
-                  prev?.id === topFastest.id ? prev : topFastest,
-                );
-              }
-              void pingRemainingServersInPlace(ranked);
-            })
-            .catch(() => {});
-        } else {
-          void pingRemainingServersInPlace(orderedInitial);
+        try {
+          const ranked = await rankWithTimeout(orderedInitial);
+          if (cancelled) return;
+          const finalRanked = ranked.length > 0 ? ranked : orderedInitial;
+          setStreams(finalRanked);
+          setActiveStream((prev) => prev ?? pickBestPlayableStream(finalRanked));
+          void pingRemainingServersInPlace(finalRanked);
+        } finally {
+          if (!cancelled) setLoadingStreams(false);
         }
         return;
       }
@@ -644,39 +669,40 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         );
         if (cancelled) return;
         const sorted = sortStreamsByDecreasingQuality(resolved);
-        setStreams(sorted);
-        setActiveStream((prev) => {
-          if (prev && sorted.some((r) => r.url === prev.url && r.name === prev.name)) {
-            return prev;
-          }
-          if (initialStream) return initialStream;
-          return (
-            sorted.find((s) => s.kind === 'direct' && !s.isPromo && !s.unreachable) ??
-            sorted.find((s) => s.kind === 'direct' && !s.isPromo) ??
-            sorted.find((s) => s.kind === 'youtube') ??
-            sorted[0] ??
-            null
-          );
-        });
-        if (sorted.length > 0) {
+        if (sorted.length === 0) {
+          setStreams([]);
+          return;
+        }
+
+        if (initialStream) {
+          setStreams(sorted);
+          setActiveStream(initialStream);
           rankStreamsByResponsiveness(sorted)
             .then((ranked) => {
               if (cancelled || ranked.length === 0) return;
               setStreams(ranked);
-              const topFastest = ranked.find((s) => s.isTopResponsive && !s.unreachable);
-              if (
-                topFastest &&
-                !hasStartedPlaybackRef.current &&
-                !userManuallySelectedStreamRef.current
-              ) {
-                setActiveStream((prev) =>
-                  prev?.id === topFastest.id ? prev : topFastest,
-                );
-              }
               void pingRemainingServersInPlace(ranked);
             })
             .catch(() => {});
+          return;
         }
+
+        setStreams(sorted);
+        const ranked = await rankWithTimeout(sorted);
+        if (cancelled) return;
+        const finalRanked = ranked.length > 0 ? ranked : sorted;
+        setStreams(finalRanked);
+        setActiveStream((prev) => {
+          if (
+            prev &&
+            userManuallySelectedStreamRef.current &&
+            finalRanked.some((r) => r.url === prev.url && r.name === prev.name)
+          ) {
+            return prev;
+          }
+          return pickBestPlayableStream(finalRanked);
+        });
+        void pingRemainingServersInPlace(finalRanked);
       } finally {
         if (!cancelled) setLoadingStreams(false);
       }

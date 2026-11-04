@@ -3881,18 +3881,15 @@ export const App: React.FC = () => {
                       onClick={() => {
                         const target = dossierItem;
                         const currentStreams = [...dossierStreams];
-                        const bestStream =
-                          currentStreams.find(
-                            (s) => s.kind === 'direct' && !s.isPromo && !s.unreachable,
-                          ) ??
-                          currentStreams.find((s) => s.kind === 'direct' && !s.isPromo) ??
-                          currentStreams[0];
+                        const preRankedBest = currentStreams.find(
+                          (s) => s.isTopResponsive && !s.unreachable,
+                        );
                         const resumePos = progressMap[target.id]?.positionSec ?? 0;
                         setDossierItem(null);
                         startScreeningItem(
                           target,
                           target.videos[0],
-                          bestStream,
+                          preRankedBest,
                           resumePos,
                           currentStreams,
                         );
@@ -3915,17 +3912,14 @@ export const App: React.FC = () => {
                         onClick={() => {
                           const target = dossierItem;
                           const currentStreams = [...dossierStreams];
-                          const bestStream =
-                            currentStreams.find(
-                              (s) => s.kind === 'direct' && !s.isPromo && !s.unreachable,
-                            ) ??
-                            currentStreams.find((s) => s.kind === 'direct' && !s.isPromo) ??
-                            currentStreams[0];
+                          const preRankedBest = currentStreams.find(
+                            (s) => s.isTopResponsive && !s.unreachable,
+                          );
                           setDossierItem(null);
                           startScreeningItem(
                             target,
                             target.videos[0],
-                            bestStream,
+                            preRankedBest,
                             0,
                             currentStreams,
                           );
