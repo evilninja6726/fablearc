@@ -875,5 +875,38 @@ describe('Strix-Style E2E & Security Audit Suite', () => {
     expect(cinemaPlayerTsx).toContain('sceneBookmarks');
     expect(appTsx).toContain('watchlist-collection-tabs');
     expect(appTsx).toContain('handleSurpriseMePick');
+
+    // 5. Verify Background Partial Server Speed Benchmark (/api/media-health-batch), rankStreamsByResponsiveness, and Full-Viewport Details Page
+    const stylesCss = fs.readFileSync(path.join(rootDir, 'src/styles.css'), 'utf8');
+    expect(appTsx).toContain('rankStreamsByResponsiveness');
+    expect(appTsx).toContain('fastest-server-badge');
+    expect(stylesCss).toContain('max-width: 100vw;');
+
+    const { token } = ctx.db.registerUser({
+      displayName: 'Health Tester',
+      email: 'healthtester@fablearc.test',
+      password: 'ValidPass123!',
+    });
+
+    const healthResp = await fetch(`${ctx.baseUrl}/api/media-health-batch`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        candidates: [
+          { id: 'ssrf-blocked', url: 'http://127.0.0.1:8080/internal.mkv', sizeBytes: 1000 },
+        ],
+      }),
+    });
+    expect(healthResp.status).toBe(200);
+    const healthJson = (await healthResp.json()) as {
+      results: Array<{ id: string; ok: boolean; unreachable: boolean; statusBadge: string }>;
+    };
+    expect(healthJson.results).toHaveLength(1);
+    expect(healthJson.results[0].id).toBe('ssrf-blocked');
+    expect(healthJson.results[0].ok).toBe(false);
+    expect(healthJson.results[0].statusBadge).toBe('Blocked');
   });
 });

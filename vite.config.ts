@@ -1465,9 +1465,9 @@ export function registerStreamzApiMiddlewares(
                 '-user_agent',
                 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
                 '-analyzeduration',
-                '1800000',
+                '450000',
                 '-probesize',
-                '2000000',
+                '450000',
                 '-i',
                 loopbackInputUrl,
               ],
@@ -1516,6 +1516,202 @@ export function registerStreamzApiMiddlewares(
       const msg = err instanceof Error ? err.message : 'Probe failed';
       const status = msg.startsWith('Blocked unsafe') ? 400 : 500;
       sendJson(res, status, { error: msg });
+    }
+  });
+
+  // 2b. Background Partial Server Speed & Responsiveness Benchmark (Requires Auth)
+  // Tests up to 6 candidate stream servers in parallel using a tiny bounded 64 KB byte-range check (Range: bytes=0-65535).
+  // Measures TTFB latency (ms), burst throughput (Mbps), HTTPS compatibility, and reachability.
+  // Returns a tiny ~400-byte JSON payload so Render outbound HTTP Response bandwidth is 0 MB.
+  middlewares.use('/api/media-health-batch', async (req, res) => {
+    try {
+      const urlObj = new URL(req.url || '', 'http://localhost');
+      const token = extractBearerToken(req, urlObj);
+      const userId = await resolveUserIdWithCloudSync(token);
+      if (!userId) {
+        sendJson(res, 401, { error: 'Authentication required to benchmark media servers.' });
+        return;
+      }
+
+      if (req.method !== 'POST') {
+        sendJson(res, 405, { error: 'Method not allowed' });
+        return;
+      }
+
+      const body = await readJsonBody<{
+        candidates?: Array<{ id?: string; url?: string; sizeBytes?: number }>;
+      }>(req);
+
+      const rawCandidates = Array.isArray(body?.candidates)
+        ? body.candidates.slice(0, 6)
+        : [];
+
+      const results = await Promise.all(
+        rawCandidates.map(async (item) => {
+          const id = String(item?.id || '').trim();
+          const rawUrl = String(item?.url || '').trim();
+          const sizeBytes = Number(item?.sizeBytes || 0);
+
+          if (!id || !rawUrl || !isSafePublicUrl(rawUrl, false)) {
+            return {
+              id,
+              ok: false,
+              unreachable: true,
+              isHttps: false,
+              ttfbMs: 9999,
+              speedMbps: 0,
+              responsivenessScore: -1000,
+              statusBadge: 'Blocked',
+            };
+          }
+
+          const cacheKey = `health:${rawUrl}`;
+          const cached = globalCache.getSync<{
+            id: string;
+            ok: boolean;
+            unreachable: boolean;
+            isHttps: boolean;
+            resolvedUrl: string;
+            ttfbMs: number;
+            speedMbps: number;
+            responsivenessScore: number;
+            statusBadge: string;
+          }>(cacheKey);
+          if (cached) {
+            return { ...cached, id };
+          }
+
+          const startAt = Date.now();
+          try {
+            const unwrapped = await unwrapMediaStreamUrlWithStatus(rawUrl);
+            const resolvedUrl = unwrapped.url;
+            const isHttps = resolvedUrl.toLowerCase().startsWith('https://');
+
+            if (unwrapped.unreachable || !isSafePublicUrl(resolvedUrl, false)) {
+              const deadRes = {
+                id,
+                ok: false,
+                unreachable: true,
+                isHttps,
+                resolvedUrl,
+                ttfbMs: 9999,
+                speedMbps: 0,
+                responsivenessScore: -500,
+                statusBadge: 'Offline',
+              };
+              globalCache.setSync(cacheKey, deadRes, 300);
+              return deadRes;
+            }
+
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 3500);
+            const fetchStart = Date.now();
+            const resp = await fetch(resolvedUrl, {
+              method: 'GET',
+              headers: {
+                'User-Agent':
+                  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+                Range: 'bytes=0-65535',
+              },
+              redirect: 'follow',
+              signal: controller.signal,
+            });
+
+            const ttfbMs = Math.max(10, Date.now() - fetchStart);
+            const statusOk = resp.status >= 200 && resp.status < 300;
+            let bytesRead = 0;
+
+            if (statusOk && resp.body) {
+              const reader = resp.body.getReader();
+              while (bytesRead < 65536) {
+                const { done, value } = await reader.read();
+                if (done || !value) break;
+                bytesRead += value.byteLength;
+                if (bytesRead >= 65536) break;
+              }
+              await reader.cancel().catch(() => {});
+            } else {
+              await resp.body?.cancel().catch(() => {});
+            }
+            clearTimeout(timeoutId);
+
+            const totalElapsedSec = Math.max(0.015, (Date.now() - fetchStart) / 1000);
+            const speedMbps =
+              bytesRead > 0
+                ? Number(((bytesRead * 8) / (totalElapsedSec * 1_000_000)).toFixed(2))
+                : 0;
+
+            if (!statusOk || bytesRead === 0) {
+              const failRes = {
+                id,
+                ok: false,
+                unreachable: true,
+                isHttps,
+                resolvedUrl,
+                ttfbMs,
+                speedMbps: 0,
+                responsivenessScore: -400,
+                statusBadge: 'Offline',
+              };
+              globalCache.setSync(cacheKey, failRes, 300);
+              return failRes;
+            }
+
+            // Estimate required bitrate for zero buffering (assume ~7200s 2-hour movie if sizeBytes > 0)
+            const estimatedRequiredMbps =
+              sizeBytes > 0
+                ? Math.max(1.5, (sizeBytes * 8) / (7200 * 1_000_000))
+                : 4.0;
+            const headroomRatio = speedMbps / estimatedRequiredMbps;
+
+            // Compute responsiveness score: reward low TTFB, high throughput headroom, and HTTPS
+            const latencyBonus = Math.max(0, 600 - Math.min(600, ttfbMs * 0.45));
+            const throughputBonus = Math.min(450, headroomRatio * 140 + speedMbps * 10);
+            const httpsBonus = isHttps ? 200 : -350;
+            const responsivenessScore = Math.round(
+              latencyBonus + throughputBonus + httpsBonus,
+            );
+
+            const statusBadge = !isHttps
+              ? 'HTTP Only'
+              : ttfbMs <= 420 && headroomRatio >= 1.1
+                ? `⚡ ${ttfbMs}ms · Fast`
+                : `${ttfbMs}ms`;
+
+            const okRes = {
+              id,
+              ok: isHttps,
+              unreachable: false,
+              isHttps,
+              resolvedUrl,
+              ttfbMs,
+              speedMbps,
+              responsivenessScore,
+              statusBadge,
+            };
+            globalCache.setSync(cacheKey, okRes, 900);
+            return okRes;
+          } catch {
+            const elapsed = Date.now() - startAt;
+            return {
+              id,
+              ok: false,
+              unreachable: true,
+              isHttps: false,
+              ttfbMs: elapsed,
+              speedMbps: 0,
+              responsivenessScore: -300,
+              statusBadge: 'Slow / Timeout',
+            };
+          }
+        }),
+      );
+
+      sendJson(res, 200, { results });
+    } catch (err) {
+      sendJson(res, 500, {
+        error: err instanceof Error ? err.message : 'Server health check failed',
+      });
     }
   });
 
@@ -1612,11 +1808,11 @@ export function registerStreamzApiMiddlewares(
         '-protocol_whitelist',
         'file,http,https,tcp,tls,crypto,pipe,fd,data,hls',
         '-fflags',
-        '+genpts+igndts+discardcorrupt',
+        '+nobuffer+flush_packets+genpts+igndts+discardcorrupt',
         '-analyzeduration',
-        '1200000',
+        '400000',
         '-probesize',
-        '1500000',
+        '384000',
         '-user_agent',
         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
         '-reconnect',

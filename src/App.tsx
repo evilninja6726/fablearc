@@ -44,6 +44,7 @@ import {
   fetchStremioManifest,
   InstalledAddon,
   parseStreamingCatalogsConfig,
+  rankStreamsByResponsiveness,
   sortStreamsByDecreasingQuality,
   STREAMING_CATALOG_COUNTRIES,
   STREAMING_CATALOG_SERVICES,
@@ -488,6 +489,7 @@ export const App: React.FC = () => {
   const [dossierLoadingMeta, setDossierLoadingMeta] = useState(false);
   const [dossierStreams, setDossierStreams] = useState<StremioStreamItem[]>([]);
   const [dossierLoadingStreams, setDossierLoadingStreams] = useState(false);
+  const [dossierBenchmarkingServers, setDossierBenchmarkingServers] = useState(false);
   const [dossierSelectedSeason, setDossierSelectedSeason] = useState<number>(1);
   const [dossierEpisodeQuery, setDossierEpisodeQuery] = useState<string>('');
   const [dossierShowStreams, setDossierShowStreams] = useState<boolean>(false);
@@ -546,6 +548,7 @@ export const App: React.FC = () => {
     media: StremioMediaItem;
     episode?: StremioEpisodeVideo;
     stream?: StremioStreamItem;
+    streams?: StremioStreamItem[];
     resumeSec: number;
   } | null>(null);
 
@@ -1370,8 +1373,23 @@ export const App: React.FC = () => {
         targetVideoId,
         finalItem,
       );
-      setDossierStreams(sortStreamsByDecreasingQuality(streams));
+      const initialSorted = sortStreamsByDecreasingQuality(streams);
+      setDossierStreams(initialSorted);
       setDossierLoadingStreams(false);
+
+      // Background partial server speed & health benchmark:
+      // Tests top candidate servers (64 KB Range check), promotes the fastest zero-buffer server to #1,
+      // keeps remaining servers in decreasing quality order, and pre-warms /api/media-probe for the #1 server!
+      if (initialSorted.length > 0) {
+        setDossierBenchmarkingServers(true);
+        rankStreamsByResponsiveness(initialSorted)
+          .then((ranked) => {
+            setDossierStreams((prev) => (prev.length > 0 ? ranked : prev));
+          })
+          .finally(() => {
+            setDossierBenchmarkingServers(false);
+          });
+      }
     },
     [addons, currentUser],
   );
@@ -1383,6 +1401,7 @@ export const App: React.FC = () => {
       episode?: StremioEpisodeVideo,
       stream?: StremioStreamItem,
       resumeSec = 0,
+      preloadedStreams?: StremioStreamItem[],
     ) => {
       if (!currentUser) {
         setAuthModalOpen(true);
@@ -1397,6 +1416,7 @@ export const App: React.FC = () => {
         media: targetItem,
         episode: episode ?? targetItem.videos[0],
         stream,
+        streams: preloadedStreams,
         resumeSec,
       });
     },
@@ -3776,12 +3796,22 @@ export const App: React.FC = () => {
                       className="neon-primary-btn details-play-main-btn"
                       onClick={() => {
                         const target = dossierItem;
+                        const currentStreams = [...dossierStreams];
                         const bestStream =
-                          dossierStreams.find((s) => s.kind === 'direct' && !s.isPromo) ??
-                          dossierStreams[0];
+                          currentStreams.find(
+                            (s) => s.kind === 'direct' && !s.isPromo && !s.unreachable,
+                          ) ??
+                          currentStreams.find((s) => s.kind === 'direct' && !s.isPromo) ??
+                          currentStreams[0];
                         const resumePos = progressMap[target.id]?.positionSec ?? 0;
                         setDossierItem(null);
-                        startScreeningItem(target, target.videos[0], bestStream, resumePos);
+                        startScreeningItem(
+                          target,
+                          target.videos[0],
+                          bestStream,
+                          resumePos,
+                          currentStreams,
+                        );
                       }}
                     >
                       <Play size={18} fill="currentColor" />
@@ -3800,11 +3830,21 @@ export const App: React.FC = () => {
                         className="glass-secondary-btn"
                         onClick={() => {
                           const target = dossierItem;
+                          const currentStreams = [...dossierStreams];
                           const bestStream =
-                            dossierStreams.find((s) => s.kind === 'direct' && !s.isPromo) ??
-                            dossierStreams[0];
+                            currentStreams.find(
+                              (s) => s.kind === 'direct' && !s.isPromo && !s.unreachable,
+                            ) ??
+                            currentStreams.find((s) => s.kind === 'direct' && !s.isPromo) ??
+                            currentStreams[0];
                           setDossierItem(null);
-                          startScreeningItem(target, target.videos[0], bestStream, 0);
+                          startScreeningItem(
+                            target,
+                            target.videos[0],
+                            bestStream,
+                            0,
+                            currentStreams,
+                          );
                         }}
                       >
                         <RefreshCw size={15} />
@@ -3839,7 +3879,9 @@ export const App: React.FC = () => {
                       <span>
                         {dossierLoadingStreams
                           ? 'Loading Servers…'
-                          : `Servers & Quality (${dossierStreams.length})`}
+                          : dossierBenchmarkingServers
+                            ? `Testing Fastest Server (${dossierStreams.length})…`
+                            : `Servers & Quality (${dossierStreams.length})`}
                       </span>
                     </button>
 
@@ -4061,7 +4103,9 @@ export const App: React.FC = () => {
                   <span className="drawer-label">
                     {dossierLoadingStreams
                       ? 'Finding best quality streams…'
-                      : `Available Servers & Quality (${dossierStreams.length})`}
+                      : dossierBenchmarkingServers
+                        ? `Benchmarking Servers in Background (${dossierStreams.length})…`
+                        : `Available Servers — Fastest & Zero-Buffer First (${dossierStreams.length})`}
                   </span>
                   <div className="dossier-streams-list">
                     {dossierStreams.map((st) => {
@@ -4076,16 +4120,17 @@ export const App: React.FC = () => {
                       return (
                         <div
                           key={st.id}
-                          className="dossier-stream-row"
-                          style={{ cursor: 'pointer' }}
+                          className={`dossier-stream-row ${st.isTopResponsive ? 'top-responsive-server' : ''}`}
+                          style={{ cursor: 'pointer', opacity: st.unreachable ? 0.55 : 1 }}
                           onClick={() => {
                             if (st.kind === 'external' && st.externalUrl) {
                               window.open(st.externalUrl, '_blank', 'noopener,noreferrer');
                               return;
                             }
                             const target = dossierItem;
+                            const currentStreams = [...dossierStreams];
                             setDossierItem(null);
-                            startScreeningItem(target, undefined, st, 0);
+                            startScreeningItem(target, undefined, st, 0, currentStreams);
                           }}
                         >
                           <div style={{ flex: 1, minWidth: 0 }}>
@@ -4098,12 +4143,24 @@ export const App: React.FC = () => {
                                 marginBottom: 4,
                               }}
                             >
+                              {st.isTopResponsive && (
+                                <span className="fastest-server-badge">
+                                  ⚡ Fastest · Zero-Buffer
+                                </span>
+                              )}
                               <span className={`quality-tier-badge ${tierClass}`}>
                                 {st.qualityBadge || st.kind.toUpperCase()}
                               </span>
                               {st.audioBadge && (
                                 <span className="multi-audio-badge">
                                   {st.audioBadge}
+                                </span>
+                              )}
+                              {st.serverStatusBadge && !st.isTopResponsive && (
+                                <span
+                                  className={`server-ping-badge mono ${st.unreachable ? 'offline' : 'online'}`}
+                                >
+                                  {st.serverStatusBadge}
                                 </span>
                               )}
                               <strong>{st.name}</strong>
@@ -4171,9 +4228,11 @@ export const App: React.FC = () => {
           initialEpisode={playingSession.episode}
           initialStream={playingSession.stream}
           initialStreams={
-            dossierItem?.id === playingSession.media.id && dossierStreams.length > 0
-              ? dossierStreams
-              : undefined
+            playingSession.streams && playingSession.streams.length > 0
+              ? playingSession.streams
+              : dossierItem?.id === playingSession.media.id && dossierStreams.length > 0
+                ? dossierStreams
+                : undefined
           }
           initialPositionSec={playingSession.resumeSec}
           onClose={() => {

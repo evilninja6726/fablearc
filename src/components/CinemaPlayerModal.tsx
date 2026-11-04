@@ -40,6 +40,7 @@ import {
   InstalledAddon,
   ProbedAudioTrack,
   probeMediaStream,
+  rankStreamsByResponsiveness,
   sortAudioTracksByLanguagePriority,
   sortStreamsByDecreasingQuality,
   StremioEpisodeVideo,
@@ -539,18 +540,33 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         initialStreams.length > 0 &&
         activeVideoId === initialTargetId
       ) {
-        const sortedInitial = sortStreamsByDecreasingQuality(initialStreams);
-        setStreams(sortedInitial);
+        const hasRankedWinner = initialStreams.some((s) => s.isTopResponsive);
+        const orderedInitial = hasRankedWinner
+          ? initialStreams
+          : sortStreamsByDecreasingQuality(initialStreams);
+        setStreams(orderedInitial);
         setActiveStream((prev) => {
           if (prev) return prev;
           if (initialStream) return initialStream;
           return (
-            sortedInitial.find((s) => s.kind === 'direct' && !s.isPromo) ??
-            sortedInitial.find((s) => s.kind === 'youtube') ??
-            sortedInitial[0] ??
+            orderedInitial.find(
+              (s) => s.kind === 'direct' && !s.isPromo && !s.unreachable,
+            ) ??
+            orderedInitial.find((s) => s.kind === 'direct' && !s.isPromo) ??
+            orderedInitial.find((s) => s.kind === 'youtube') ??
+            orderedInitial[0] ??
             null
           );
         });
+        if (!hasRankedWinner) {
+          rankStreamsByResponsiveness(orderedInitial)
+            .then((ranked) => {
+              if (!cancelled && ranked.length > 0) {
+                setStreams(ranked);
+              }
+            })
+            .catch(() => {});
+        }
         return;
       }
 
@@ -571,12 +587,22 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
           }
           if (initialStream) return initialStream;
           return (
+            sorted.find((s) => s.kind === 'direct' && !s.isPromo && !s.unreachable) ??
             sorted.find((s) => s.kind === 'direct' && !s.isPromo) ??
             sorted.find((s) => s.kind === 'youtube') ??
             sorted[0] ??
             null
           );
         });
+        if (sorted.length > 0) {
+          rankStreamsByResponsiveness(sorted)
+            .then((ranked) => {
+              if (!cancelled && ranked.length > 0) {
+                setStreams(ranked);
+              }
+            })
+            .catch(() => {});
+        }
       } finally {
         if (!cancelled) setLoadingStreams(false);
       }
@@ -742,7 +768,15 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     }
 
     const streamUrl = activeStream.url;
-    setResolvedDirectUrl(null);
+    // Fast-Start Audio & Video: If the background server benchmark already unwrapped the CDN URL,
+    // use it immediately so <video> and <audio> start loading in 0ms in parallel with /api/media-probe!
+    const preResolvedCdn =
+      activeStream.resolvedDirectUrl &&
+      /^https?:\/\//i.test(activeStream.resolvedDirectUrl)
+        ? activeStream.resolvedDirectUrl
+        : streamUrl;
+    setResolvedDirectUrl(preResolvedCdn);
+    setProbedStreamUrl(streamUrl);
 
     const isM3u8 =
       activeStream.isHls || streamUrl.toLowerCase().includes('.m3u8');
@@ -2606,7 +2640,8 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                         <button
                           key={stream.id}
                           type="button"
-                          className={`popover-option-row ${isSelected ? 'selected' : ''}`}
+                          className={`popover-option-row ${isSelected ? 'selected' : ''} ${stream.isTopResponsive ? 'top-responsive-server' : ''}`}
+                          style={{ opacity: stream.unreachable ? 0.55 : 1 }}
                           onClick={() => {
                             if (stream.kind === 'external' && stream.externalUrl) {
                               window.open(stream.externalUrl, '_blank', 'noopener,noreferrer');
@@ -2621,12 +2656,24 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                         >
                           <div className="popover-option-main">
                             <div className="popover-option-title-line">
+                              {stream.isTopResponsive && (
+                                <span className="fastest-server-badge">
+                                  ⚡ Fastest
+                                </span>
+                              )}
                               <span className={`quality-tier-badge ${tierClass}`}>
                                 {stream.qualityBadge || stream.kind.toUpperCase()}
                               </span>
                               {stream.audioBadge && (
                                 <span className="multi-audio-badge">
                                   {stream.audioBadge}
+                                </span>
+                              )}
+                              {stream.serverStatusBadge && !stream.isTopResponsive && (
+                                <span
+                                  className={`server-ping-badge mono ${stream.unreachable ? 'offline' : 'online'}`}
+                                >
+                                  {stream.serverStatusBadge}
                                 </span>
                               )}
                               <strong>{stream.name}</strong>

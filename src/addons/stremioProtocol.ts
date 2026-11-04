@@ -113,6 +113,13 @@ export interface StremioStreamItem {
   sizeBytes?: number;
   sizeLabel?: string;
   isPromo?: boolean;
+  isTopResponsive?: boolean;
+  ttfbMs?: number;
+  speedMbps?: number;
+  responsivenessScore?: number;
+  serverStatusBadge?: string;
+  unreachable?: boolean;
+  resolvedDirectUrl?: string;
 }
 
 export interface StremioSubtitleTrack {
@@ -1568,6 +1575,138 @@ export function buildTranscodedStreamUrl(
   const modeParam = mode === 'audio' ? '&mode=audio' : '';
   const backendOrigin = getCloudBackendOrigin();
   return `${backendOrigin}/api/media-stream?url=${encodeURIComponent(streamUrl)}&audioTrack=${audioTrackIndex}&start=${roundedStart}${modeParam}${tokenParam}`;
+}
+
+export interface ServerHealthMetric {
+  id: string;
+  ok: boolean;
+  unreachable: boolean;
+  isHttps: boolean;
+  resolvedUrl?: string;
+  ttfbMs: number;
+  speedMbps: number;
+  responsivenessScore: number;
+  statusBadge: string;
+}
+
+/**
+ * Benchmarks up to 6 candidate stream servers in the background with a partial 64 KB Range check
+ * via `/api/media-health-batch` (costs ~400 bytes of JSON on Render outbound HTTP Responses),
+ * promotes the single most responsive zero-buffer server to the #1 top slot (`isTopResponsive: true`),
+ * pushes confirmed dead/offline servers to the bottom, and preserves the exact decreasing quality +
+ * multi-audio sorting for all remaining servers!
+ */
+export async function rankStreamsByResponsiveness(
+  streams: StremioStreamItem[],
+  explicitToken?: string,
+): Promise<StremioStreamItem[]> {
+  const sortedBase = sortStreamsByDecreasingQuality(streams);
+  const directCandidates = sortedBase
+    .filter((s) => s.kind === 'direct' && !s.isPromo && Boolean(s.url))
+    .slice(0, 6);
+
+  if (directCandidates.length === 0) {
+    return sortedBase;
+  }
+
+  try {
+    const authToken = explicitToken ?? getClientAuthToken();
+    const backendOrigin = getCloudBackendOrigin();
+    const resp = await fetch(`${backendOrigin}/api/media-health-batch`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+      },
+      body: JSON.stringify({
+        candidates: directCandidates.map((c) => ({
+          id: c.id,
+          url: c.url,
+          sizeBytes: c.sizeBytes ?? 0,
+        })),
+      }),
+    });
+
+    if (!resp.ok) {
+      return sortedBase;
+    }
+
+    const payload = (await resp.json()) as { results?: ServerHealthMetric[] };
+    const metrics = Array.isArray(payload?.results) ? payload.results : [];
+    if (metrics.length === 0) {
+      return sortedBase;
+    }
+
+    const metricById = new Map<string, ServerHealthMetric>();
+    for (const m of metrics) {
+      if (m && typeof m.id === 'string') {
+        metricById.set(m.id, m);
+      }
+    }
+
+    // Annotate streams with measured TTFB, speed, and reachability
+    const annotated = sortedBase.map((s) => {
+      const m = metricById.get(s.id);
+      if (!m) return { ...s, isTopResponsive: false };
+      return {
+        ...s,
+        isTopResponsive: false,
+        ttfbMs: m.ttfbMs,
+        speedMbps: m.speedMbps,
+        responsivenessScore: m.responsivenessScore,
+        serverStatusBadge: m.statusBadge,
+        unreachable: m.unreachable || !m.ok,
+        resolvedDirectUrl: m.resolvedUrl || s.url,
+      };
+    });
+
+    // Identify the best healthy server among the benchmarked candidates
+    // Combine responsivenessScore with a slight quality tie-breaker so high-res fast servers win
+    let bestStreamId: string | null = null;
+    let bestCompositeScore = -Infinity;
+
+    for (const s of annotated) {
+      const m = metricById.get(s.id);
+      if (!m || !m.ok || m.unreachable || !m.isHttps) continue;
+      const qualityBonus = Math.min(180, ((s.qualityScore ?? 720) / 2160) * 180);
+      const audioBonus = (s.audioScore ?? 0) * 35;
+      const composite = m.responsivenessScore + qualityBonus + audioBonus;
+      if (composite > bestCompositeScore) {
+        bestCompositeScore = composite;
+        bestStreamId = s.id;
+      }
+    }
+
+    if (!bestStreamId) {
+      return annotated;
+    }
+
+    const winner = annotated.find((s) => s.id === bestStreamId);
+    if (!winner) {
+      return annotated;
+    }
+
+    const topWinner: StremioStreamItem = {
+      ...winner,
+      isTopResponsive: true,
+    };
+
+    // Remaining healthy/untested streams stay in exact decreasing quality order,
+    // while confirmed unreachable/HTTP-only streams are demoted below healthy direct streams
+    const others = annotated.filter((s) => s.id !== bestStreamId);
+    const healthyOrUntested = others.filter((s) => !s.unreachable);
+    const demotedDead = others.filter((s) => s.unreachable);
+
+    // Pre-warm /api/media-probe for the winning #1 server in the background so audio tracks load in 0ms on Play!
+    if (topWinner.url) {
+      probeMediaStream(topWinner.url, authToken ?? undefined).catch(() => {});
+    }
+
+    return [topWinner, ...healthyOrUntested, ...demotedDead];
+  } catch {
+    return sortedBase;
+  }
 }
 
 /**
