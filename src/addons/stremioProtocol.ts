@@ -1438,7 +1438,29 @@ export async function fetchStreamsFromAddons(
           }
 
           if (typeof raw.url === 'string' && raw.url.trim()) {
-            const urlCheck = validateAddonOrStreamUrl(raw.url.trim(), {
+            let candidateStreamUrl = raw.url.trim();
+            // Auto-upgrade http:// stream URLs when they point to the same HTTPS-enabled addon host
+            // (e.g. HdHub returning `http://hdhub.thevolecitor.qzz.io/resolve/...` even though the host serves HTTPS)
+            if (candidateStreamUrl.startsWith('http://')) {
+              try {
+                const streamParsed = new URL(candidateStreamUrl);
+                const addonParsed = new URL(effectiveManifestUrl);
+                const streamHost = streamParsed.hostname.toLowerCase();
+                if (
+                  (addonParsed.protocol === 'https:' &&
+                    streamHost === addonParsed.hostname.toLowerCase()) ||
+                  streamHost === 'hdhub.thevolecitor.qzz.io' ||
+                  streamHost.endsWith('.workers.dev') ||
+                  streamHost.endsWith('.baby-beamup.club')
+                ) {
+                  streamParsed.protocol = 'https:';
+                  candidateStreamUrl = streamParsed.toString();
+                }
+              } catch {
+                // Keep original candidateStreamUrl
+              }
+            }
+            const urlCheck = validateAddonOrStreamUrl(candidateStreamUrl, {
               requireHttps: false,
               allowExplicitLanMediaServer: false,
             });

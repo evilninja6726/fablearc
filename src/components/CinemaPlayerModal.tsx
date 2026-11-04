@@ -252,7 +252,6 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
 }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
-  const webtorIframeRef = useRef<HTMLIFrameElement | null>(null);
   const [copiedMagnet, setCopiedMagnet] = useState(false);
   const directVideoLoadedUrlRef = useRef<string | null>(null);
   const userPausedRef = useRef<boolean>(false);
@@ -1068,13 +1067,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
   }, [activeStreamId, activeStreamKind, activeStreamUrl]);
 
   // Torrentio P2P (`kind === 'magnet'`) Client-Side Playback Bridge (0.00 Bytes on Render):
-  // 1. Probes local P2P streaming engine (`http://127.0.0.1:11470/<infoHash>/<fileIdx>`) and promotes to native <video> if active.
-  // 2. Performs a safe, zero-eval postMessage handshake with the embedded WebTor HTML5 P2P player iframe.
-  const webtorSessionId = useMemo(
-    () => `fablearc-p2p-${(activeStreamId || 'stream').replace(/[^a-zA-Z0-9_-]/g, '')}`,
-    [activeStreamId],
-  );
-
+  // Probes local P2P streaming engine (`http://127.0.0.1:11470/<infoHash>/<fileIdx>`) and promotes to native <video> if active.
   useEffect(() => {
     const currentStream = activeStreamRef.current;
     setCopiedMagnet(false);
@@ -1084,7 +1077,6 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     setIsBuffering(false);
     setHasStartedPlayback(true);
 
-    // 1. Auto-detect local P2P Streaming Server (Stremio Service / Nuvio Engine on 127.0.0.1:11470)
     if (currentStream.infoHash) {
       const localEngineUrl = `http://127.0.0.1:11470/${currentStream.infoHash}/${currentStream.fileIdx ?? 0}`;
       const abortCtrl = new AbortController();
@@ -1114,93 +1106,10 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         });
     }
 
-    // 2. Safe, Zero-Eval WebTor Embed Handshake (`https://webtor.io/show`)
-    const onWebtorMessage = (event: MessageEvent) => {
-      if (cancelled) return;
-      if (event.origin !== 'https://webtor.io') return;
-      const d = event.data;
-      if (!d || typeof d !== 'object' || d.id !== webtorSessionId) return;
-
-      if (d.name === 'init') {
-        webtorIframeRef.current?.contentWindow?.postMessage(
-          {
-            id: webtorSessionId,
-            name: 'init',
-            data: {
-              baseUrl: 'https://webtor.io',
-              width: '100%',
-              height: '100%',
-              mode: 'video',
-              magnet: currentStream.url,
-              path: currentStream.filename ? `/${currentStream.filename}` : undefined,
-              imdbId: media.imdbId || (media.id.startsWith('tt') ? media.id : undefined),
-              title: selectedEpisode
-                ? `${media.name} — S${selectedEpisode.season}:E${selectedEpisode.episode} ${selectedEpisode.name}`
-                : media.name,
-              poster: media.background || media.poster || null,
-              header: false,
-              controls: true,
-              version: '0.2.19',
-              subtitles: subtitleTracks.slice(0, 8).map((s) => ({
-                srclang: s.lang,
-                label: s.label,
-                src: s.url,
-              })),
-              i18n: {},
-              features: {
-                p2pProgress: true,
-                subtitles: true,
-                settings: true,
-                fullscreen: true,
-              },
-            },
-          },
-          'https://webtor.io',
-        );
-      } else if (d.name === 'current time' && typeof d.data === 'number' && d.data > 1) {
-        const posSec = Number(d.data);
-        setCurrentTimeSec(posSec);
-        onProgressRef.current({
-          mediaId: media.id,
-          mediaName: media.name,
-          mediaType: media.type,
-          poster: media.poster,
-          background: media.background,
-          episodeId: selectedEpisode?.id,
-          episodeLabel: selectedEpisode
-            ? `S${selectedEpisode.season}:E${selectedEpisode.episode} ${selectedEpisode.name}`
-            : undefined,
-          positionSec: posSec,
-          durationSec: nativeDurationSec || probedDurationSec || 7200,
-          updatedAtIso: new Date().toISOString(),
-        });
-      } else if (d.name === 'duration' && typeof d.data === 'number' && d.data > 0) {
-        setNativeDurationSec(Number(d.data));
-      }
-      // Security note: `d.name === 'inject'` is strictly ignored (never eval external code).
-    };
-
-    window.addEventListener('message', onWebtorMessage);
     return () => {
       cancelled = true;
-      window.removeEventListener('message', onWebtorMessage);
     };
-  }, [
-    activeStreamId,
-    activeStreamKind,
-    activeStreamUrl,
-    media.background,
-    media.id,
-    media.imdbId,
-    media.name,
-    media.poster,
-    media.type,
-    nativeDurationSec,
-    probedDurationSec,
-    selectedEpisode,
-    subtitleTracks,
-    webtorSessionId,
-  ]);
+  }, [activeStreamId, activeStreamKind, activeStreamUrl]);
 
   // Download live SRT/VTT content when a subtitle track is selected
   useEffect(() => {
@@ -2789,108 +2698,106 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
           </div>
         )}
 
-        {activeStream?.kind === 'magnet' && activeStream.url && (
-          <div
-            className="youtube-stage-embed"
-            onClick={(e) => e.stopPropagation()}
-            style={{
-              width: '100%',
-              height: '100%',
-              display: 'flex',
-              flexDirection: 'column',
-              position: 'relative',
-              background: '#050608',
-            }}
-          >
-            <iframe
-              ref={webtorIframeRef}
-              id={webtorSessionId}
-              title={activeStream.title}
-              src={`https://webtor.io/show?id=${encodeURIComponent(webtorSessionId)}&mode=video`}
-              style={{ width: '100%', flex: 1, border: 'none' }}
-              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; fullscreen; picture-in-picture"
-              allowFullScreen
-            />
-            <div
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'space-between',
-                gap: 10,
-                flexWrap: 'wrap',
-                padding: '10px 18px',
-                background: 'rgba(9, 11, 16, 0.94)',
-                borderTop: '1px solid rgba(255, 255, 255, 0.08)',
-                zIndex: 12,
-              }}
+        {!loadingStreams &&
+          !activePopover &&
+          activeStream?.kind === 'magnet' &&
+          activeStream.url && (
+          <div className="pause-dossier-overlay" onClick={(e) => e.stopPropagation()}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 6 }}>
+              <span className="fastest-server-badge">
+                {activeStream.serverStatusBadge || 'P2P Swarm'}
+              </span>
+              {activeStream.qualityBadge && (
+                <span className="quality-tier-badge tier-4k">
+                  {activeStream.qualityBadge}
+                </span>
+              )}
+              {activeStream.audioBadge && (
+                <span className="multi-audio-badge">
+                  {activeStream.audioBadge}
+                </span>
+              )}
+              {activeStream.sizeLabel && (
+                <span className="mono size-pill">{activeStream.sizeLabel}</span>
+              )}
+            </div>
+            <h3 className="pause-film-heading">{media.name}</h3>
+            <p className="pause-synopsis" style={{ maxWidth: 640 }}>
+              {activeStream.filename || activeStream.title}
+            </p>
+            <p
+              className="pause-synopsis"
+              style={{ fontSize: '0.82rem', opacity: 0.78, marginTop: 4, maxWidth: 640 }}
             >
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-                <span className="fastest-server-badge">
-                  {activeStream.serverStatusBadge || 'P2P Swarm'}
-                </span>
-                <span
-                  style={{
-                    fontSize: '0.82rem',
-                    color: 'rgba(255,255,255,0.82)',
-                    whiteSpace: 'nowrap',
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis',
-                    maxWidth: 420,
-                  }}
-                >
-                  {activeStream.filename || activeStream.title}
-                </span>
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                {streams.some((s) => s.kind === 'direct' && !s.unreachable) && (
-                  <button
-                    type="button"
-                    className="primary-amber-btn"
-                    style={{ padding: '6px 12px', fontSize: '0.78rem' }}
-                    onClick={() => {
-                      const fastestDirect =
-                        streams.find((s) => s.kind === 'direct' && s.isTopResponsive && !s.unreachable) ||
-                        streams.find((s) => s.kind === 'direct' && !s.unreachable);
-                      if (fastestDirect) {
-                        setActiveStream(fastestDirect);
-                      }
-                    }}
-                  >
-                    <Play size={14} />
-                    <span>Switch to Fastest Direct Server</span>
-                  </button>
-                )}
-                <a
-                  href={activeStream.url}
-                  className="secondary-outline-btn"
-                  style={{ padding: '6px 12px', fontSize: '0.78rem', textDecoration: 'none' }}
-                >
-                  <ExternalLink size={14} />
-                  <span>Open in Stremio / Torrent App</span>
-                </a>
+              BitTorrent P2P stream ({activeStream.addonName}). Web browsers block raw UDP/DHT peer
+              sockets directly — switch to a direct HTTPS server below for instant in-browser playback,
+              or open this P2P swarm in Stremio / VLC / WebTor:
+            </p>
+
+            <div className="hero-cta-row" style={{ marginTop: 14, flexWrap: 'wrap', gap: 10 }}>
+              {streams.some((s) => s.kind === 'direct' && !s.unreachable) && (
                 <button
                   type="button"
-                  className="secondary-outline-btn"
-                  style={{ padding: '6px 12px', fontSize: '0.78rem' }}
+                  className="primary-amber-btn"
                   onClick={() => {
-                    navigator.clipboard?.writeText(activeStream.url!);
-                    setCopiedMagnet(true);
-                    window.setTimeout(() => setCopiedMagnet(false), 2000);
+                    const fastestDirect =
+                      streams.find((s) => s.kind === 'direct' && s.isTopResponsive && !s.unreachable) ||
+                      streams.find((s) => s.kind === 'direct' && !s.unreachable);
+                    if (fastestDirect) {
+                      setActiveStream(fastestDirect);
+                    }
                   }}
                 >
-                  {copiedMagnet ? <Check size={14} /> : <Copy size={14} />}
-                  <span>{copiedMagnet ? 'Copied Magnet!' : 'Copy Magnet'}</span>
+                  <Play size={16} />
+                  <span>Play Fastest Direct Server</span>
                 </button>
-                <button
-                  type="button"
-                  className="secondary-outline-btn"
-                  style={{ padding: '6px 12px', fontSize: '0.78rem' }}
-                  onClick={() => togglePopover('quality')}
-                >
-                  <Layers size={14} />
-                  <span>Servers ({streams.length})</span>
-                </button>
-              </div>
+              )}
+
+              <a
+                href={activeStream.url}
+                className={
+                  streams.some((s) => s.kind === 'direct' && !s.unreachable)
+                    ? 'secondary-outline-btn'
+                    : 'primary-amber-btn'
+                }
+                style={{ textDecoration: 'none' }}
+              >
+                <ExternalLink size={16} />
+                <span>Open in Stremio / Torrent App</span>
+              </a>
+
+              <a
+                href={`https://webtor.io/#/${encodeURIComponent(activeStream.infoHash || '')}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="secondary-outline-btn"
+                style={{ textDecoration: 'none' }}
+              >
+                <ExternalLink size={16} />
+                <span>Stream on WebTor (New Tab)</span>
+              </a>
+
+              <button
+                type="button"
+                className="secondary-outline-btn"
+                onClick={() => {
+                  navigator.clipboard?.writeText(activeStream.url!);
+                  setCopiedMagnet(true);
+                  window.setTimeout(() => setCopiedMagnet(false), 2000);
+                }}
+              >
+                {copiedMagnet ? <Check size={16} /> : <Copy size={16} />}
+                <span>{copiedMagnet ? 'Copied Magnet!' : 'Copy Magnet'}</span>
+              </button>
+
+              <button
+                type="button"
+                className="secondary-outline-btn"
+                onClick={() => togglePopover('quality')}
+              >
+                <Layers size={16} />
+                <span>Choose Server ({streams.length})</span>
+              </button>
             </div>
           </div>
         )}
