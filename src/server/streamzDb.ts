@@ -178,6 +178,8 @@ const DEFAULT_STREAMING_CFG_COMPACT = 'nfx,hbm,dnp,amp,atp::US:1:0:US';
 const AUTHENTICATED_PENGUPLAY_URL =
   process.env.STREAMZ_PENGUPLAY_MANIFEST_URL ||
   'https://pengu.uk/%7B%22auth_token%22%3A%22jBIrOxA27mMz_WvoR_ZCAMR72uZegRCgWJzw9P0IIUQ%22%7D/manifest.json';
+const DEFAULT_TORRENTIO_HINDI_URL =
+  'https://torrentio.strem.fun/language=hindi/manifest.json';
 
 /**
  * Production Cloud PostgreSQL (Neon / Supabase Free Tier) & Turso (LibSQL) Schema DDL
@@ -254,6 +256,9 @@ function normalizeDbManifestUrl(url: string): string {
   const trimmed = url.trim();
   if (/^https?:\/\/pengu\.uk\/manifest\.json$/i.test(trimmed)) {
     return AUTHENTICATED_PENGUPLAY_URL;
+  }
+  if (/^https?:\/\/torrentio\.strem\.fun\/manifest\.json$/i.test(trimmed)) {
+    return DEFAULT_TORRENTIO_HINDI_URL;
   }
   return trimmed;
 }

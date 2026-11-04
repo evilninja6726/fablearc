@@ -912,13 +912,22 @@ function isDirectCorsFastPathUrl(url: string): boolean {
   try {
     const parsed = new URL(url);
     const host = parsed.hostname.toLowerCase();
-    // pengu.uk does not send Access-Control-Allow-Origin headers and must use /api/stremio-proxy
-    if (host === 'pengu.uk' || host.endsWith('.pengu.uk')) {
+    // pengu.uk and st.111477.xyz do not send Access-Control-Allow-Origin headers on /stream/ and must use /api/stremio-proxy
+    if (
+      host === 'pengu.uk' ||
+      host.endsWith('.pengu.uk') ||
+      host === 'st.111477.xyz' ||
+      host.endsWith('.111477.xyz')
+    ) {
       return false;
     }
-    // Public CORS-enabled catalog & metadata CDNs resolve in ~150ms directly from the browser
+    // Public CORS-enabled catalog, metadata & stream addons (including Torrentio & HDHub4u)
+    // resolve directly from the browser with 0 Bytes of Render bandwidth and bypass datacenter IP blocks!
     if (
       host === 'v3-cinemeta.strem.io' ||
+      host === 'torrentio.strem.fun' ||
+      host.endsWith('.strem.fun') ||
+      host === 'hdhub.thevolecitor.qzz.io' ||
       host.endsWith('.baby-beamup.club') ||
       parsed.pathname.includes('/catalog/') ||
       parsed.pathname.endsWith('/manifest.json')
@@ -1430,6 +1439,8 @@ export async function fetchStreamsFromAddons(
             const hash = raw.infoHash.trim().toLowerCase();
             if (/^[a-f0-9]{40}$/i.test(hash)) {
               const dn = encodeURIComponent(mediaItem?.name || videoId);
+              const seedMatch = `${title} ${extraDesc}`.match(/👤\s*(\d+)/);
+              const seedCount = seedMatch ? parseInt(seedMatch[1], 10) : 0;
               results.push({
                 id: `${addon.manifest.id}-magnet-${idx}`,
                 addonId: addon.manifest.id,
@@ -1440,6 +1451,7 @@ export async function fetchStreamsFromAddons(
                 infoHash: hash,
                 fileIdx: typeof raw.fileIdx === 'number' ? raw.fileIdx : undefined,
                 url: `magnet:?xt=urn:btih:${hash}&dn=${dn}`,
+                serverStatusBadge: seedCount > 0 ? `P2P · 👤 ${seedCount}` : 'P2P',
                 ...qualityInfo,
               });
             }
@@ -1759,7 +1771,10 @@ export async function rankStreamsByResponsiveness(
 ): Promise<StremioStreamItem[]> {
   const sortedBase = applyCachedServerHealth(sortStreamsByDecreasingQuality(streams));
   const allDirect = sortedBase.filter(
-    (s) => s.kind === 'direct' && !s.isPromo && Boolean(s.url),
+    (s) =>
+      s.kind === 'direct' &&
+      !s.isPromo &&
+      Boolean(s.url && /^https?:\/\//i.test(s.url)),
   );
 
   if (allDirect.length === 0) {
@@ -1989,7 +2004,12 @@ export async function pingStreamBatch(
 ): Promise<Map<string, ServerHealthMetric>> {
   const resultMap = new Map<string, ServerHealthMetric>();
   const validCandidates = candidates
-    .filter((s) => s.kind === 'direct' && !s.isPromo && Boolean(s.url))
+    .filter(
+      (s) =>
+        s.kind === 'direct' &&
+        !s.isPromo &&
+        Boolean(s.url && /^https?:\/\//i.test(s.url)),
+    )
     .slice(0, 18);
 
   if (validCandidates.length === 0) {
@@ -2156,21 +2176,28 @@ export async function fetchCommunityAddonsDirectory(): Promise<CommunityAddonDir
 export const DEFAULT_PENGUPLAY_MANIFEST_URL =
   'https://pengu.uk/%7B%22auth_token%22%3A%22jBIrOxA27mMz_WvoR_ZCAMR72uZegRCgWJzw9P0IIUQ%22%7D/manifest.json';
 
+export const DEFAULT_TORRENTIO_HINDI_MANIFEST_URL =
+  'https://torrentio.strem.fun/language=hindi/manifest.json';
+
 /**
  * Automatically upgrades any legacy unauthenticated PenguPlay URL (`https://pengu.uk/manifest.json`)
- * stored in localStorage or SQLite DB to the authenticated default URL.
+ * or bare Torrentio URL (`https://torrentio.strem.fun/manifest.json`) stored in localStorage or SQLite DB
+ * to the configured default URL.
  */
 export function upgradeLegacyDefaultAddonUrl(manifestUrl: string): string {
   const trimmed = manifestUrl.trim();
   if (/^https?:\/\/pengu\.uk\/manifest\.json$/i.test(trimmed)) {
     return DEFAULT_PENGUPLAY_MANIFEST_URL;
   }
+  if (/^https?:\/\/torrentio\.strem\.fun\/manifest\.json$/i.test(trimmed)) {
+    return DEFAULT_TORRENTIO_HINDI_MANIFEST_URL;
+  }
   return trimmed;
 }
 
 /**
  * Default live Stremio addon manifest URLs installed automatically on startup.
- * Includes all 7 user-requested default addons + Cinemeta & OpenSubtitles v3 for complete catalog, stream, meta, and subtitle coverage.
+ * Includes all user-requested default addons + Cinemeta & OpenSubtitles v3 for complete catalog, stream, meta, and subtitle coverage.
  */
 export const DEFAULT_BOOTSTRAP_MANIFEST_URLS: string[] = [
   // Streaming Catalogs addon commented out (code preserved):
@@ -2180,6 +2207,7 @@ export const DEFAULT_BOOTSTRAP_MANIFEST_URLS: string[] = [
   DEFAULT_PENGUPLAY_MANIFEST_URL,
   'https://st.111477.xyz/config/aHR0cHM6Ly9hLjExMTQ3Ny54eXov/manifest.json',
   'https://hdhub.thevolecitor.qzz.io/eyJ0b3Jib3giOiJ1bnNldCIsInF1YWxpdGllcyI6IjIxNjBwLDEwODBwLDcyMHAiLCJzb3J0IjoiZGVzYyJ9/manifest.json',
+  DEFAULT_TORRENTIO_HINDI_MANIFEST_URL,
   'https://opensubtitlesv3-pro.dexter21767.com/manifest.json',
   'https://v3-cinemeta.strem.io/manifest.json',
   'https://opensubtitles-v3.strem.io/manifest.json',
