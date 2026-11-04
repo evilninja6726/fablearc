@@ -38,6 +38,7 @@ import {
   fetchSubtitlesFromAddons,
   getAudioTrackLanguagePriority,
   InstalledAddon,
+  pingStreamBatch,
   ProbedAudioTrack,
   probeMediaStream,
   rankStreamsByResponsiveness,
@@ -311,6 +312,11 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
   const [isPlaying, setIsPlaying] = useState(false);
   const [isBuffering, setIsBuffering] = useState(true);
   const [hasStartedPlayback, setHasStartedPlayback] = useState(false);
+  const hasStartedPlaybackRef = useRef<boolean>(false);
+  hasStartedPlaybackRef.current = hasStartedPlayback;
+  const userManuallySelectedStreamRef = useRef<boolean>(Boolean(initialStream));
+  const activeStreamRef = useRef<StremioStreamItem | null>(activeStream);
+  activeStreamRef.current = activeStream;
   const [hasFreezeFrame, setHasFreezeFrame] = useState(false);
   const [scrubPreviewSec, setScrubPreviewSec] = useState<number | null>(null);
   const [failoverCountdownSec, setFailoverCountdownSec] = useState<number>(30);
@@ -446,6 +452,8 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     },
     [activeStream, captureVideoFrameSnapshot, streams],
   );
+  const switchToNextStreamRef = useRef(switchToNextStream);
+  switchToNextStreamRef.current = switchToNextStream;
 
   // Clear failover toast after 6 seconds
   useEffect(() => {
@@ -542,6 +550,34 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         ? (initialEpisode ?? media.videos[0])!.id
         : media.imdbId || media.id;
 
+    // Progressively ping remaining un-pinged direct streams in batches of 18 so ALL servers show their live ms ping
+    const pingRemainingServersInPlace = async (baseList: StremioStreamItem[]) => {
+      const unpinged = baseList.filter(
+        (s) => s.kind === 'direct' && !s.isPromo && Boolean(s.url) && !s.serverStatusBadge,
+      );
+      for (let i = 0; i < unpinged.length; i += 18) {
+        if (cancelled) return;
+        const chunk = unpinged.slice(i, i + 18);
+        const metricsMap = await pingStreamBatch(chunk);
+        if (cancelled || metricsMap.size === 0) continue;
+        setStreams((prev) =>
+          prev.map((s) => {
+            const m = metricsMap.get(s.id);
+            if (!m) return s;
+            return {
+              ...s,
+              ttfbMs: m.ttfbMs,
+              speedMbps: m.speedMbps || s.speedMbps,
+              responsivenessScore: m.responsivenessScore || s.responsivenessScore,
+              serverStatusBadge: m.statusBadge,
+              unreachable: m.unreachable || !m.ok,
+              resolvedDirectUrl: m.resolvedUrl || s.resolvedDirectUrl || s.url,
+            };
+          }),
+        );
+      }
+    };
+
     const loadStreams = async () => {
       if (
         initialStreams &&
@@ -557,6 +593,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
           if (prev) return prev;
           if (initialStream) return initialStream;
           return (
+            orderedInitial.find((s) => s.isTopResponsive && !s.unreachable) ??
             orderedInitial.find(
               (s) => s.kind === 'direct' && !s.isPromo && !s.unreachable,
             ) ??
@@ -569,11 +606,25 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         if (!hasRankedWinner) {
           rankStreamsByResponsiveness(orderedInitial)
             .then((ranked) => {
-              if (!cancelled && ranked.length > 0) {
-                setStreams(ranked);
+              if (cancelled || ranked.length === 0) return;
+              setStreams(ranked);
+              // Only promote activeStream to the ⚡ Fastest winner if playback hasn't started yet
+              // and the user didn't manually pick a specific server. Never interrupt active playback!
+              const topFastest = ranked.find((s) => s.isTopResponsive && !s.unreachable);
+              if (
+                topFastest &&
+                !hasStartedPlaybackRef.current &&
+                !userManuallySelectedStreamRef.current
+              ) {
+                setActiveStream((prev) =>
+                  prev?.id === topFastest.id ? prev : topFastest,
+                );
               }
+              void pingRemainingServersInPlace(ranked);
             })
             .catch(() => {});
+        } else {
+          void pingRemainingServersInPlace(orderedInitial);
         }
         return;
       }
@@ -605,9 +656,19 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         if (sorted.length > 0) {
           rankStreamsByResponsiveness(sorted)
             .then((ranked) => {
-              if (!cancelled && ranked.length > 0) {
-                setStreams(ranked);
+              if (cancelled || ranked.length === 0) return;
+              setStreams(ranked);
+              const topFastest = ranked.find((s) => s.isTopResponsive && !s.unreachable);
+              if (
+                topFastest &&
+                !hasStartedPlaybackRef.current &&
+                !userManuallySelectedStreamRef.current
+              ) {
+                setActiveStream((prev) =>
+                  prev?.id === topFastest.id ? prev : topFastest,
+                );
               }
+              void pingRemainingServersInPlace(ranked);
             })
             .catch(() => {});
         }
@@ -837,12 +898,20 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     syncSplitPlayback,
   ]);
 
-  // Probe embedded multi-language audio tracks and container duration whenever activeStream changes
+  // Probe embedded multi-language audio tracks and container duration whenever the selected stream URL/ID actually changes.
+  // Depend on primitive stream identifiers (id, url, kind) rather than `streams` or `switchToNextStream` so background
+  // server health/ping updates NEVER reset directVideoLoadedUrlRef or restart <video>/<audio> buffering!
+  const activeStreamId = activeStream?.id ?? '';
+  const activeStreamUrl = activeStream?.url ?? '';
+  const activeStreamKind = activeStream?.kind ?? '';
+  const activeStreamIsHls = Boolean(activeStream?.isHls);
+
   useEffect(() => {
+    const currentStream = activeStreamRef.current;
     directVideoLoadedUrlRef.current = null;
     userPausedRef.current = false;
     setAudioBlockedByBrowser(false);
-    if (!activeStream || activeStream.kind !== 'direct' || !activeStream.url) {
+    if (!currentStream || currentStream.kind !== 'direct' || !currentStream.url) {
       setProbedAudioTracks([]);
       setProbedDurationSec(0);
       setResolvedDirectUrl(null);
@@ -850,19 +919,19 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       return;
     }
 
-    const streamUrl = activeStream.url;
+    const streamUrl = currentStream.url;
     // Fast-Start Audio & Video: If the background server benchmark already unwrapped the CDN URL,
     // use it immediately so <video> and <audio> start loading in 0ms in parallel with /api/media-probe!
     const preResolvedCdn =
-      activeStream.resolvedDirectUrl &&
-      /^https?:\/\//i.test(activeStream.resolvedDirectUrl)
-        ? activeStream.resolvedDirectUrl
+      currentStream.resolvedDirectUrl &&
+      /^https?:\/\//i.test(currentStream.resolvedDirectUrl)
+        ? currentStream.resolvedDirectUrl
         : streamUrl;
     setResolvedDirectUrl(preResolvedCdn);
     setProbedStreamUrl(streamUrl);
 
     const isM3u8 =
-      activeStream.isHls || streamUrl.toLowerCase().includes('.m3u8');
+      currentStream.isHls || streamUrl.toLowerCase().includes('.m3u8');
     if (isM3u8) {
       setUseFfmpegAudioEngine(false);
       setProbedAudioTracks([]);
@@ -893,7 +962,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
           /\/signin\.mp4(\?|$)/i.test(targetCdnUrl) ||
           (probe && probe.durationSec === 0 && probe.audioTracks.length === 0)
         ) {
-          switchToNextStream('Server offline or file removed');
+          switchToNextStreamRef.current('Server offline or file removed');
           return;
         }
 
@@ -903,7 +972,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
           window.location?.protocol === 'https:' &&
           targetCdnUrl.startsWith('http://');
         if (isInsecureHttpCdn) {
-          switchToNextStream('Skipped insecure HTTP server');
+          switchToNextStreamRef.current('Skipped insecure HTTP server');
           return;
         }
 
@@ -947,7 +1016,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [activeStream, switchToNextStream]);
+  }, [activeStreamId, activeStreamKind, activeStreamUrl]);
 
   // Download live SRT/VTT content when a subtitle track is selected
   useEffect(() => {
@@ -1177,7 +1246,10 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       }
     };
   }, [
-    activeStream,
+    activeStreamId,
+    activeStreamIsHls,
+    activeStreamKind,
+    activeStreamUrl,
     isSplitAudioMode,
     probedStreamUrl,
     resolvedDirectUrl,
@@ -2783,6 +2855,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                               window.open(stream.externalUrl, '_blank', 'noopener,noreferrer');
                               return;
                             }
+                            userManuallySelectedStreamRef.current = true;
                             const resumeAtSec = Math.max(0, Math.floor(currentTimeRef.current));
                             setStreamStartOffsetSec(resumeAtSec);
                             setCurrentTimeSec(resumeAtSec);
@@ -2805,7 +2878,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                                   {stream.audioBadge}
                                 </span>
                               )}
-                              {stream.serverStatusBadge && !stream.isTopResponsive && (
+                              {stream.serverStatusBadge && (
                                 <span
                                   className={`server-ping-badge mono ${stream.unreachable ? 'offline' : 'online'}`}
                                 >

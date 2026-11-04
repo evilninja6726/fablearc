@@ -1540,10 +1540,13 @@ export function registerStreamzApiMiddlewares(
 
       const body = await readJsonBody<{
         candidates?: Array<{ id?: string; url?: string; sizeBytes?: number }>;
+        pingOnly?: boolean;
       }>(req);
 
+      const isPingOnly = Boolean(body?.pingOnly);
+      const maxBatchSize = isPingOnly ? 20 : 6;
       const rawCandidates = Array.isArray(body?.candidates)
-        ? body.candidates.slice(0, 6)
+        ? body.candidates.slice(0, maxBatchSize)
         : [];
 
       const results = await Promise.all(
@@ -1583,7 +1586,9 @@ export function registerStreamzApiMiddlewares(
 
           const startAt = Date.now();
           try {
+            const unwrapStart = Date.now();
             const unwrapped = await unwrapMediaStreamUrlWithStatus(rawUrl);
+            const unwrapMs = Math.max(8, Date.now() - unwrapStart);
             const resolvedUrl = unwrapped.url;
             const isHttps = resolvedUrl.toLowerCase().startsWith('https://');
 
@@ -1603,31 +1608,38 @@ export function registerStreamzApiMiddlewares(
               return deadRes;
             }
 
+            // Fast Ping-Only Mode (for annotating all remaining streams with ms ping in < 1s):
+            // unwrapMediaStreamUrlWithStatus already performed a Range: bytes=0-1 check on the final CDN!
+            // If it succeeded or if we only need a 1-byte ping, measure TTFB without downloading 64 KB.
+            const targetByteRange = isPingOnly ? 'bytes=0-1023' : 'bytes=0-65535';
+            const minTargetBytes = isPingOnly ? 1 : 65536;
+            const timeoutMs = isPingOnly ? 2400 : 3200;
+
             const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 3500);
+            const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
             const fetchStart = Date.now();
             const resp = await fetch(resolvedUrl, {
               method: 'GET',
               headers: {
                 'User-Agent':
                   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-                Range: 'bytes=0-65535',
+                Range: targetByteRange,
               },
               redirect: 'follow',
               signal: controller.signal,
             });
 
-            const ttfbMs = Math.max(10, Date.now() - fetchStart);
+            const ttfbMs = Math.max(8, Math.min(unwrapMs, Date.now() - fetchStart));
             const statusOk = resp.status >= 200 && resp.status < 300;
             let bytesRead = 0;
 
             if (statusOk && resp.body) {
               const reader = resp.body.getReader();
-              while (bytesRead < 65536) {
+              while (bytesRead < minTargetBytes) {
                 const { done, value } = await reader.read();
                 if (done || !value) break;
                 bytesRead += value.byteLength;
-                if (bytesRead >= 65536) break;
+                if (bytesRead >= minTargetBytes) break;
               }
               await reader.cancel().catch(() => {});
             } else {

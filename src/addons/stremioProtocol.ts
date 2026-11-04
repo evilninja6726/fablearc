@@ -1710,6 +1710,61 @@ export async function rankStreamsByResponsiveness(
 }
 
 /**
+ * Progressively pings a batch of direct streams (up to 18 per request, 1 KB Range check)
+ * via `/api/media-health-batch` (`pingOnly: true`) so every stream in the Quality dropdown
+ * and Details page displays its live `ms` ping without re-sorting or interrupting playback.
+ */
+export async function pingStreamBatch(
+  candidates: StremioStreamItem[],
+  explicitToken?: string,
+): Promise<Map<string, ServerHealthMetric>> {
+  const resultMap = new Map<string, ServerHealthMetric>();
+  const validCandidates = candidates
+    .filter((s) => s.kind === 'direct' && !s.isPromo && Boolean(s.url))
+    .slice(0, 18);
+
+  if (validCandidates.length === 0) {
+    return resultMap;
+  }
+
+  try {
+    const authToken = explicitToken ?? getClientAuthToken();
+    const backendOrigin = getCloudBackendOrigin();
+    const resp = await fetch(`${backendOrigin}/api/media-health-batch`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+      },
+      body: JSON.stringify({
+        pingOnly: true,
+        candidates: validCandidates.map((c) => ({
+          id: c.id,
+          url: c.url,
+          sizeBytes: c.sizeBytes ?? 0,
+        })),
+      }),
+    });
+
+    if (!resp.ok) {
+      return resultMap;
+    }
+
+    const payload = (await resp.json()) as { results?: ServerHealthMetric[] };
+    const metrics = Array.isArray(payload?.results) ? payload.results : [];
+    for (const m of metrics) {
+      if (m && typeof m.id === 'string') {
+        resultMap.set(m.id, m);
+      }
+    }
+    return resultMap;
+  } catch {
+    return resultMap;
+  }
+}
+
+/**
  * Queries all enabled `subtitles` addons (e.g., OpenSubtitles v3 Pro & OpenSubtitles v3) for `/subtitles/<type>/<videoId>.json`.
  */
 export async function fetchSubtitlesFromAddons(

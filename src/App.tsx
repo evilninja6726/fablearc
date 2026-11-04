@@ -44,6 +44,7 @@ import {
   fetchStremioManifest,
   InstalledAddon,
   parseStreamingCatalogsConfig,
+  pingStreamBatch,
   rankStreamsByResponsiveness,
   sortStreamsByDecreasingQuality,
   STREAMING_CATALOG_COUNTRIES,
@@ -1379,14 +1380,44 @@ export const App: React.FC = () => {
 
       // Background partial server speed & health benchmark:
       // Tests top candidate servers (64 KB Range check), promotes the fastest zero-buffer server to #1,
-      // keeps remaining servers in decreasing quality order, and pre-warms /api/media-probe for the #1 server!
+      // keeps remaining servers in decreasing quality order, pre-warms /api/media-probe for the #1 server,
+      // and then progressively pings all remaining direct servers in background batches!
       if (initialSorted.length > 0) {
         setDossierBenchmarkingServers(true);
         rankStreamsByResponsiveness(initialSorted)
-          .then((ranked) => {
+          .then(async (ranked) => {
             setDossierStreams((prev) => (prev.length > 0 ? ranked : prev));
+            setDossierBenchmarkingServers(false);
+
+            const unpinged = ranked.filter(
+              (s) =>
+                s.kind === 'direct' &&
+                !s.isPromo &&
+                Boolean(s.url) &&
+                !s.serverStatusBadge,
+            );
+            for (let i = 0; i < unpinged.length; i += 18) {
+              const chunk = unpinged.slice(i, i + 18);
+              const metricsMap = await pingStreamBatch(chunk);
+              if (metricsMap.size === 0) continue;
+              setDossierStreams((prev) =>
+                prev.map((s) => {
+                  const m = metricsMap.get(s.id);
+                  if (!m) return s;
+                  return {
+                    ...s,
+                    ttfbMs: m.ttfbMs,
+                    speedMbps: m.speedMbps || s.speedMbps,
+                    responsivenessScore: m.responsivenessScore || s.responsivenessScore,
+                    serverStatusBadge: m.statusBadge,
+                    unreachable: m.unreachable || !m.ok,
+                    resolvedDirectUrl: m.resolvedUrl || s.resolvedDirectUrl || s.url,
+                  };
+                }),
+              );
+            }
           })
-          .finally(() => {
+          .catch(() => {
             setDossierBenchmarkingServers(false);
           });
       }
@@ -4156,7 +4187,7 @@ export const App: React.FC = () => {
                                   {st.audioBadge}
                                 </span>
                               )}
-                              {st.serverStatusBadge && !st.isTopResponsive && (
+                              {st.serverStatusBadge && (
                                 <span
                                   className={`server-ping-badge mono ${st.unreachable ? 'offline' : 'online'}`}
                                 >

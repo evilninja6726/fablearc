@@ -1021,5 +1021,24 @@ describe('Strix-Style E2E & Security Audit Suite', () => {
     expect(fallbackRanked).toHaveLength(2);
     expect(fallbackRanked[0].id).toBe('s-2160');
     expect(fallbackRanked[1].id).toBe('s-720');
+
+    // Edge Case 5: pingOnly=true on /api/media-health-batch allows up to 20 candidates per batch so all streams display their live ms ping
+    const pingBatchCandidates = Array.from({ length: 12 }, (_, idx) => ({
+      id: `ping-cand-${idx}`,
+      url: `http://127.0.0.1:9999/internal-${idx}.mkv`,
+      sizeBytes: 1_000_000_000,
+    }));
+    const pingBatchResp = await fetch(`${ctx.baseUrl}/api/media-health-batch`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ pingOnly: true, candidates: pingBatchCandidates }),
+    });
+    expect(pingBatchResp.status).toBe(200);
+    const pingBatchBody = await pingBatchResp.json();
+    expect(pingBatchBody.results).toHaveLength(12);
+    expect(pingBatchBody.results[0].statusBadge).toBeDefined();
   });
 });
