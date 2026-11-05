@@ -78,9 +78,12 @@ import type { DbUserProfile, UserStatePayload } from './server/streamzDb';
 import {
   detectConceptClustersForText,
   extractSignificantKeywords,
+  loadLocalRecommendationPreferences,
   parseNaturalLanguageSuggestionQuery,
   QUICK_SUGGESTION_PROMPTS,
   rankSimilarMediaItems,
+  resetLocalRecommendationPreferences,
+  saveLocalRecommendationPreferences,
   scoreCandidatesForSuggestionPrompt,
 } from './intelligence/recommendationEngine';
 
@@ -598,6 +601,11 @@ export const App: React.FC = () => {
   const [suggestionLoadingRemote, setSuggestionLoadingRemote] = useState<boolean>(false);
   const [suggestionVisibleCount, setSuggestionVisibleCount] = useState<number>(48);
   const [suggestionNextSkip, setSuggestionNextSkip] = useState<number>(100);
+  const [personalizationEnabled, setPersonalizationEnabled] = useState<boolean>(() => {
+    const prefs = loadLocalRecommendationPreferences();
+    return prefs.settings?.personalizationEnabled ?? true;
+  });
+  const [preferenceVersionTick, setPreferenceVersionTick] = useState<number>(0);
   const suggestionFetchingMoreRef = useRef<boolean>(false);
 
   const dossierProviderCategories = useMemo(() => {
@@ -2725,6 +2733,8 @@ export const App: React.FC = () => {
         }
       }
     }
+    void preferenceVersionTick;
+    void watchlistMetaById;
     return scoreCandidatesForSuggestionPrompt(
       parsedSuggestionQuery,
       Array.from(candidateMap.values()),
@@ -2735,8 +2745,10 @@ export const App: React.FC = () => {
     catalogShelves,
     genreExtraItemsByKey,
     parsedSuggestionQuery,
+    preferenceVersionTick,
     suggestionRemotePool,
     suggestionTypeFilter,
+    watchlistMetaById,
   ]);
 
   // Close Movie/Series Details Page on Escape key when player is not active
@@ -3665,11 +3677,55 @@ export const App: React.FC = () => {
           <div className="spatial-scroll-flow padded-top">
             <section className="catalog-shelf suggestions-hero-panel">
               <div className="suggestions-panel-header">
-                <div className="shelf-title-group">
-                  <h2>Suggestions</h2>
-                  <p className="suggestions-subcopy">
-                    Type any movie description, vibe, genre, or year to find similar titles.
-                  </p>
+                <div
+                  className="shelf-title-group"
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    width: '100%',
+                    flexWrap: 'wrap',
+                    gap: 10,
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, flexWrap: 'wrap' }}>
+                    <h2>Suggestions</h2>
+                    <p className="suggestions-subcopy">
+                      Type any movie description, vibe, genre, or year to find similar titles.
+                    </p>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <button
+                      type="button"
+                      className={`genre-pill ${personalizationEnabled ? 'active' : ''}`}
+                      onClick={() => {
+                        const prefs = loadLocalRecommendationPreferences();
+                        const next = !personalizationEnabled;
+                        prefs.settings = {
+                          personalizationEnabled: next,
+                          discoveryLevel: prefs.settings?.discoveryLevel || 'balanced',
+                        };
+                        saveLocalRecommendationPreferences(prefs);
+                        setPersonalizationEnabled(next);
+                        setPreferenceVersionTick((t) => t + 1);
+                      }}
+                      title="Toggle device-local taste personalization"
+                    >
+                      {personalizationEnabled ? 'Personalization: On' : 'Personalization: Off'}
+                    </button>
+                    <button
+                      type="button"
+                      className="genre-pill"
+                      onClick={() => {
+                        resetLocalRecommendationPreferences();
+                        setPersonalizationEnabled(true);
+                        setPreferenceVersionTick((t) => t + 1);
+                      }}
+                      title="Reset recommendation preferences stored in this browser"
+                    >
+                      Reset Preferences
+                    </button>
+                  </div>
                 </div>
 
                 <form
@@ -3763,11 +3819,11 @@ export const App: React.FC = () => {
                 <div className="poster-grid">
                   {scoredSuggestionResults
                     .slice(0, suggestionVisibleCount)
-                    .map(({ item, matchPercent, matchReasonLabel }) => {
+                    .map(({ item, normalizedRelevance, matchReasonLabel }) => {
                       const tierClass =
-                        matchPercent >= 75
+                        normalizedRelevance >= 0.72
                           ? 'high-match'
-                          : matchPercent >= 45
+                          : normalizedRelevance >= 0.40
                             ? 'mid-match'
                             : 'low-match';
                       return (
