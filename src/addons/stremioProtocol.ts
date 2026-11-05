@@ -2068,29 +2068,69 @@ const clientServerHealthCache = new Map<
 >();
 
 /**
+ * Returns true ONLY if a stream has been confirmed Offline or Blocked.
+ * Never returns true for `Slow / Timeout` streams so slow streams are kept in the list.
+ */
+export function isOfflineStream(stream: StremioStreamItem): boolean {
+  const badge = (stream.serverStatusBadge || '').trim();
+  if (/^Slow\s*\/\s*Timeout$/i.test(badge)) {
+    return false;
+  }
+  if (/^(Offline|Blocked)$/i.test(badge)) {
+    return true;
+  }
+  return Boolean(stream.unreachable);
+}
+
+/**
+ * Marks a stream URL as Offline in the client health cache so confirmed dead streams are
+ * immediately removed from both the Details Page and Player server lists.
+ */
+export function markStreamOfflineInCache(streamUrl?: string | null): void {
+  if (!streamUrl) return;
+  clientServerHealthCache.set(streamUrl, {
+    metric: {
+      id: streamUrl,
+      ok: false,
+      unreachable: true,
+      isHttps: streamUrl.startsWith('https://'),
+      resolvedUrl: streamUrl,
+      ttfbMs: 9999,
+      speedMbps: 0,
+      responsivenessScore: -500,
+      statusBadge: 'Offline',
+    },
+    expiresAt: Date.now() + 5 * 60 * 1000,
+  });
+}
+
+/**
  * Layer 4 (Client-Side Ping & Resolution Cache):
- * Applies any cached server ping/health metrics synchronously so re-opening the Details Page
- * or Player displays `ms` badges and unwrapped CDN URLs in 0ms without re-pinging.
+ * Applies any cached server ping/health metrics synchronously and removes confirmed
+ * Offline streams while keeping Slow / Timeout streams intact.
  */
 export function applyCachedServerHealth(
   streams: StremioStreamItem[],
 ): StremioStreamItem[] {
   const now = Date.now();
-  return streams.map((s) => {
-    if (!s.url) return s;
-    const cached = clientServerHealthCache.get(s.url);
-    if (!cached || cached.expiresAt <= now) return s;
-    const m = cached.metric;
-    return {
-      ...s,
-      ttfbMs: m.ttfbMs,
-      speedMbps: m.speedMbps || s.speedMbps,
-      responsivenessScore: m.responsivenessScore || s.responsivenessScore,
-      serverStatusBadge: m.statusBadge || s.serverStatusBadge,
-      unreachable: m.unreachable || !m.ok,
-      resolvedDirectUrl: m.resolvedUrl || s.resolvedDirectUrl || s.url,
-    };
-  });
+  return streams
+    .map((s) => {
+      if (!s.url) return s;
+      const cached = clientServerHealthCache.get(s.url);
+      if (!cached || cached.expiresAt <= now) return s;
+      const m = cached.metric;
+      const isSlowTimeout = /^Slow\s*\/\s*Timeout$/i.test((m.statusBadge || '').trim());
+      return {
+        ...s,
+        ttfbMs: m.ttfbMs,
+        speedMbps: m.speedMbps || s.speedMbps,
+        responsivenessScore: m.responsivenessScore || s.responsivenessScore,
+        serverStatusBadge: m.statusBadge || s.serverStatusBadge,
+        unreachable: isSlowTimeout ? false : Boolean(m.unreachable),
+        resolvedDirectUrl: m.resolvedUrl || s.resolvedDirectUrl || s.url,
+      };
+    })
+    .filter((s) => !isOfflineStream(s));
 }
 
 /**
@@ -2272,21 +2312,24 @@ export async function rankStreamsByResponsiveness(
       return sortedBase;
     }
 
-    // Annotate streams with measured TTFB, speed, and reachability
-    const annotated = sortedBase.map((s) => {
-      const m = metricById.get(s.id);
-      if (!m) return { ...s, isTopResponsive: false };
-      return {
-        ...s,
-        isTopResponsive: false,
-        ttfbMs: m.ttfbMs,
-        speedMbps: m.speedMbps,
-        responsivenessScore: m.responsivenessScore,
-        serverStatusBadge: m.statusBadge,
-        unreachable: m.unreachable || !m.ok,
-        resolvedDirectUrl: m.resolvedUrl || s.url,
-      };
-    });
+    // Annotate streams with measured TTFB, speed, and reachability, and remove confirmed Offline streams (keeping Slow / Timeout streams)
+    const annotated = sortedBase
+      .map((s) => {
+        const m = metricById.get(s.id);
+        if (!m) return { ...s, isTopResponsive: false };
+        const isSlowTimeout = /^Slow\s*\/\s*Timeout$/i.test((m.statusBadge || '').trim());
+        return {
+          ...s,
+          isTopResponsive: false,
+          ttfbMs: m.ttfbMs,
+          speedMbps: m.speedMbps,
+          responsivenessScore: m.responsivenessScore,
+          serverStatusBadge: m.statusBadge,
+          unreachable: isSlowTimeout ? false : Boolean(m.unreachable),
+          resolvedDirectUrl: m.resolvedUrl || s.url,
+        };
+      })
+      .filter((s) => !isOfflineStream(s));
 
     // Identify the best healthy server among the benchmarked candidates
     // Combine responsivenessScore with quality + multi-audio + Layer 3 Native/Fast-Start container bonus

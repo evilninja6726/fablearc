@@ -1926,8 +1926,8 @@ export function registerStreamzApiMiddlewares(
             const timeoutRes = {
               id,
               ok: false,
-              unreachable: true,
-              isHttps: false,
+              unreachable: false,
+              isHttps: rawUrl.toLowerCase().startsWith('https://'),
               resolvedUrl: rawUrl,
               ttfbMs: elapsed,
               speedMbps: 0,

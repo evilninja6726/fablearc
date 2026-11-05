@@ -13,6 +13,7 @@ import {
 } from '../src/player/subtitleEngine';
 import {
   addonSupportsResource,
+  applyCachedServerHealth,
   buildP2pMagnetUri,
   buildStreamingCatalogsManifestUrl,
   canBrowserPlayAudioCodecNatively,
@@ -20,6 +21,8 @@ import {
   DEFAULT_PENGUPLAY_MANIFEST_URL,
   extractStreamQualityInfo,
   getStreamProviderCategory,
+  isOfflineStream,
+  markStreamOfflineInCache,
   normalizeStremioMeta,
   parseStreamingCatalogsConfig,
   ProbedAudioTrack,
@@ -154,6 +157,42 @@ describe('Default Addons & Decreasing Stream Quality Sorting', () => {
       '[PixelDrain] [💾 125.17 MB] SAMPLE-Sinners.2025.1080p.DS4K.WEB-DL.mkv',
     );
     expect(sampleClipInfo.isPromo).toBe(true);
+
+    const mixedStreams: StremioStreamItem[] = [
+      {
+        id: 'fast-1',
+        addonId: 'hdhub',
+        addonName: 'HdHub',
+        name: '1080p',
+        title: 'Fast Stream',
+        kind: 'direct',
+        url: 'https://cdn.example.com/fast.mp4',
+        serverStatusBadge: '420ms',
+      },
+      {
+        id: 'slow-1',
+        addonId: 'hdhub',
+        addonName: 'HdHub',
+        name: '1080p',
+        title: 'Slow Timeout Stream',
+        kind: 'direct',
+        url: 'https://cdn.example.com/slow.mp4',
+        serverStatusBadge: 'Slow / Timeout',
+      },
+      {
+        id: 'offline-1',
+        addonId: 'hdhub',
+        addonName: 'HdHub',
+        name: '720p',
+        title: 'Offline Stream',
+        kind: 'direct',
+        url: 'https://cdn.example.com/offline.mp4',
+      },
+    ];
+    markStreamOfflineInCache('https://cdn.example.com/offline.mp4');
+    expect(isOfflineStream(mixedStreams[1])).toBe(false);
+    const filtered = applyCachedServerHealth(mixedStreams);
+    expect(filtered.map((s) => s.id)).toEqual(['fast-1', 'slow-1']);
   });
 
   it('parses resolution quality and sorts streams in strictly decreasing order (4K -> 1080p -> 720p -> 480p)', () => {

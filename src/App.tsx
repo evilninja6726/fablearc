@@ -45,6 +45,7 @@ import {
   fetchStremioManifest,
   getStreamProviderCategory,
   InstalledAddon,
+  isOfflineStream,
   parseStreamingCatalogsConfig,
   pingStreamBatch,
   prefetchStreamsForMedia,
@@ -1428,10 +1429,12 @@ export const App: React.FC = () => {
           }
         }
         if (measuredById.size === 0) return cleanIncoming;
-        const merged = cleanIncoming.map((itemStream) => {
-          const measured = measuredById.get(itemStream.id);
-          return measured ? { ...itemStream, ...measured } : itemStream;
-        });
+        const merged = cleanIncoming
+          .map((itemStream) => {
+            const measured = measuredById.get(itemStream.id);
+            return measured ? { ...itemStream, ...measured } : itemStream;
+          })
+          .filter((s) => !isOfflineStream(s));
         return sortStreamsByDecreasingQuality(merged);
       };
 
@@ -1494,19 +1497,24 @@ export const App: React.FC = () => {
                 const metricsMap = await pingStreamBatch(topUnpinged);
                 if (metricsMap.size > 0) {
                   setDossierStreams((prev) =>
-                    prev.map((s) => {
-                      const m = metricsMap.get(s.id);
-                      if (!m) return s;
-                      return {
-                        ...s,
-                        ttfbMs: m.ttfbMs,
-                        speedMbps: m.speedMbps || s.speedMbps,
-                        responsivenessScore: m.responsivenessScore || s.responsivenessScore,
-                        serverStatusBadge: m.statusBadge,
-                        unreachable: m.unreachable || !m.ok,
-                        resolvedDirectUrl: m.resolvedUrl || s.resolvedDirectUrl || s.url,
-                      };
-                    }),
+                    prev
+                      .map((s) => {
+                        const m = metricsMap.get(s.id);
+                        if (!m) return s;
+                        const isSlowTimeout = /^Slow\s*\/\s*Timeout$/i.test(
+                          (m.statusBadge || '').trim(),
+                        );
+                        return {
+                          ...s,
+                          ttfbMs: m.ttfbMs,
+                          speedMbps: m.speedMbps || s.speedMbps,
+                          responsivenessScore: m.responsivenessScore || s.responsivenessScore,
+                          serverStatusBadge: m.statusBadge,
+                          unreachable: isSlowTimeout ? false : Boolean(m.unreachable),
+                          resolvedDirectUrl: m.resolvedUrl || s.resolvedDirectUrl || s.url,
+                        };
+                      })
+                      .filter((s) => !isOfflineStream(s)),
                   );
                 }
               }

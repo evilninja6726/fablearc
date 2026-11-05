@@ -42,6 +42,8 @@ import {
   getCachedMediaProbe,
   getStreamProviderCategory,
   InstalledAddon,
+  isOfflineStream,
+  markStreamOfflineInCache,
   MediaProbeResponse,
   pingStreamBatch,
   ProbedAudioTrack,
@@ -450,36 +452,29 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
   // Keep HUD visible whenever paused, buffering, or a bottom dropdown popover is open
   const showControlsHud = hudVisible || !isPlaying || isBuffering || activePopover !== null;
 
-  // Automatically switch to the next available stream in decreasing quality order
+  // Automatically switch to the next available stream in decreasing quality order and remove the failed offline stream
   const switchToNextStream = useCallback(
     (reason: string) => {
       if (!activeStream) return;
       failedStreamIdsRef.current.add(activeStream.id);
+      markStreamOfflineInCache(activeStream.url);
 
-      const playableCandidates = streams.filter(
+      const remainingStreams = streams.filter(
+        (s) => s.id !== activeStream.id && !isOfflineStream(s),
+      );
+      setStreams(remainingStreams);
+
+      const playableCandidates = remainingStreams.filter(
         (s) => (s.kind === 'direct' || s.kind === 'youtube') && !s.isPromo,
       );
-      const pool = playableCandidates.length > 0 ? playableCandidates : streams;
-      if (pool.length <= 1) {
+      const pool = playableCandidates.length > 0 ? playableCandidates : remainingStreams;
+      if (pool.length === 0) {
         setFailoverToast('No alternative stream available to switch to.');
         return;
       }
 
-      const currentIdx = pool.findIndex((s) => s.id === activeStream.id);
-      let nextStream: StremioStreamItem | undefined;
-
-      for (let offset = 1; offset <= pool.length; offset++) {
-        const candidate = pool[(Math.max(0, currentIdx) + offset) % pool.length];
-        if (candidate && !failedStreamIdsRef.current.has(candidate.id)) {
-          nextStream = candidate;
-          break;
-        }
-      }
-
-      if (!nextStream) {
-        failedStreamIdsRef.current.clear();
-        nextStream = pool[(Math.max(0, currentIdx) + 1) % pool.length];
-      }
+      const nextStream =
+        pool.find((s) => !failedStreamIdsRef.current.has(s.id)) ?? pool[0];
 
       if (nextStream && nextStream.id !== activeStream.id) {
         captureVideoFrameSnapshot();
@@ -607,19 +602,24 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       const metricsMap = await pingStreamBatch(topUnpinged);
       if (cancelled || metricsMap.size === 0) return;
       setStreams((prev) =>
-        prev.map((s) => {
-          const m = metricsMap.get(s.id);
-          if (!m) return s;
-          return {
-            ...s,
-            ttfbMs: m.ttfbMs,
-            speedMbps: m.speedMbps || s.speedMbps,
-            responsivenessScore: m.responsivenessScore || s.responsivenessScore,
-            serverStatusBadge: m.statusBadge,
-            unreachable: m.unreachable || !m.ok,
-            resolvedDirectUrl: m.resolvedUrl || s.resolvedDirectUrl || s.url,
-          };
-        }),
+        prev
+          .map((s) => {
+            const m = metricsMap.get(s.id);
+            if (!m) return s;
+            const isSlowTimeout = /^Slow\s*\/\s*Timeout$/i.test(
+              (m.statusBadge || '').trim(),
+            );
+            return {
+              ...s,
+              ttfbMs: m.ttfbMs,
+              speedMbps: m.speedMbps || s.speedMbps,
+              responsivenessScore: m.responsivenessScore || s.responsivenessScore,
+              serverStatusBadge: m.statusBadge,
+              unreachable: isSlowTimeout ? false : Boolean(m.unreachable),
+              resolvedDirectUrl: m.resolvedUrl || s.resolvedDirectUrl || s.url,
+            };
+          })
+          .filter((s) => !isOfflineStream(s)),
       );
     };
 
@@ -652,10 +652,12 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         }
       }
       if (measuredById.size === 0) return cleanIncoming;
-      const merged = cleanIncoming.map((itemStream) => {
-        const measured = measuredById.get(itemStream.id);
-        return measured ? { ...itemStream, ...measured } : itemStream;
-      });
+      const merged = cleanIncoming
+        .map((itemStream) => {
+          const measured = measuredById.get(itemStream.id);
+          return measured ? { ...itemStream, ...measured } : itemStream;
+        })
+        .filter((s) => !isOfflineStream(s));
       return sortStreamsByDecreasingQuality(merged);
     };
 
