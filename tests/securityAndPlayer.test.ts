@@ -15,6 +15,7 @@ import {
   addonSupportsResource,
   buildP2pMagnetUri,
   buildStreamingCatalogsManifestUrl,
+  canBrowserPlayAudioCodecNatively,
   DEFAULT_BOOTSTRAP_MANIFEST_URLS,
   DEFAULT_PENGUPLAY_MANIFEST_URL,
   extractStreamQualityInfo,
@@ -136,6 +137,10 @@ describe('Default Addons & Decreasing Stream Quality Sorting', () => {
     expect(DEFAULT_BOOTSTRAP_MANIFEST_URLS).toContain(
       'https://opensubtitlesv3-pro.dexter21767.com/manifest.json',
     );
+    expect(canBrowserPlayAudioCodecNatively('AAC')).toBe(true);
+    expect(canBrowserPlayAudioCodecNatively('mp3')).toBe(true);
+    expect(canBrowserPlayAudioCodecNatively('opus')).toBe(true);
+    expect(canBrowserPlayAudioCodecNatively('dts')).toBe(false);
   });
 
   it('parses resolution quality and sorts streams in strictly decreasing order (4K -> 1080p -> 720p -> 480p)', () => {

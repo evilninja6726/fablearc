@@ -3,12 +3,13 @@ import react from '@vitejs/plugin-react';
 import { ChildProcess, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import {
+  Agent as HttpAgent,
   createServer as createHttpServer,
   request as httpRequest,
   type IncomingMessage,
   type ServerResponse,
 } from 'node:http';
-import { request as httpsRequest } from 'node:https';
+import { Agent as HttpsAgent, request as httpsRequest } from 'node:https';
 import ffmpegPath from 'ffmpeg-static';
 import {
   AdminUserSummary,
@@ -386,6 +387,24 @@ const loopbackMediaRegistry = new Map<string, { url: string; expiresAt: number }
 let loopbackGatewayPort: number | null = null;
 let loopbackGatewayInitPromise: Promise<number> | null = null;
 
+// Persistent Keep-Alive Connection Pools for Loopback Media Gateway:
+// Reuses warm TCP + TLS sockets across FFmpeg / FFprobe HTTP Range seeks (header -> MKV Cues / MP4 moov -> cluster),
+// eliminating 300ms-800ms DNS + TLS handshakes on every internal container seek.
+const keepAliveHttpAgent = new HttpAgent({
+  keepAlive: true,
+  keepAliveMsecs: 15_000,
+  maxSockets: 64,
+  maxFreeSockets: 16,
+  timeout: 30_000,
+});
+const keepAliveHttpsAgent = new HttpsAgent({
+  keepAlive: true,
+  keepAliveMsecs: 15_000,
+  maxSockets: 64,
+  maxFreeSockets: 16,
+  timeout: 30_000,
+});
+
 function registerLoopbackTarget(targetUrl: string): string {
   const now = Date.now();
   if (loopbackMediaRegistry.size > 500) {
@@ -450,6 +469,7 @@ function forwardLoopbackMediaRequest(
       path: `${parsed.pathname}${parsed.search}`,
       method: clientReq.method === 'HEAD' ? 'HEAD' : 'GET',
       headers: upHeaders,
+      agent: isHttps ? keepAliveHttpsAgent : keepAliveHttpAgent,
       ...(isHttps ? { servername: parsed.hostname } : {}),
       timeout: 25_000,
     },
@@ -1457,7 +1477,7 @@ export function registerStreamzApiMiddlewares(
         data = cachedProbe;
         cacheStatus = 'HIT-L1';
       } else {
-        const unwrapped = await unwrapMediaStreamUrlWithStatus(rawStreamUrl);
+        const unwrapped = await unwrapMediaStreamUrlWithStatus(rawStreamUrl, 3200);
         const resolvedUrl = unwrapped.url;
         if (unwrapped.unreachable) {
           data = {
@@ -1481,9 +1501,9 @@ export function registerStreamzApiMiddlewares(
                 '-user_agent',
                 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
                 '-analyzeduration',
-                '450000',
+                '350000',
                 '-probesize',
-                '450000',
+                '350000',
                 '-i',
                 loopbackInputUrl,
               ],
@@ -1491,15 +1511,10 @@ export function registerStreamzApiMiddlewares(
             );
 
             let stderr = '';
-            const killTimer = setTimeout(() => {
-              proc.kill('SIGKILL');
-            }, 12000);
-
-            proc.stderr.on('data', (chunk: Buffer) => {
-              stderr += chunk.toString('utf8');
-            });
-
-            proc.on('close', () => {
+            let resolvedEarly = false;
+            const finishProbe = () => {
+              if (resolvedEarly) return;
+              resolvedEarly = true;
               clearTimeout(killTimer);
               const parsed = parseFfmpegProbeOutput(stderr, resolvedUrl);
               if (
@@ -1512,6 +1527,23 @@ export function registerStreamzApiMiddlewares(
                 parsed.unreachable = true;
               }
               resolve(parsed);
+            };
+
+            const killTimer = setTimeout(() => {
+              proc.kill('SIGKILL');
+              finishProbe();
+            }, 4500);
+
+            proc.stderr.on('data', (chunk: Buffer) => {
+              stderr += chunk.toString('utf8');
+              if (stderr.includes('At least one output file must be specified')) {
+                proc.kill('SIGKILL');
+                finishProbe();
+              }
+            });
+
+            proc.on('close', () => {
+              finishProbe();
             });
           });
           cacheStatus = 'MISS';
@@ -1627,12 +1659,33 @@ export function registerStreamzApiMiddlewares(
               return deadRes;
             }
 
-            // Fast Ping-Only Mode (for annotating all remaining streams with ms ping in < 1s):
+            // Fast Ping-Only Mode (for annotating streams with ms ping in < 1s):
             // unwrapMediaStreamUrlWithStatus already performed a Range: bytes=0-1 check on the final CDN!
-            // If it succeeded or if we only need a 1-byte ping, measure TTFB without downloading 64 KB.
-            const targetByteRange = isPingOnly ? 'bytes=0-1023' : 'bytes=0-65535';
-            const minTargetBytes = isPingOnly ? 1 : 65536;
-            const timeoutMs = isPingOnly ? 2000 : 2600;
+            // For non-HLS direct files in pingOnly mode, reuse the unwrap result immediately without a 2nd TCP/TLS round-trip.
+            const isLikelyHls = /\.m3u8(\?|$)|\/hls\/|\/playlist\//i.test(resolvedUrl);
+            if (isPingOnly && !isLikelyHls) {
+              const latencyScore = Math.round(900 - Math.min(850, unwrapMs * 0.22));
+              const httpsBonus = isHttps ? 200 : -350;
+              const responsivenessScore = Math.round(latencyScore + httpsBonus);
+              const statusBadge = !isHttps ? 'HTTP Only' : `${unwrapMs}ms`;
+              const fastPingRes = {
+                id,
+                ok: isHttps,
+                unreachable: false,
+                isHttps,
+                resolvedUrl,
+                ttfbMs: unwrapMs,
+                speedMbps: 12,
+                responsivenessScore,
+                statusBadge,
+              };
+              globalCache.setSync(cacheKey, fastPingRes, 900);
+              return fastPingRes;
+            }
+
+            const targetByteRange = isPingOnly ? 'bytes=0-1023' : 'bytes=0-32767';
+            const minTargetBytes = isPingOnly ? 1 : 32768;
+            const timeoutMs = isPingOnly ? 1600 : 2000;
 
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), timeoutMs);

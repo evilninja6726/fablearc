@@ -1486,32 +1486,34 @@ export const App: React.FC = () => {
               setDossierStreams((prev) => (prev.length > 0 ? ranked : prev));
               setDossierBenchmarkingServers(false);
 
-              const unpinged = ranked.filter(
-                (s) =>
-                  s.kind === 'direct' &&
-                  !s.isPromo &&
-                  Boolean(s.url) &&
-                  !s.serverStatusBadge,
-              );
-              for (let i = 0; i < unpinged.length; i += 18) {
-                const chunk = unpinged.slice(i, i + 18);
-                const metricsMap = await pingStreamBatch(chunk);
-                if (metricsMap.size === 0) continue;
-                setDossierStreams((prev) =>
-                  prev.map((s) => {
-                    const m = metricsMap.get(s.id);
-                    if (!m) return s;
-                    return {
-                      ...s,
-                      ttfbMs: m.ttfbMs,
-                      speedMbps: m.speedMbps || s.speedMbps,
-                      responsivenessScore: m.responsivenessScore || s.responsivenessScore,
-                      serverStatusBadge: m.statusBadge,
-                      unreachable: m.unreachable || !m.ok,
-                      resolvedDirectUrl: m.resolvedUrl || s.resolvedDirectUrl || s.url,
-                    };
-                  }),
-                );
+              const topUnpinged = ranked
+                .filter(
+                  (s) =>
+                    s.kind === 'direct' &&
+                    !s.isPromo &&
+                    Boolean(s.url) &&
+                    !s.serverStatusBadge,
+                )
+                .slice(0, 18);
+              if (topUnpinged.length > 0) {
+                const metricsMap = await pingStreamBatch(topUnpinged);
+                if (metricsMap.size > 0) {
+                  setDossierStreams((prev) =>
+                    prev.map((s) => {
+                      const m = metricsMap.get(s.id);
+                      if (!m) return s;
+                      return {
+                        ...s,
+                        ttfbMs: m.ttfbMs,
+                        speedMbps: m.speedMbps || s.speedMbps,
+                        responsivenessScore: m.responsivenessScore || s.responsivenessScore,
+                        serverStatusBadge: m.statusBadge,
+                        unreachable: m.unreachable || !m.ok,
+                        resolvedDirectUrl: m.resolvedUrl || s.resolvedDirectUrl || s.url,
+                      };
+                    }),
+                  );
+                }
               }
             })
             .catch(() => {

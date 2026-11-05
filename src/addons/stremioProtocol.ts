@@ -369,6 +369,14 @@ export function sortStreamsByDecreasingQuality(
       score -= 30;
     }
 
+    // 4. Reward universal browser-native codecs (H.264 / AAC / Opus / MP4) that play with 0ms native decode
+    if (/\b(x264|h\.?264|avc)\b/i.test(metaLower)) {
+      score += 20;
+    }
+    if (/\b(aac|opus|mp4)\b/i.test(metaLower)) {
+      score += 15;
+    }
+
     return score;
   };
 
@@ -1034,7 +1042,7 @@ function isDirectCorsFastPathUrl(url: string): boolean {
     ) {
       return false;
     }
-    // Public CORS-enabled catalog, metadata & stream addons (including CNCVerse Bridge, Torrentio & HDHub4u)
+    // Public CORS-enabled catalog, metadata, subtitle & stream addons (including CNCVerse Bridge, Torrentio, HDHub4u, OpenSubtitles & AIOLists)
     // resolve directly from the browser with 0 Bytes of Render bandwidth and bypass datacenter IP blocks!
     if (
       host === 'v3-cinemeta.strem.io' ||
@@ -1043,6 +1051,9 @@ function isDirectCorsFastPathUrl(url: string): boolean {
       host === 'torrentio.strem.fun' ||
       host.endsWith('.strem.fun') ||
       host === 'hdhub.thevolecitor.qzz.io' ||
+      host === 'opensubtitlesv3-pro.dexter21767.com' ||
+      host === 'opensubtitles-v3.strem.io' ||
+      host === 'aiometadata.elfhosted.com' ||
       host.endsWith('.baby-beamup.club') ||
       parsed.pathname.includes('/catalog/') ||
       parsed.pathname.endsWith('/manifest.json')
@@ -1829,6 +1840,53 @@ export function sortAudioTracksByLanguagePriority(
     }
     return a.audioIndex - b.audioIndex;
   });
+}
+
+let cachedAc3Support: boolean | null = null;
+let cachedEac3Support: boolean | null = null;
+
+/**
+ * Checks whether the current browser can natively decode the given audio codec inside HTML5 `<video>`,
+ * avoiding unnecessary server-side FFmpeg split-audio transcoding (0 MB on Render & 0ms lockstep delay).
+ */
+export function canBrowserPlayAudioCodecNatively(codec?: string | null): boolean {
+  const c = (codec || '').trim().toLowerCase();
+  if (!c) return false;
+  if (/^(aac|mp3|mp4a|opus|vorbis|flac|pcm)/i.test(c)) {
+    return true;
+  }
+  if (typeof document === 'undefined') {
+    return false;
+  }
+  if (c === 'eac3' || c === 'ec-3' || c === 'ec3') {
+    if (cachedEac3Support === null) {
+      try {
+        const v = document.createElement('video');
+        const res =
+          v.canPlayType('audio/mp4; codecs="ec-3"') ||
+          v.canPlayType('video/mp4; codecs="avc1.42E01E, ec-3"');
+        cachedEac3Support = res === 'probably' || res === 'maybe';
+      } catch {
+        cachedEac3Support = false;
+      }
+    }
+    return cachedEac3Support;
+  }
+  if (c === 'ac3' || c === 'ac-3') {
+    if (cachedAc3Support === null) {
+      try {
+        const v = document.createElement('video');
+        const res =
+          v.canPlayType('audio/mp4; codecs="ac-3"') ||
+          v.canPlayType('video/mp4; codecs="avc1.42E01E, ac-3"');
+        cachedAc3Support = res === 'probably' || res === 'maybe';
+      } catch {
+        cachedAc3Support = false;
+      }
+    }
+    return cachedAc3Support;
+  }
+  return false;
 }
 
 export interface MediaProbeResponse {

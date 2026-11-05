@@ -35,6 +35,7 @@ import {
 import {
   applyCachedServerHealth,
   buildTranscodedStreamUrl,
+  canBrowserPlayAudioCodecNatively,
   fetchStreamsFromAddons,
   fetchSubtitlesFromAddons,
   getAudioTrackLanguagePriority,
@@ -327,7 +328,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
   const [probedAudioTracks, setProbedAudioTracks] = useState<ProbedAudioTrack[]>([]);
   const [selectedAudioTrackIndex, setSelectedAudioTrackIndex] = useState<number>(0);
   const [probingAudio, setProbingAudio] = useState(false);
-  const [useFfmpegAudioEngine, setUseFfmpegAudioEngine] = useState<boolean>(true);
+  const [useFfmpegAudioEngine, setUseFfmpegAudioEngine] = useState<boolean>(false);
   const [audioBlockedByBrowser, setAudioBlockedByBrowser] = useState<boolean>(false);
   const [resolvedDirectUrl, setResolvedDirectUrl] = useState<string | null>(null);
   const [probedStreamUrl, setProbedStreamUrl] = useState<string | null>(null);
@@ -593,32 +594,33 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         ? (initialEpisode ?? media.videos[0])!.id
         : media.imdbId || media.id;
 
-    // Progressively ping remaining un-pinged direct streams in batches of 18 so ALL servers show their live ms ping
+    // Ping at most the top 18 un-pinged direct streams after a 2s startup delay so background pings never compete with <video> startup
     const pingRemainingServersInPlace = async (baseList: StremioStreamItem[]) => {
-      const unpinged = baseList.filter(
-        (s) => s.kind === 'direct' && !s.isPromo && Boolean(s.url) && !s.serverStatusBadge,
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 2000));
+      if (cancelled) return;
+      const topUnpinged = baseList
+        .filter(
+          (s) => s.kind === 'direct' && !s.isPromo && Boolean(s.url) && !s.serverStatusBadge,
+        )
+        .slice(0, 18);
+      if (topUnpinged.length === 0) return;
+      const metricsMap = await pingStreamBatch(topUnpinged);
+      if (cancelled || metricsMap.size === 0) return;
+      setStreams((prev) =>
+        prev.map((s) => {
+          const m = metricsMap.get(s.id);
+          if (!m) return s;
+          return {
+            ...s,
+            ttfbMs: m.ttfbMs,
+            speedMbps: m.speedMbps || s.speedMbps,
+            responsivenessScore: m.responsivenessScore || s.responsivenessScore,
+            serverStatusBadge: m.statusBadge,
+            unreachable: m.unreachable || !m.ok,
+            resolvedDirectUrl: m.resolvedUrl || s.resolvedDirectUrl || s.url,
+          };
+        }),
       );
-      for (let i = 0; i < unpinged.length; i += 18) {
-        if (cancelled) return;
-        const chunk = unpinged.slice(i, i + 18);
-        const metricsMap = await pingStreamBatch(chunk);
-        if (cancelled || metricsMap.size === 0) continue;
-        setStreams((prev) =>
-          prev.map((s) => {
-            const m = metricsMap.get(s.id);
-            if (!m) return s;
-            return {
-              ...s,
-              ttfbMs: m.ttfbMs,
-              speedMbps: m.speedMbps || s.speedMbps,
-              responsivenessScore: m.responsivenessScore || s.responsivenessScore,
-              serverStatusBadge: m.statusBadge,
-              unreachable: m.unreachable || !m.ok,
-              resolvedDirectUrl: m.resolvedUrl || s.resolvedDirectUrl || s.url,
-            };
-          }),
-        );
-      }
     };
 
     const rankWithTimeout = async (
@@ -725,34 +727,22 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
             if (!cancelled) setLoadingMoreProviders(false);
           });
 
-        if (hasRankedWinner || initialStream) {
-          setActiveStream((prev) => prev ?? initialStream ?? pickBestPlayableStream(orderedInitial));
-          if (!hasRankedWinner) {
-            rankStreamsByResponsiveness(orderedInitial)
-              .then((ranked) => {
-                if (cancelled || ranked.length === 0) return;
-                setStreams((prev) => mergeWithMeasuredMetrics(ranked, prev.length > ranked.length ? prev : ranked));
-                void pingRemainingServersInPlace(ranked);
-              })
-              .catch(() => {});
-          } else {
-            void pingRemainingServersInPlace(orderedInitial);
-          }
-          return;
-        }
-
-        setLoadingStreams(true);
-        try {
-          const ranked = await rankWithTimeout(orderedInitial, 4500);
-          if (cancelled) return;
-          const finalRanked = ranked.length > 0 ? ranked : orderedInitial;
-          setStreams((prev) =>
-            mergeWithMeasuredMetrics(finalRanked, prev.length > finalRanked.length ? prev : finalRanked),
-          );
-          setActiveStream((prev) => prev ?? pickBestPlayableStream(finalRanked));
-          void pingRemainingServersInPlace(finalRanked);
-        } finally {
-          if (!cancelled) setLoadingStreams(false);
+        // Instant Play (0ms pre-play benchmark gate, matching Nuvio Android):
+        // Start playing the top sorted / selected stream immediately while benchmarking runs non-blocking in the background
+        setLoadingStreams(false);
+        setActiveStream((prev) => prev ?? initialStream ?? pickBestPlayableStream(orderedInitial));
+        if (!hasRankedWinner) {
+          rankStreamsByResponsiveness(orderedInitial)
+            .then((ranked) => {
+              if (cancelled || ranked.length === 0) return;
+              setStreams((prev) =>
+                mergeWithMeasuredMetrics(ranked, prev.length > ranked.length ? prev : ranked),
+              );
+              void pingRemainingServersInPlace(ranked);
+            })
+            .catch(() => {});
+        } else {
+          void pingRemainingServersInPlace(orderedInitial);
         }
         return;
       }
@@ -761,35 +751,28 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       setLoadingMoreProviders(true);
       let firstWaveStarted = false;
 
-      let firstWaveInProgress = false;
-
-      const handleFirstWavePlayback = async (waveList: StremioStreamItem[]) => {
-        if (firstWaveStarted || firstWaveInProgress || cancelled) return;
+      const handleFirstWavePlayback = (waveList: StremioStreamItem[]) => {
+        if (firstWaveStarted || cancelled) return;
         const hasDirect = waveList.some(
           (s) => s.kind === 'direct' && !s.isPromo && !s.unreachable,
         );
         if (!hasDirect) return;
-        firstWaveInProgress = true;
-
-        if (initialStream) {
-          firstWaveStarted = true;
-          setLoadingStreams(false);
-          setActiveStream((prev) => prev ?? initialStream);
-          return;
-        }
-
-        const rankedWave = await rankWithTimeout(waveList, 4500);
-        firstWaveInProgress = false;
-        if (cancelled || firstWaveStarted) return;
         firstWaveStarted = true;
         setLoadingStreams(false);
-        setStreams((prev) =>
-          mergeWithMeasuredMetrics(
-            rankedWave,
-            prev.length > rankedWave.length ? prev : rankedWave,
-          ),
-        );
-        setActiveStream((prev) => prev ?? pickBestPlayableStream(rankedWave));
+        setActiveStream((prev) => prev ?? initialStream ?? pickBestPlayableStream(waveList));
+
+        // Benchmark first wave non-blocking in the background to annotate ping badges
+        rankWithTimeout(waveList, 2500)
+          .then((rankedWave) => {
+            if (cancelled || rankedWave.length === 0) return;
+            setStreams((prev) =>
+              mergeWithMeasuredMetrics(
+                rankedWave,
+                prev.length > rankedWave.length ? prev : rankedWave,
+              ),
+            );
+          })
+          .catch(() => {});
       };
 
       try {
@@ -817,23 +800,6 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         }
 
         setStreams((prev) => mergeWithMeasuredMetrics(prev, sorted));
-
-        if (initialStream) {
-          setActiveStream((prev) => prev ?? initialStream);
-          rankStreamsByResponsiveness(sorted)
-            .then((ranked) => {
-              if (cancelled || ranked.length === 0) return;
-              setStreams((prev) => mergeWithMeasuredMetrics(ranked, prev));
-              void pingRemainingServersInPlace(ranked);
-            })
-            .catch(() => {});
-          return;
-        }
-
-        const ranked = await rankWithTimeout(sorted, 4500);
-        if (cancelled) return;
-        const finalRanked = ranked.length > 0 ? ranked : sorted;
-        setStreams((prev) => mergeWithMeasuredMetrics(finalRanked, finalRanked));
         setActiveStream((prev) => {
           if (
             prev &&
@@ -841,9 +807,16 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
           ) {
             return prev;
           }
-          return pickBestPlayableStream(finalRanked);
+          return initialStream ?? pickBestPlayableStream(sorted);
         });
-        void pingRemainingServersInPlace(finalRanked);
+
+        rankStreamsByResponsiveness(sorted)
+          .then((ranked) => {
+            if (cancelled || ranked.length === 0) return;
+            setStreams((prev) => mergeWithMeasuredMetrics(ranked, prev));
+            void pingRemainingServersInPlace(ranked);
+          })
+          .catch(() => {});
       } finally {
         if (!cancelled) {
           setLoadingStreams(false);
@@ -1140,7 +1113,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       warmBrowserCdnConnection(targetCdnUrl);
       setResolvedDirectUrl(targetCdnUrl);
 
-      let shouldUseFfmpeg = true;
+      let shouldUseFfmpeg = false;
       if (probe) {
         if (probe.durationSec > 0) {
           setProbedDurationSec(probe.durationSec);
@@ -1154,14 +1127,19 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
           const targetAudioIndex = preferredTrack ? preferredTrack.audioIndex : 0;
           setSelectedAudioTrackIndex(targetAudioIndex);
 
-          // Direct-play from source CDN (0 MB Render bandwidth) when default track 0 already uses a browser-native audio codec
+          // Direct-play from source CDN (0 MB Render bandwidth & 0ms lockstep delay) whenever Track 0 is playable natively by the browser
           const isBrowserNativeAudio = Boolean(
-            preferredTrack &&
-              /^(aac|mp3|mp4a|opus|vorbis|flac)$/i.test(preferredTrack.codec),
+            preferredTrack && canBrowserPlayAudioCodecNatively(preferredTrack.codec),
           );
-          if (targetAudioIndex === 0 && isBrowserNativeAudio) {
-            shouldUseFfmpeg = false;
-          }
+          shouldUseFfmpeg = !(targetAudioIndex === 0 && isBrowserNativeAudio);
+        }
+      }
+      if (shouldUseFfmpeg) {
+        const video = videoRef.current;
+        if (video && video.currentTime > 1) {
+          const liveSec = Math.max(0, Math.floor(video.currentTime));
+          streamStartOffsetRef.current = liveSec;
+          setStreamStartOffsetSec(liveSec);
         }
       }
       setUseFfmpegAudioEngine(shouldUseFfmpeg);
@@ -1179,9 +1157,15 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       return;
     }
 
-    // Hold <video> and <audio> loading until /api/media-probe confirms reachability & audio codec
-    // so dead servers or track switches never trigger (canceled) media requests!
-    setProbedStreamUrl(null);
+    // Optimistic Direct-Play Fast-Path (Nuvio Android style):
+    // If the stream URL is already an HTTPS direct CDN link (and not an unresolved /resolve/ or /dl.php wrapper),
+    // start loading <video> immediately in 0ms while /api/media-probe inspects audio tracks in parallel!
+    const isDirectHttpsReady =
+      preResolvedCdn.toLowerCase().startsWith('https://') &&
+      !/\/resolve\/|\/dl\.php\?/i.test(preResolvedCdn);
+
+    setUseFfmpegAudioEngine(false);
+    setProbedStreamUrl(isDirectHttpsReady ? streamUrl : null);
     let cancelled = false;
     setProbingAudio(true);
     setProbedAudioTracks([]);
@@ -1360,7 +1344,12 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       directVideoLoadedUrlRef.current = null;
       const hls = new Hls({
         enableWorker: true,
-        fragLoadingMaxRetry: 1,
+        startFragPrefetch: true,
+        lowLatencyMode: false,
+        backBufferLength: 30,
+        maxBufferLength: 30,
+        maxMaxBufferLength: 60,
+        fragLoadingMaxRetry: 2,
         manifestLoadingMaxRetry: 1,
         levelLoadingMaxRetry: 1,
       });
@@ -1465,24 +1454,28 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         audio.removeAttribute('src');
         audio.load();
       }
-      directVideoLoadedUrlRef.current = effectiveCdnUrl;
-      video.src = effectiveCdnUrl;
       video.muted = isMuted;
       video.volume = volume;
       video.playbackRate = playbackSpeed;
-      video.load();
-      video.addEventListener(
-        'loadedmetadata',
-        () => {
-          if (streamStartOffsetSec > 0 && video.currentTime < 1) {
-            video.currentTime = streamStartOffsetSec;
-          }
-          video.play().catch(() => {
-            setIsPlaying(false);
-          });
-        },
-        { once: true },
-      );
+      if (directVideoLoadedUrlRef.current !== effectiveCdnUrl) {
+        directVideoLoadedUrlRef.current = effectiveCdnUrl;
+        video.src = effectiveCdnUrl;
+        video.load();
+        video.addEventListener(
+          'loadedmetadata',
+          () => {
+            if (streamStartOffsetSec > 0 && video.currentTime < 1) {
+              video.currentTime = streamStartOffsetSec;
+            }
+            video.play().catch(() => {
+              setIsPlaying(false);
+            });
+          },
+          { once: true },
+        );
+      } else if (video.paused && !userPausedRef.current) {
+        video.play().catch(() => {});
+      }
     }
 
     return () => {
@@ -1516,7 +1509,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     const canPlayChosenTrackNatively = Boolean(
       trackIndex === 0 &&
         chosenTrack &&
-        /^(aac|mp3|mp4a|opus|vorbis|flac)$/i.test(chosenTrack.codec),
+        canBrowserPlayAudioCodecNatively(chosenTrack.codec),
     );
     setUseFfmpegAudioEngine(!canPlayChosenTrackNatively);
     if (hlsRef.current) {
