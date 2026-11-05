@@ -78,9 +78,9 @@ import type { DbUserProfile, UserStatePayload } from './server/streamzDb';
 import {
   detectConceptClustersForText,
   extractSignificantKeywords,
+  INTELLIGENT_SUGGESTION_PLACEHOLDERS,
   loadLocalRecommendationPreferences,
   parseNaturalLanguageSuggestionQuery,
-  QUICK_SUGGESTION_PROMPTS,
   rankSimilarMediaItems,
   resetLocalRecommendationPreferences,
   saveLocalRecommendationPreferences,
@@ -594,6 +594,9 @@ export const App: React.FC = () => {
   // Feature 3: Smart Suggestions Tab state (nothing selected by default; infinite scroll enabled)
   const [suggestionInput, setSuggestionInput] = useState<string>('');
   const [suggestionPrompt, setSuggestionPrompt] = useState<string>('');
+  const [suggestionPlaceholderIdx, setSuggestionPlaceholderIdx] = useState<number>(() =>
+    Math.floor(Math.random() * INTELLIGENT_SUGGESTION_PLACEHOLDERS.length),
+  );
   const [suggestionTypeFilter, setSuggestionTypeFilter] = useState<'all' | 'movie' | 'series'>(
     'all',
   );
@@ -2533,6 +2536,24 @@ export const App: React.FC = () => {
     setSuggestionNextSkip(100);
   }, [suggestionPrompt, suggestionTypeFilter]);
 
+  // Rotate intelligent placeholder examples automatically when user is on Suggestions tab and input is empty
+  useEffect(() => {
+    if (activeNav !== 'suggestions' || suggestionInput.trim().length > 0) return;
+    setSuggestionPlaceholderIdx((prev) => {
+      const len = INTELLIGENT_SUGGESTION_PLACEHOLDERS.length;
+      if (len <= 1) return 0;
+      let next = Math.floor(Math.random() * len);
+      if (next === prev) next = (prev + 1) % len;
+      return next;
+    });
+    const timer = window.setInterval(() => {
+      setSuggestionPlaceholderIdx(
+        (prev) => (prev + 1) % INTELLIGENT_SUGGESTION_PLACEHOLDERS.length,
+      );
+    }, 3400);
+    return () => window.clearInterval(timer);
+  }, [activeNav, suggestionInput]);
+
   useEffect(() => {
     if (activeNav !== 'suggestions' || !currentUser) return;
     let cancelled = false;
@@ -3740,7 +3761,11 @@ export const App: React.FC = () => {
                     <input
                       type="text"
                       className="suggestions-prompt-input"
-                      placeholder="Type a description, concept (e.g. post-apocalyptic, space, vampire), genre, or year…"
+                      placeholder={
+                        INTELLIGENT_SUGGESTION_PLACEHOLDERS[
+                          suggestionPlaceholderIdx % INTELLIGENT_SUGGESTION_PLACEHOLDERS.length
+                        ]
+                      }
                       value={suggestionInput}
                       onChange={(e) => {
                         setSuggestionInput(e.target.value);
@@ -3780,33 +3805,6 @@ export const App: React.FC = () => {
                     ))}
                   </div>
                 </form>
-
-                {/* Quick Concept Inspiration Chips */}
-                <div className="suggestions-quick-chips">
-                  {QUICK_SUGGESTION_PROMPTS.map((preset) => {
-                    const isActive =
-                      Boolean(suggestionPrompt.trim()) &&
-                      suggestionPrompt.trim().toLowerCase() === preset.prompt.toLowerCase();
-                    return (
-                      <button
-                        key={preset.label}
-                        type="button"
-                        className={`genre-pill ${isActive ? 'active' : ''}`}
-                        onClick={() => {
-                          if (isActive) {
-                            setSuggestionInput('');
-                            setSuggestionPrompt('');
-                          } else {
-                            setSuggestionInput(preset.prompt);
-                            setSuggestionPrompt(preset.prompt);
-                          }
-                        }}
-                      >
-                        {preset.label}
-                      </button>
-                    );
-                  })}
-                </div>
               </div>
 
               <div className="shelf-header" style={{ marginTop: 18 }}>

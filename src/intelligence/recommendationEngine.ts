@@ -679,40 +679,22 @@ export function scoreCandidatesForSuggestionPrompt(
   }));
 }
 
+export const INTELLIGENT_SUGGESTION_PLACEHOLDERS: string[] = [
+  'Try: "Mind-bending sci-fi with a time loop and a satisfying twist…"',
+  'Try: "Post-apocalyptic survival after a deadly virus outbreak…"',
+  'Try: "Like Interstellar, but darker and more suspenseful…"',
+  'Try: "Slow-burn detective murder mystery without gore…"',
+  'Try: "Realistic deep space exploration and astronauts after 2015…"',
+  'Try: "Underrated psychological thriller under two hours…"',
+  'Try: "Dark bloody vampire or supernatural horror from the 2020s…"',
+  'Try: "High-stakes bank heist or mastermind crime movie…"',
+  'Try: "Something light and feel-good for tonight, no romance…"',
+  'Try: "Movies about artificial intelligence and consciousness…"',
+  'Try: "Dark fantasy series with political intrigue and betrayal…"',
+  'Try: "Sci-fi action movie, avoid predictable superhero films…"',
+];
+
 export const QUICK_SUGGESTION_PROMPTS: Array<{
   label: string;
   prompt: string;
-}> = [
-  {
-    label: 'Post-Apocalyptic Survival',
-    prompt: 'Post-apocalyptic survival after a virus outbreak or wasteland collapse',
-  },
-  {
-    label: 'Deep Space & Interstellar',
-    prompt: 'Realistic space exploration, astronauts, alien worlds and hard sci-fi',
-  },
-  {
-    label: 'Mind-Bending & Time Loops',
-    prompt: 'Mind-bending sci-fi or thriller with time loops and a satisfying twist',
-  },
-  {
-    label: 'Dark Detective Mystery',
-    prompt: 'Slow-burn detective murder mystery with a dark atmosphere',
-  },
-  {
-    label: 'Like Interstellar, But Darker',
-    prompt: 'Like Interstellar, but darker and more suspenseful',
-  },
-  {
-    label: 'Thriller Without Gore',
-    prompt: 'Gripping psychological thriller without gore or slasher violence',
-  },
-  {
-    label: 'Underrated Hidden Gems',
-    prompt: 'Underrated psychological thriller or sci-fi hidden gems above 7.2',
-  },
-  {
-    label: 'Light & Feel-Good Tonight',
-    prompt: 'Something light and uplifting for tonight without depressing drama',
-  },
-];
+}> = [];
