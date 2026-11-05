@@ -3779,9 +3779,11 @@ export const App: React.FC = () => {
                             onOpenDossier={openItemDossier}
                             onToggleLibrary={toggleLibraryItem}
                           />
-                          <div className={`suggestion-match-reason-pill mono ${tierClass}`}>
-                            <span>{matchReasonLabel}</span>
-                          </div>
+                          {Boolean(suggestionPrompt.trim()) && (
+                            <div className={`suggestion-match-reason-pill mono ${tierClass}`}>
+                              <span>{matchReasonLabel}</span>
+                            </div>
+                          )}
                         </div>
                       );
                     })}
