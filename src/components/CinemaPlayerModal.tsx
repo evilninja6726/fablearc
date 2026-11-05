@@ -8,7 +8,6 @@ import {
   ChevronUp,
   Copy,
   Crop,
-  Download,
   ExternalLink,
   FastForward,
   Gauge,
@@ -37,7 +36,6 @@ import {
   applyCachedServerHealth,
   buildTranscodedStreamUrl,
   canBrowserPlayAudioCodecNatively,
-  canDirectDownloadStream,
   fetchStreamsFromAddons,
   fetchSubtitlesFromAddons,
   getAudioTrackLanguagePriority,
@@ -57,7 +55,6 @@ import {
   StremioMediaItem,
   StremioStreamItem,
   StremioSubtitleTrack,
-  triggerDirectStreamDownload,
   warmBrowserCdnConnection,
 } from '../addons/stremioProtocol';
 import {
@@ -454,49 +451,6 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
 
   // Keep HUD visible whenever paused, buffering, or a bottom dropdown popover is open
   const showControlsHud = hudVisible || !isPlaying || isBuffering || activePopover !== null;
-
-  const [downloadingStreamId, setDownloadingStreamId] = useState<string | null>(null);
-
-  const handleDownloadStream = useCallback(
-    async (targetStream: StremioStreamItem, e?: React.MouseEvent) => {
-      if (e) {
-        e.stopPropagation();
-        e.preventDefault();
-      }
-      if (!canDirectDownloadStream(targetStream) || downloadingStreamId === targetStream.id) {
-        return;
-      }
-      setDownloadingStreamId(targetStream.id);
-      const episodeTag = selectedEpisode
-        ? `S${String(selectedEpisode.season).padStart(2, '0')}E${String(selectedEpisode.episode).padStart(2, '0')}`
-        : undefined;
-      try {
-        const result = await triggerDirectStreamDownload(targetStream, {
-          mediaName: media.name,
-          episodeTag,
-          fallbackResolvedUrl:
-            activeStream?.id === targetStream.id && resolvedDirectUrl
-              ? resolvedDirectUrl
-              : undefined,
-        });
-        if (!result.ok) {
-          if (targetStream.url && isOfflineStream(applyCachedServerHealth([targetStream])[0])) {
-            setStreams((prev) => prev.filter((s) => s.id !== targetStream.id));
-          }
-          setFailoverToast(result.reason || 'Unable to start download for this server.');
-          window.setTimeout(() => setFailoverToast(null), 4000);
-          return;
-        }
-        setFailoverToast(
-          `Download started: ${result.filename}${targetStream.sizeLabel ? ` (${targetStream.sizeLabel})` : ''}`,
-        );
-        window.setTimeout(() => setFailoverToast(null), 4200);
-      } finally {
-        setDownloadingStreamId((curr) => (curr === targetStream.id ? null : curr));
-      }
-    },
-    [activeStream?.id, downloadingStreamId, media.name, resolvedDirectUrl, selectedEpisode],
-  );
 
   // Automatically switch to the next available stream in decreasing quality order and remove the failed offline stream
   const switchToNextStream = useCallback(
@@ -2264,19 +2218,8 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
           </div>
         </div>
 
-        {/* Top-Right Quick Utility Actions (Download, Ambilight, Screenshot, Mini Player, Screen Lock) */}
+        {/* Top-Right Quick Utility Actions (Ambilight, Screenshot, Mini Player, Screen Lock) */}
         <div className="player-top-right">
-          {activeStream && canDirectDownloadStream(activeStream) && (
-            <button
-              type="button"
-              className={`player-icon-btn ${downloadingStreamId === activeStream.id ? 'active-utility-btn' : ''}`}
-              onClick={(e) => handleDownloadStream(activeStream, e)}
-              title={`Download ${activeStream.qualityBadge || 'Video'}${activeStream.sizeLabel ? ` (${activeStream.sizeLabel})` : ''} directly from CDN`}
-              aria-label="Download Current Stream"
-            >
-              <Download size={17} />
-            </button>
-          )}
           <button
             type="button"
             className={`player-icon-btn ${ambilightEnabled ? 'active-utility-btn' : ''}`}
@@ -3033,20 +2976,6 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                   </span>
                 </button>
               )}
-              {activeStream && canDirectDownloadStream(activeStream) && (
-                <button
-                  type="button"
-                  className="secondary-outline-btn"
-                  onClick={(e) => handleDownloadStream(activeStream, e)}
-                >
-                  <Download size={16} />
-                  <span>
-                    {downloadingStreamId === activeStream.id
-                      ? 'Starting Download…'
-                      : `Download${activeStream.sizeLabel ? ` (${activeStream.sizeLabel})` : ''}`}
-                  </span>
-                </button>
-              )}
             </div>
           </div>
         )}
@@ -3212,7 +3141,6 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                     filteredStreamsByProvider.map((stream) => {
                       const isSelected = activeStream?.id === stream.id;
                       const providerLabel = getStreamProviderCategory(stream);
-                      const isDownloadable = canDirectDownloadStream(stream);
                       const tierClass =
                         (stream.qualityScore ?? 0) >= 2160
                           ? 'tier-4k'
@@ -3221,31 +3149,23 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                             : (stream.qualityScore ?? 0) >= 720
                               ? 'tier-720p'
                               : 'tier-sd';
-                      const selectStreamRow = () => {
-                        if (stream.kind === 'external' && stream.externalUrl) {
-                          window.open(stream.externalUrl, '_blank', 'noopener,noreferrer');
-                          return;
-                        }
-                        userManuallySelectedStreamRef.current = true;
-                        const resumeAtSec = Math.max(0, Math.floor(currentTimeRef.current));
-                        setStreamStartOffsetSec(resumeAtSec);
-                        setCurrentTimeSec(resumeAtSec);
-                        setActiveStream(stream);
-                        setActivePopover(null);
-                      };
                       return (
-                        <div
+                        <button
                           key={stream.id}
-                          role="button"
-                          tabIndex={0}
+                          type="button"
                           className={`popover-option-row ${isSelected ? 'selected' : ''}`}
                           style={{ opacity: stream.unreachable ? 0.55 : 1 }}
-                          onClick={selectStreamRow}
-                          onKeyDown={(e) => {
-                            if (e.key === 'Enter' || e.key === ' ') {
-                              e.preventDefault();
-                              selectStreamRow();
+                          onClick={() => {
+                            if (stream.kind === 'external' && stream.externalUrl) {
+                              window.open(stream.externalUrl, '_blank', 'noopener,noreferrer');
+                              return;
                             }
+                            userManuallySelectedStreamRef.current = true;
+                            const resumeAtSec = Math.max(0, Math.floor(currentTimeRef.current));
+                            setStreamStartOffsetSec(resumeAtSec);
+                            setCurrentTimeSec(resumeAtSec);
+                            setActiveStream(stream);
+                            setActivePopover(null);
                           }}
                         >
                           <div className="popover-option-main">
@@ -3273,24 +3193,8 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                             </div>
                             <span className="popover-option-sub">{stream.title}</span>
                           </div>
-                          <div className="stream-row-right-actions">
-                            {isDownloadable && (
-                              <button
-                                type="button"
-                                className="stream-download-action-btn"
-                                onClick={(e) => handleDownloadStream(stream, e)}
-                                title={`Download ${stream.qualityBadge || 'file'}${stream.sizeLabel ? ` (${stream.sizeLabel})` : ''}`}
-                                aria-label={`Download ${stream.name}`}
-                              >
-                                <Download size={14} />
-                                <span>
-                                  {downloadingStreamId === stream.id ? 'Starting…' : 'Download'}
-                                </span>
-                              </button>
-                            )}
-                            {isSelected && <Check size={16} className="selected-check" />}
-                          </div>
-                        </div>
+                          {isSelected && <Check size={16} className="selected-check" />}
+                        </button>
                       );
                     })
                   )}

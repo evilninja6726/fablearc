@@ -15,14 +15,11 @@ import {
   addonSupportsResource,
   applyCachedServerHealth,
   buildP2pMagnetUri,
-  buildStreamDownloadFilename,
   buildStreamingCatalogsManifestUrl,
   canBrowserPlayAudioCodecNatively,
-  canDirectDownloadStream,
   DEFAULT_BOOTSTRAP_MANIFEST_URLS,
   DEFAULT_PENGUPLAY_MANIFEST_URL,
   extractStreamQualityInfo,
-  formatDirectDownloadUrl,
   getStreamProviderCategory,
   isOfflineStream,
   markStreamOfflineInCache,
@@ -729,42 +726,5 @@ describe('Commercial SQLite WAL Database (Per-User Auth, Watch History & Dedupli
     const adminList = db.adminListUsers(adminId);
     expect(adminList).toHaveLength(2);
     expect(adminList.every((u) => u.passwordHash.startsWith('scrypt$'))).toBe(true);
-  });
-
-  it('validates direct CDN download URLs, PixelDrain attachment query, and safe filenames', () => {
-    const directMkv: StremioStreamItem = {
-      id: 'dl-1',
-      addonId: 'com.stremio.HdHub',
-      addonName: 'HdHub',
-      name: 'HdHub 1080p',
-      title: '[PixelDrain] [💾 2.3GB] Sinners.2025.1080p.10Bit.HEVC.DS4K.WEB-DL.Hindi.5.1-English.5.1.mkv',
-      kind: 'direct',
-      url: 'https://pixeldrain.dev/api/file/abc123xyz',
-      qualityScore: 1080,
-      qualityBadge: '1080p FHD',
-      audioBadge: 'Dual Audio',
-    };
-    const hlsPlaylist: StremioStreamItem = {
-      id: 'dl-hls',
-      addonId: 'webstreamr',
-      addonName: 'WebStreamr',
-      name: 'WebStreamr 1080p',
-      title: 'HLS Master Playlist',
-      kind: 'direct',
-      url: 'https://cdn.example.com/master.m3u8',
-      isHls: true,
-    };
-
-    expect(canDirectDownloadStream(directMkv)).toBe(true);
-    expect(canDirectDownloadStream(hlsPlaylist)).toBe(false);
-    expect(formatDirectDownloadUrl('https://pixeldrain.dev/api/file/abc123xyz')).toBe(
-      'https://pixeldrain.dev/api/file/abc123xyz?download',
-    );
-    expect(formatDirectDownloadUrl('https://pixeldrain.dev/u/abc123xyz')).toBe(
-      'https://pixeldrain.dev/api/file/abc123xyz?download',
-    );
-    expect(buildStreamDownloadFilename(directMkv, 'Sinners')).toBe(
-      'Sinners.2025.1080p.10Bit.HEVC.DS4K.WEB-DL.Hindi.5.1-English.5.1.mkv',
-    );
   });
 });

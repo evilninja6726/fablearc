@@ -7,7 +7,6 @@ import {
   ChevronRight,
   Clapperboard,
   Compass,
-  Download,
   ExternalLink,
   Film,
   Flame,
@@ -37,7 +36,6 @@ import {
   applyCachedServerHealth,
   buildApiUrl,
   buildStreamingCatalogsManifestUrl,
-  canDirectDownloadStream,
   CommunityAddonDirectoryEntry,
   DEFAULT_BOOTSTRAP_MANIFEST_URLS,
   fetchAddonCatalog,
@@ -60,7 +58,6 @@ import {
   StremioMediaItem,
   StremioStreamItem,
   stripDiscordText,
-  triggerDirectStreamDownload,
   upgradeLegacyDefaultAddonUrl,
 } from './addons/stremioProtocol';
 import {
@@ -1401,47 +1398,6 @@ export const App: React.FC = () => {
   }, [searchQuery, addons, catalogShelves]);
 
   // Open Movie / Series Details Page & enrich with episodes, sorted streams, and similar titles
-  const [dossierDownloadingStreamId, setDossierDownloadingStreamId] = useState<string | null>(null);
-  const [dossierDownloadToast, setDossierDownloadToast] = useState<string | null>(null);
-
-  const handleDossierDownloadStream = useCallback(
-    async (stream: StremioStreamItem, e?: React.MouseEvent) => {
-      if (e) {
-        e.stopPropagation();
-        e.preventDefault();
-      }
-      if (!canDirectDownloadStream(stream) || dossierDownloadingStreamId === stream.id) {
-        return;
-      }
-      setDossierDownloadingStreamId(stream.id);
-      const firstEp =
-        dossierItem?.type === 'series' && dossierItem.videos?.[0]
-          ? `S${String(dossierItem.videos[0].season).padStart(2, '0')}E${String(dossierItem.videos[0].episode).padStart(2, '0')}`
-          : undefined;
-      try {
-        const res = await triggerDirectStreamDownload(stream, {
-          mediaName: dossierItem?.name,
-          episodeTag: firstEp,
-        });
-        if (!res.ok) {
-          if (stream.url && isOfflineStream(applyCachedServerHealth([stream])[0])) {
-            setDossierStreams((prev) => prev.filter((s) => s.id !== stream.id));
-          }
-          setDossierDownloadToast(res.reason || 'Unable to download from this server.');
-          window.setTimeout(() => setDossierDownloadToast(null), 4000);
-          return;
-        }
-        setDossierDownloadToast(
-          `Download started: ${res.filename}${stream.sizeLabel ? ` (${stream.sizeLabel})` : ''}`,
-        );
-        window.setTimeout(() => setDossierDownloadToast(null), 4200);
-      } finally {
-        setDossierDownloadingStreamId((curr) => (curr === stream.id ? null : curr));
-      }
-    },
-    [dossierDownloadingStreamId, dossierItem],
-  );
-
   const openItemDossier = useCallback(
     async (item: StremioMediaItem) => {
       if (!currentUser) {
@@ -4126,29 +4082,6 @@ export const App: React.FC = () => {
                       </span>
                     </button>
 
-                    {dossierStreams.some((s) => canDirectDownloadStream(s)) && (
-                      <button
-                        type="button"
-                        className="glass-secondary-btn"
-                        onClick={() => {
-                          setDossierShowStreams(true);
-                          const bestDownloadable =
-                            dossierStreams.find(
-                              (s) => s.isTopResponsive && canDirectDownloadStream(s),
-                            ) || dossierStreams.find((s) => canDirectDownloadStream(s));
-                          if (bestDownloadable) {
-                            handleDossierDownloadStream(bestDownloadable);
-                          }
-                        }}
-                        title="Download highest-quality direct MKV/MP4 stream directly from CDN (or choose any quality below)"
-                      >
-                        <Download size={15} />
-                        <span>
-                          {dossierDownloadingStreamId ? 'Starting Download…' : 'Download'}
-                        </span>
-                      </button>
-                    )}
-
                     <button
                       type="button"
                       className="glass-secondary-btn"
@@ -4159,27 +4092,6 @@ export const App: React.FC = () => {
                       <span>Surprise Me</span>
                     </button>
                   </div>
-
-                  {dossierDownloadToast && (
-                    <div
-                      className="mono"
-                      style={{
-                        marginTop: 10,
-                        padding: '8px 14px',
-                        borderRadius: 8,
-                        background: 'rgba(16, 185, 129, 0.14)',
-                        border: '1px solid rgba(16, 185, 129, 0.4)',
-                        color: '#6ee7b7',
-                        fontSize: 12,
-                        display: 'inline-flex',
-                        alignItems: 'center',
-                        gap: 8,
-                      }}
-                    >
-                      <Download size={14} />
-                      <span>{dossierDownloadToast}</span>
-                    </div>
-                  )}
 
                   {/* Personal Collection Status & 1-5★ Rating Bar inside Details Page */}
                   <div className="details-personal-rating-bar">
@@ -4427,7 +4339,6 @@ export const App: React.FC = () => {
                   <div className="dossier-streams-list">
                     {filteredDossierStreams.map((st) => {
                       const providerLabel = getStreamProviderCategory(st);
-                      const isDownloadable = canDirectDownloadStream(st);
                       const tierClass =
                         (st.qualityScore ?? 0) >= 2160
                           ? 'tier-4k'
@@ -4487,25 +4398,9 @@ export const App: React.FC = () => {
                               <span>{st.title}</span>
                             </div>
                           </div>
-                          <div className="stream-row-right-actions">
-                            {isDownloadable && (
-                              <button
-                                type="button"
-                                className="stream-download-action-btn"
-                                onClick={(e) => handleDossierDownloadStream(st, e)}
-                                title={`Download ${st.qualityBadge || 'file'}${st.sizeLabel ? ` (${st.sizeLabel})` : ''} directly from CDN`}
-                                aria-label={`Download ${st.name}`}
-                              >
-                                <Download size={14} />
-                                <span>
-                                  {dossierDownloadingStreamId === st.id ? 'Starting…' : 'Download'}
-                                </span>
-                              </button>
-                            )}
-                            <span className="episode-play-indicator">
-                              <Play size={14} fill="currentColor" />
-                            </span>
-                          </div>
+                          <span className="episode-play-indicator">
+                            <Play size={14} fill="currentColor" />
+                          </span>
                         </div>
                       );
                     })}
