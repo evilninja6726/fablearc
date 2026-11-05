@@ -879,7 +879,6 @@ describe('Strix-Style E2E & Security Audit Suite', () => {
     // 5. Verify Background Partial Server Speed Benchmark (/api/media-health-batch), rankStreamsByResponsiveness, and Full-Viewport Details Page
     const stylesCss = fs.readFileSync(path.join(rootDir, 'src/styles.css'), 'utf8');
     expect(appTsx).toContain('rankStreamsByResponsiveness');
-    expect(appTsx).toContain('fastest-server-badge');
     expect(stylesCss).toContain('max-width: 100vw;');
 
     const { token } = ctx.db.registerUser({

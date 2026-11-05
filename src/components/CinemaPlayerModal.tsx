@@ -41,8 +41,6 @@ import {
   getCachedMediaProbe,
   getStreamProviderCategory,
   InstalledAddon,
-  isUnreachableOrSlowStream,
-  markStreamUnreachableInCache,
   MediaProbeResponse,
   pingStreamBatch,
   ProbedAudioTrack,
@@ -456,24 +454,31 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     (reason: string) => {
       if (!activeStream) return;
       failedStreamIdsRef.current.add(activeStream.id);
-      markStreamUnreachableInCache(activeStream.url, 'Offline');
 
-      const remainingStreams = streams.filter(
-        (s) => s.id !== activeStream.id && !isUnreachableOrSlowStream(s),
-      );
-      setStreams(remainingStreams);
-
-      const playableCandidates = remainingStreams.filter(
+      const playableCandidates = streams.filter(
         (s) => (s.kind === 'direct' || s.kind === 'youtube') && !s.isPromo,
       );
-      const pool = playableCandidates.length > 0 ? playableCandidates : remainingStreams;
-      if (pool.length === 0) {
+      const pool = playableCandidates.length > 0 ? playableCandidates : streams;
+      if (pool.length <= 1) {
         setFailoverToast('No alternative stream available to switch to.');
         return;
       }
 
-      const nextStream =
-        pool.find((s) => !failedStreamIdsRef.current.has(s.id)) ?? pool[0];
+      const currentIdx = pool.findIndex((s) => s.id === activeStream.id);
+      let nextStream: StremioStreamItem | undefined;
+
+      for (let offset = 1; offset <= pool.length; offset++) {
+        const candidate = pool[(Math.max(0, currentIdx) + offset) % pool.length];
+        if (candidate && !failedStreamIdsRef.current.has(candidate.id)) {
+          nextStream = candidate;
+          break;
+        }
+      }
+
+      if (!nextStream) {
+        failedStreamIdsRef.current.clear();
+        nextStream = pool[(Math.max(0, currentIdx) + 1) % pool.length];
+      }
 
       if (nextStream && nextStream.id !== activeStream.id) {
         captureVideoFrameSnapshot();
@@ -599,21 +604,19 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         const metricsMap = await pingStreamBatch(chunk);
         if (cancelled || metricsMap.size === 0) continue;
         setStreams((prev) =>
-          prev
-            .map((s) => {
-              const m = metricsMap.get(s.id);
-              if (!m) return s;
-              return {
-                ...s,
-                ttfbMs: m.ttfbMs,
-                speedMbps: m.speedMbps || s.speedMbps,
-                responsivenessScore: m.responsivenessScore || s.responsivenessScore,
-                serverStatusBadge: m.statusBadge,
-                unreachable: m.unreachable || !m.ok,
-                resolvedDirectUrl: m.resolvedUrl || s.resolvedDirectUrl || s.url,
-              };
-            })
-            .filter((s) => !isUnreachableOrSlowStream(s)),
+          prev.map((s) => {
+            const m = metricsMap.get(s.id);
+            if (!m) return s;
+            return {
+              ...s,
+              ttfbMs: m.ttfbMs,
+              speedMbps: m.speedMbps || s.speedMbps,
+              responsivenessScore: m.responsivenessScore || s.responsivenessScore,
+              serverStatusBadge: m.statusBadge,
+              unreachable: m.unreachable || !m.ok,
+              resolvedDirectUrl: m.resolvedUrl || s.resolvedDirectUrl || s.url,
+            };
+          }),
         );
       }
     };
@@ -647,12 +650,10 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         }
       }
       if (measuredById.size === 0) return cleanIncoming;
-      const merged = cleanIncoming
-        .map((itemStream) => {
-          const measured = measuredById.get(itemStream.id);
-          return measured ? { ...itemStream, ...measured } : itemStream;
-        })
-        .filter((s) => !isUnreachableOrSlowStream(s));
+      const merged = cleanIncoming.map((itemStream) => {
+        const measured = measuredById.get(itemStream.id);
+        return measured ? { ...itemStream, ...measured } : itemStream;
+      });
       const topWinner = merged.find((s) => s.isTopResponsive && !s.unreachable);
       if (!topWinner) return sortStreamsByDecreasingQuality(merged);
       const rest = sortStreamsByDecreasingQuality(
@@ -765,7 +766,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       const handleFirstWavePlayback = async (waveList: StremioStreamItem[]) => {
         if (firstWaveStarted || firstWaveInProgress || cancelled) return;
         const hasDirect = waveList.some(
-          (s) => s.kind === 'direct' && !s.isPromo && !isUnreachableOrSlowStream(s),
+          (s) => s.kind === 'direct' && !s.isPromo && !s.unreachable,
         );
         if (!hasDirect) return;
         firstWaveInProgress = true;
@@ -780,21 +781,15 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         const rankedWave = await rankWithTimeout(waveList, 4500);
         firstWaveInProgress = false;
         if (cancelled || firstWaveStarted) return;
-        const healthyWave = rankedWave.filter((s) => !isUnreachableOrSlowStream(s));
-        if (healthyWave.length === 0) {
-          // All streams in this early wave were dead; keep waiting for the next provider wave!
-          setStreams((prev) => prev.filter((s) => !isUnreachableOrSlowStream(s)));
-          return;
-        }
         firstWaveStarted = true;
         setLoadingStreams(false);
         setStreams((prev) =>
           mergeWithMeasuredMetrics(
-            healthyWave,
-            prev.length > healthyWave.length ? prev : healthyWave,
+            rankedWave,
+            prev.length > rankedWave.length ? prev : rankedWave,
           ),
         );
-        setActiveStream((prev) => prev ?? pickBestPlayableStream(healthyWave));
+        setActiveStream((prev) => prev ?? pickBestPlayableStream(rankedWave));
       };
 
       try {
@@ -2862,7 +2857,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
           activeStream.url && (
           <div className="pause-dossier-overlay" onClick={(e) => e.stopPropagation()}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 6 }}>
-              <span className="fastest-server-badge">
+              <span className="multi-audio-badge">
                 {activeStream.serverStatusBadge || 'P2P Swarm'}
               </span>
               {activeStream.qualityBadge && (
@@ -2906,7 +2901,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                   }}
                 >
                   <Play size={16} />
-                  <span>Play Fastest Direct Server</span>
+                  <span>Play Direct Server</span>
                 </button>
               )}
 
@@ -3186,11 +3181,6 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                         >
                           <div className="popover-option-main">
                             <div className="popover-option-title-line">
-                              {stream.isTopResponsive && (
-                                <span className="fastest-server-badge">
-                                  ⚡ Fastest
-                                </span>
-                              )}
                               <span className={`quality-tier-badge ${tierClass}`}>
                                 {stream.qualityBadge || stream.kind.toUpperCase()}
                               </span>

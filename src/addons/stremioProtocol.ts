@@ -1989,84 +1989,29 @@ const clientServerHealthCache = new Map<
 >();
 
 /**
- * Returns true if a stream has been detected as offline, unreachable, blocked, HTTP-only, or slow/timed-out.
- */
-export function isUnreachableOrSlowStream(stream: StremioStreamItem): boolean {
-  if (stream.unreachable) return true;
-  if (stream.url) {
-    const urlLower = stream.url.toLowerCase();
-    if (
-      urlLower.includes('hubcloud.ist') ||
-      urlLower.includes('rohitkiskk.workers.dev') ||
-      urlLower.includes('video-downloads.googleusercontent.com') ||
-      urlLower.includes('/resolve/cj/')
-    ) {
-      return true;
-    }
-  }
-  if (
-    stream.serverStatusBadge &&
-    /^(Slow\s*\/\s*Timeout|Offline|Blocked|HTTP Only)$/i.test(
-      stream.serverStatusBadge.trim(),
-    )
-  ) {
-    return true;
-  }
-  return false;
-}
-
-/**
- * Marks a stream URL as unreachable/offline in the client health cache so it is immediately
- * pruned from both the Details Page and Player server lists.
- */
-export function markStreamUnreachableInCache(
-  streamUrl?: string | null,
-  statusBadge: 'Offline' | 'Slow / Timeout' = 'Offline',
-): void {
-  if (!streamUrl) return;
-  clientServerHealthCache.set(streamUrl, {
-    metric: {
-      id: streamUrl,
-      ok: false,
-      unreachable: true,
-      isHttps: streamUrl.startsWith('https://'),
-      resolvedUrl: streamUrl,
-      ttfbMs: 9999,
-      speedMbps: 0,
-      responsivenessScore: -500,
-      statusBadge,
-    },
-    expiresAt: Date.now() + 5 * 60 * 1000,
-  });
-}
-
-/**
  * Layer 4 (Client-Side Ping & Resolution Cache):
- * Applies any cached server ping/health metrics synchronously and removes confirmed
- * Slow / Timeout and Offline streams so re-opening the Details Page or Player displays
- * only healthy servers in 0ms.
+ * Applies any cached server ping/health metrics synchronously so re-opening the Details Page
+ * or Player displays `ms` badges and unwrapped CDN URLs in 0ms without re-pinging.
  */
 export function applyCachedServerHealth(
   streams: StremioStreamItem[],
 ): StremioStreamItem[] {
   const now = Date.now();
-  return streams
-    .map((s) => {
-      if (!s.url) return s;
-      const cached = clientServerHealthCache.get(s.url);
-      if (!cached || cached.expiresAt <= now) return s;
-      const m = cached.metric;
-      return {
-        ...s,
-        ttfbMs: m.ttfbMs,
-        speedMbps: m.speedMbps || s.speedMbps,
-        responsivenessScore: m.responsivenessScore || s.responsivenessScore,
-        serverStatusBadge: m.statusBadge || s.serverStatusBadge,
-        unreachable: m.unreachable || !m.ok,
-        resolvedDirectUrl: m.resolvedUrl || s.resolvedDirectUrl || s.url,
-      };
-    })
-    .filter((s) => !isUnreachableOrSlowStream(s));
+  return streams.map((s) => {
+    if (!s.url) return s;
+    const cached = clientServerHealthCache.get(s.url);
+    if (!cached || cached.expiresAt <= now) return s;
+    const m = cached.metric;
+    return {
+      ...s,
+      ttfbMs: m.ttfbMs,
+      speedMbps: m.speedMbps || s.speedMbps,
+      responsivenessScore: m.responsivenessScore || s.responsivenessScore,
+      serverStatusBadge: m.statusBadge || s.serverStatusBadge,
+      unreachable: m.unreachable || !m.ok,
+      resolvedDirectUrl: m.resolvedUrl || s.resolvedDirectUrl || s.url,
+    };
+  });
 }
 
 /**
@@ -2248,23 +2193,21 @@ export async function rankStreamsByResponsiveness(
       return sortedBase;
     }
 
-    // Annotate streams with measured TTFB, speed, and reachability, then remove Slow / Timeout & Offline streams
-    const annotated = sortedBase
-      .map((s) => {
-        const m = metricById.get(s.id);
-        if (!m) return { ...s, isTopResponsive: false };
-        return {
-          ...s,
-          isTopResponsive: false,
-          ttfbMs: m.ttfbMs,
-          speedMbps: m.speedMbps,
-          responsivenessScore: m.responsivenessScore,
-          serverStatusBadge: m.statusBadge,
-          unreachable: m.unreachable || !m.ok,
-          resolvedDirectUrl: m.resolvedUrl || s.url,
-        };
-      })
-      .filter((s) => !isUnreachableOrSlowStream(s));
+    // Annotate streams with measured TTFB, speed, and reachability
+    const annotated = sortedBase.map((s) => {
+      const m = metricById.get(s.id);
+      if (!m) return { ...s, isTopResponsive: false };
+      return {
+        ...s,
+        isTopResponsive: false,
+        ttfbMs: m.ttfbMs,
+        speedMbps: m.speedMbps,
+        responsivenessScore: m.responsivenessScore,
+        serverStatusBadge: m.statusBadge,
+        unreachable: m.unreachable || !m.ok,
+        resolvedDirectUrl: m.resolvedUrl || s.url,
+      };
+    });
 
     // Identify the best healthy server among the benchmarked candidates
     // Combine responsivenessScore with quality + multi-audio + Layer 3 Native/Fast-Start container bonus
@@ -2322,9 +2265,11 @@ export async function rankStreamsByResponsiveness(
       isTopResponsive: true,
     };
 
-    // Remaining healthy/untested streams stay in exact decreasing quality order;
-    // Slow / Timeout and Offline streams have already been removed.
-    const healthyOrUntested = annotated.filter((s) => s.id !== bestStreamId);
+    // Remaining healthy/untested streams stay in exact decreasing quality order,
+    // while confirmed unreachable/HTTP-only streams are demoted below healthy direct streams
+    const others = annotated.filter((s) => s.id !== bestStreamId);
+    const healthyOrUntested = others.filter((s) => !s.unreachable);
+    const demotedDead = others.filter((s) => s.unreachable);
 
     // Layer 2 & 3: Immediately preconnect browser TLS to the winning CDN origin AND pre-warm /api/media-probe!
     warmBrowserCdnConnection(topWinner.resolvedDirectUrl || topWinner.url);
@@ -2332,7 +2277,7 @@ export async function rankStreamsByResponsiveness(
       probeMediaStream(topWinner.url, authToken ?? undefined).catch(() => {});
     }
 
-    return [topWinner, ...healthyOrUntested];
+    return [topWinner, ...healthyOrUntested, ...demotedDead];
   } catch {
     return sortedBase;
   }

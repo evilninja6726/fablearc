@@ -45,7 +45,6 @@ import {
   fetchStremioManifest,
   getStreamProviderCategory,
   InstalledAddon,
-  isUnreachableOrSlowStream,
   parseStreamingCatalogsConfig,
   pingStreamBatch,
   prefetchStreamsForMedia,
@@ -1429,12 +1428,10 @@ export const App: React.FC = () => {
           }
         }
         if (measuredById.size === 0) return cleanIncoming;
-        const merged = cleanIncoming
-          .map((itemStream) => {
-            const measured = measuredById.get(itemStream.id);
-            return measured ? { ...itemStream, ...measured } : itemStream;
-          })
-          .filter((s) => !isUnreachableOrSlowStream(s));
+        const merged = cleanIncoming.map((itemStream) => {
+          const measured = measuredById.get(itemStream.id);
+          return measured ? { ...itemStream, ...measured } : itemStream;
+        });
         const topWinner = merged.find((s) => s.isTopResponsive && !s.unreachable);
         if (!topWinner) return sortStreamsByDecreasingQuality(merged);
         const rest = sortStreamsByDecreasingQuality(
@@ -1501,21 +1498,19 @@ export const App: React.FC = () => {
                 const metricsMap = await pingStreamBatch(chunk);
                 if (metricsMap.size === 0) continue;
                 setDossierStreams((prev) =>
-                  prev
-                    .map((s) => {
-                      const m = metricsMap.get(s.id);
-                      if (!m) return s;
-                      return {
-                        ...s,
-                        ttfbMs: m.ttfbMs,
-                        speedMbps: m.speedMbps || s.speedMbps,
-                        responsivenessScore: m.responsivenessScore || s.responsivenessScore,
-                        serverStatusBadge: m.statusBadge,
-                        unreachable: m.unreachable || !m.ok,
-                        resolvedDirectUrl: m.resolvedUrl || s.resolvedDirectUrl || s.url,
-                      };
-                    })
-                    .filter((s) => !isUnreachableOrSlowStream(s)),
+                  prev.map((s) => {
+                    const m = metricsMap.get(s.id);
+                    if (!m) return s;
+                    return {
+                      ...s,
+                      ttfbMs: m.ttfbMs,
+                      speedMbps: m.speedMbps || s.speedMbps,
+                      responsivenessScore: m.responsivenessScore || s.responsivenessScore,
+                      serverStatusBadge: m.statusBadge,
+                      unreachable: m.unreachable || !m.ok,
+                      resolvedDirectUrl: m.resolvedUrl || s.resolvedDirectUrl || s.url,
+                    };
+                  }),
                 );
               }
             })
@@ -4077,7 +4072,7 @@ export const App: React.FC = () => {
                         {dossierLoadingStreams
                           ? 'Loading Servers…'
                           : dossierBenchmarkingServers
-                            ? `Testing Fastest Server (${dossierStreams.length})…`
+                            ? `Testing Servers (${dossierStreams.length})…`
                             : `Servers & Quality (${dossierStreams.length})`}
                       </span>
                     </button>
@@ -4312,7 +4307,7 @@ export const App: React.FC = () => {
                         ? 'Finding best quality streams…'
                         : dossierBenchmarkingServers
                           ? `Benchmarking Servers in Background (${dossierStreams.length})…`
-                          : `Available Servers — Fastest & Zero-Buffer First (${filteredDossierStreams.length})`}
+                          : `Available Servers (${filteredDossierStreams.length})`}
                     </span>
                     {dossierProviderCategories.length > 1 && (
                       <div
@@ -4373,11 +4368,6 @@ export const App: React.FC = () => {
                                 marginBottom: 4,
                               }}
                             >
-                              {st.isTopResponsive && (
-                                <span className="fastest-server-badge">
-                                  ⚡ Fastest · Zero-Buffer
-                                </span>
-                              )}
                               <span className={`quality-tier-badge ${tierClass}`}>
                                 {st.qualityBadge || st.kind.toUpperCase()}
                               </span>

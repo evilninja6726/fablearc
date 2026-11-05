@@ -13,15 +13,12 @@ import {
 } from '../src/player/subtitleEngine';
 import {
   addonSupportsResource,
-  applyCachedServerHealth,
   buildP2pMagnetUri,
   buildStreamingCatalogsManifestUrl,
   DEFAULT_BOOTSTRAP_MANIFEST_URLS,
   DEFAULT_PENGUPLAY_MANIFEST_URL,
   extractStreamQualityInfo,
   getStreamProviderCategory,
-  isUnreachableOrSlowStream,
-  markStreamUnreachableInCache,
   normalizeStremioMeta,
   parseStreamingCatalogsConfig,
   ProbedAudioTrack,
@@ -139,43 +136,6 @@ describe('Default Addons & Decreasing Stream Quality Sorting', () => {
     expect(DEFAULT_BOOTSTRAP_MANIFEST_URLS).toContain(
       'https://opensubtitlesv3-pro.dexter21767.com/manifest.json',
     );
-
-    const sampleStreams: StremioStreamItem[] = [
-      {
-        id: 'healthy-1',
-        addonId: 'hdhub',
-        addonName: 'HdHub',
-        name: '1080p',
-        title: 'Healthy Stream',
-        kind: 'direct',
-        url: 'https://cdn.example.com/healthy.mp4',
-        serverStatusBadge: '⚡ 420ms',
-      },
-      {
-        id: 'slow-1',
-        addonId: 'hdhub',
-        addonName: 'HdHub',
-        name: '1080p',
-        title: 'Slow Timeout Stream',
-        kind: 'direct',
-        url: 'https://cdn.example.com/slow.mp4',
-        serverStatusBadge: 'Slow / Timeout',
-        unreachable: true,
-      },
-      {
-        id: 'offline-1',
-        addonId: 'hdhub',
-        addonName: 'HdHub',
-        name: '720p',
-        title: 'Offline Stream',
-        kind: 'direct',
-        url: 'https://cdn.example.com/offline.mp4',
-      },
-    ];
-    markStreamUnreachableInCache('https://cdn.example.com/offline.mp4', 'Offline');
-    expect(isUnreachableOrSlowStream(sampleStreams[1])).toBe(true);
-    const pruned = applyCachedServerHealth(sampleStreams);
-    expect(pruned.map((s) => s.id)).toEqual(['healthy-1']);
   });
 
   it('parses resolution quality and sorts streams in strictly decreasing order (4K -> 1080p -> 720p -> 480p)', () => {
