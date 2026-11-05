@@ -91,6 +91,7 @@ interface CinemaPlayerModalProps {
   initialPositionSec?: number;
   onClose: () => void;
   onProgressUpdate: (entry: WatchProgressEntry, flushToDb?: boolean) => void;
+  onServerCheckComplete?: () => void;
 }
 
 export interface SceneBookmarkItem {
@@ -253,7 +254,10 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
   initialPositionSec = 0,
   onClose,
   onProgressUpdate,
+  onServerCheckComplete,
 }) => {
+  const onServerCheckCompleteRef = useRef(onServerCheckComplete);
+  onServerCheckCompleteRef.current = onServerCheckComplete;
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [copiedMagnet, setCopiedMagnet] = useState(false);
@@ -288,6 +292,22 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       ? hydrated
       : applyCachedServerHealth(sortStreamsByDecreasingQuality(hydrated));
   });
+
+  useEffect(() => {
+    if (!initialStreams || initialStreams.length === 0) return;
+    setStreams((prev) => {
+      const incomingById = new Map(initialStreams.map((s) => [s.id, s]));
+      const merged = prev.length > 0
+        ? prev.map((p) => {
+            const updated = incomingById.get(p.id);
+            return updated && (updated.serverStatusBadge || updated.ttfbMs !== undefined)
+              ? { ...p, ...updated }
+              : p;
+          })
+        : initialStreams;
+      return applyCachedServerHealth(merged).filter((s) => !isOfflineStream(s));
+    });
+  }, [initialStreams]);
   const [loadingStreams, setLoadingStreams] = useState(false);
   const [loadingMoreProviders, setLoadingMoreProviders] = useState(false);
   const [activeStream, setActiveStream] = useState<StremioStreamItem | null>(() => {
@@ -600,27 +620,30 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         .slice(0, 18);
       if (topUnpinged.length === 0) return;
       const metricsMap = await pingStreamBatch(topUnpinged);
-      if (cancelled || metricsMap.size === 0) return;
-      setStreams((prev) =>
-        prev
-          .map((s) => {
-            const m = metricsMap.get(s.id);
-            if (!m) return s;
-            const isSlowTimeout = /^Slow\s*\/\s*Timeout$/i.test(
-              (m.statusBadge || '').trim(),
-            );
-            return {
-              ...s,
-              ttfbMs: m.ttfbMs,
-              speedMbps: m.speedMbps || s.speedMbps,
-              responsivenessScore: m.responsivenessScore || s.responsivenessScore,
-              serverStatusBadge: m.statusBadge,
-              unreachable: isSlowTimeout ? false : Boolean(m.unreachable),
-              resolvedDirectUrl: m.resolvedUrl || s.resolvedDirectUrl || s.url,
-            };
-          })
-          .filter((s) => !isOfflineStream(s)),
-      );
+      if (cancelled) return;
+      if (metricsMap.size > 0) {
+        setStreams((prev) =>
+          prev
+            .map((s) => {
+              const m = metricsMap.get(s.id);
+              if (!m) return s;
+              const isSlowTimeout = /^Slow\s*\/\s*Timeout$/i.test(
+                (m.statusBadge || '').trim(),
+              );
+              return {
+                ...s,
+                ttfbMs: m.ttfbMs,
+                speedMbps: m.speedMbps || s.speedMbps,
+                responsivenessScore: m.responsivenessScore || s.responsivenessScore,
+                serverStatusBadge: m.statusBadge,
+                unreachable: isSlowTimeout ? false : Boolean(m.unreachable),
+                resolvedDirectUrl: m.resolvedUrl || s.resolvedDirectUrl || s.url,
+              };
+            })
+            .filter((s) => !isOfflineStream(s)),
+        );
+      }
+      onServerCheckCompleteRef.current?.();
     };
 
     const rankWithTimeout = async (

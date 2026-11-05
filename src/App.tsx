@@ -75,8 +75,23 @@ import {
   ChangePasswordModal,
 } from './components/AdminDashboardView';
 import type { DbUserProfile, UserStatePayload } from './server/streamzDb';
+import {
+  detectConceptClustersForText,
+  extractSignificantKeywords,
+  parseNaturalLanguageSuggestionQuery,
+  QUICK_SUGGESTION_PROMPTS,
+  rankSimilarMediaItems,
+  scoreCandidatesForSuggestionPrompt,
+} from './intelligence/recommendationEngine';
 
-type NavSection = 'discover' | 'movies' | 'series' | 'library' | 'addons' | 'admin';
+type NavSection =
+  | 'discover'
+  | 'movies'
+  | 'series'
+  | 'suggestions'
+  | 'library'
+  | 'addons'
+  | 'admin';
 
 interface CatalogShelfData {
   key: string;
@@ -538,6 +553,53 @@ export const App: React.FC = () => {
   const [dossierProviderCategory, setDossierProviderCategory] = useState<string>('all');
   const [dossierSimilarPool, setDossierSimilarPool] = useState<StremioMediaItem[]>([]);
   const dossierScrollRef = useRef<HTMLDivElement | null>(null);
+
+  // Feature 1: Background Server Testing Popup & Global 1.6s Green Checkup Toast
+  const [dossierPendingPlayRequest, setDossierPendingPlayRequest] = useState<{
+    item: StremioMediaItem;
+    episode?: StremioEpisodeVideo;
+    stream?: StremioStreamItem;
+    resumeSec: number;
+    streams?: StremioStreamItem[];
+  } | null>(null);
+  const [serverCheckToast, setServerCheckToast] = useState<string | null>(null);
+  const serverCheckToastTimerRef = useRef<number | null>(null);
+  const lastServerCheckToastMediaIdRef = useRef<string | null>(null);
+
+  const triggerServerCheckCompleteToast = useCallback(
+    (mediaId?: string, customMessage?: string) => {
+      if (mediaId && lastServerCheckToastMediaIdRef.current === mediaId) {
+        return;
+      }
+      if (mediaId) {
+        lastServerCheckToastMediaIdRef.current = mediaId;
+      }
+      if (serverCheckToastTimerRef.current) {
+        window.clearTimeout(serverCheckToastTimerRef.current);
+      }
+      setServerCheckToast(
+        customMessage || 'Server checkup complete · Fastest streams ready',
+      );
+      serverCheckToastTimerRef.current = window.setTimeout(() => {
+        setServerCheckToast(null);
+        serverCheckToastTimerRef.current = null;
+      }, 1650);
+    },
+    [],
+  );
+
+  // Feature 3: Smart Suggestions Tab state
+  const [suggestionInput, setSuggestionInput] = useState<string>(
+    QUICK_SUGGESTION_PROMPTS[0].prompt,
+  );
+  const [suggestionPrompt, setSuggestionPrompt] = useState<string>(
+    QUICK_SUGGESTION_PROMPTS[0].prompt,
+  );
+  const [suggestionTypeFilter, setSuggestionTypeFilter] = useState<'all' | 'movie' | 'series'>(
+    'all',
+  );
+  const [suggestionRemotePool, setSuggestionRemotePool] = useState<StremioMediaItem[]>([]);
+  const [suggestionLoadingRemote, setSuggestionLoadingRemote] = useState<boolean>(false);
 
   const dossierProviderCategories = useMemo(() => {
     const counts = new Map<string, number>();
@@ -1405,6 +1467,8 @@ export const App: React.FC = () => {
         return;
       }
       setDossierItem(item);
+      setDossierPendingPlayRequest(null);
+      lastServerCheckToastMediaIdRef.current = null;
       setDossierSelectedSeason(1);
       setDossierEpisodeQuery('');
       setDossierShowStreams(false);
@@ -1412,6 +1476,7 @@ export const App: React.FC = () => {
       setDossierLoadingMeta(true);
       setDossierLoadingStreams(true);
       setDossierStreams([]);
+      setDossierSimilarPool([]);
       if (dossierScrollRef.current) {
         dossierScrollRef.current.scrollTo({ top: 0, behavior: 'smooth' });
       }
@@ -1482,7 +1547,6 @@ export const App: React.FC = () => {
           rankStreamsByResponsiveness(finalSorted)
             .then(async (ranked) => {
               setDossierStreams((prev) => (prev.length > 0 ? ranked : prev));
-              setDossierBenchmarkingServers(false);
 
               const topUnpinged = ranked
                 .filter(
@@ -1493,35 +1557,73 @@ export const App: React.FC = () => {
                     !s.serverStatusBadge,
                 )
                 .slice(0, 18);
+              let finalVerified = ranked;
               if (topUnpinged.length > 0) {
                 const metricsMap = await pingStreamBatch(topUnpinged);
                 if (metricsMap.size > 0) {
+                  finalVerified = ranked
+                    .map((s) => {
+                      const m = metricsMap.get(s.id);
+                      if (!m) return s;
+                      const isSlowTimeout = /^Slow\s*\/\s*Timeout$/i.test(
+                        (m.statusBadge || '').trim(),
+                      );
+                      return {
+                        ...s,
+                        ttfbMs: m.ttfbMs,
+                        speedMbps: m.speedMbps || s.speedMbps,
+                        responsivenessScore: m.responsivenessScore || s.responsivenessScore,
+                        serverStatusBadge: m.statusBadge,
+                        unreachable: isSlowTimeout ? false : Boolean(m.unreachable),
+                        resolvedDirectUrl: m.resolvedUrl || s.resolvedDirectUrl || s.url,
+                      };
+                    })
+                    .filter((s) => !isOfflineStream(s));
                   setDossierStreams((prev) =>
-                    prev
-                      .map((s) => {
-                        const m = metricsMap.get(s.id);
-                        if (!m) return s;
-                        const isSlowTimeout = /^Slow\s*\/\s*Timeout$/i.test(
-                          (m.statusBadge || '').trim(),
-                        );
-                        return {
-                          ...s,
-                          ttfbMs: m.ttfbMs,
-                          speedMbps: m.speedMbps || s.speedMbps,
-                          responsivenessScore: m.responsivenessScore || s.responsivenessScore,
-                          serverStatusBadge: m.statusBadge,
-                          unreachable: isSlowTimeout ? false : Boolean(m.unreachable),
-                          resolvedDirectUrl: m.resolvedUrl || s.resolvedDirectUrl || s.url,
-                        };
-                      })
-                      .filter((s) => !isOfflineStream(s)),
+                    prev.length > 0
+                      ? prev
+                          .map((s) => {
+                            const m = metricsMap.get(s.id);
+                            if (!m) return s;
+                            const isSlowTimeout = /^Slow\s*\/\s*Timeout$/i.test(
+                              (m.statusBadge || '').trim(),
+                            );
+                            return {
+                              ...s,
+                              ttfbMs: m.ttfbMs,
+                              speedMbps: m.speedMbps || s.speedMbps,
+                              responsivenessScore: m.responsivenessScore || s.responsivenessScore,
+                              serverStatusBadge: m.statusBadge,
+                              unreachable: isSlowTimeout ? false : Boolean(m.unreachable),
+                              resolvedDirectUrl: m.resolvedUrl || s.resolvedDirectUrl || s.url,
+                            };
+                          })
+                          .filter((s) => !isOfflineStream(s))
+                      : finalVerified,
                   );
                 }
               }
+
+              setDossierBenchmarkingServers(false);
+              setPlayingSession((prevSession) => {
+                if (prevSession && prevSession.media.id === mediaContext.id) {
+                  return {
+                    ...prevSession,
+                    streams: finalVerified,
+                  };
+                }
+                return prevSession;
+              });
+              triggerServerCheckCompleteToast(
+                mediaContext.id,
+                'Server checkup complete · Best streams ready',
+              );
             })
             .catch(() => {
               setDossierBenchmarkingServers(false);
             });
+        } else {
+          setDossierBenchmarkingServers(false);
         }
       };
 
@@ -1543,27 +1645,72 @@ export const App: React.FC = () => {
       }
       setDossierLoadingMeta(false);
 
-      // Hydrate similar movies/series from Cinemeta for the primary genre so "More Like This" is always rich
-      const primaryGenre = finalItem.genres[0];
-      if (primaryGenre) {
-        fetchAddonCatalog(
-          'https://v3-cinemeta.strem.io/manifest.json',
-          finalItem.type === 'series' ? 'series' : 'movie',
-          'top',
-          { genre: primaryGenre },
-          {
-            addonId: 'com.linvo.cinemeta',
-            addonName: 'Cinemeta',
-            catalogName: `Similar ${primaryGenre}`,
-          },
-        )
-          .then((fetchedSimilar) => {
-            if (Array.isArray(fetchedSimilar) && fetchedSimilar.length > 0) {
-              setDossierSimilarPool(
-                fetchedSimilar.map((sim) =>
-                  sim.genres.length > 0 ? sim : { ...sim, genres: [primaryGenre] },
-                ),
-              );
+      // Feature 2: Hydrate Similar Movies/Series by Multi-Genre + Concept Keywords from Cinemeta
+      const targetType = finalItem.type === 'series' ? 'series' : 'movie';
+      const genresToFetch = finalItem.genres.slice(0, 2);
+      const conceptClusters = detectConceptClustersForText(
+        `${finalItem.name} ${finalItem.description || ''}`,
+      );
+      const plotKeywords = extractSignificantKeywords(finalItem.description || '');
+      const topConceptSearchTerm =
+        conceptClusters[0]?.keywords.find((kw) =>
+          (finalItem.description || '').toLowerCase().includes(kw),
+        ) ||
+        conceptClusters[0]?.keywords[0] ||
+        plotKeywords[0] ||
+        '';
+
+      const similarFetches: Promise<StremioMediaItem[]>[] = [];
+      for (const g of genresToFetch) {
+        similarFetches.push(
+          fetchAddonCatalog(
+            'https://v3-cinemeta.strem.io/manifest.json',
+            targetType,
+            'top',
+            { genre: g },
+            {
+              addonId: 'com.linvo.cinemeta',
+              addonName: 'Cinemeta',
+              catalogName: `Similar ${g}`,
+            },
+          )
+            .then((list) =>
+              Array.isArray(list)
+                ? list.map((sim) => (sim.genres.length > 0 ? sim : { ...sim, genres: [g] }))
+                : [],
+            )
+            .catch(() => []),
+        );
+      }
+      if (topConceptSearchTerm && topConceptSearchTerm.length >= 3) {
+        similarFetches.push(
+          fetchAddonCatalog(
+            'https://v3-cinemeta.strem.io/manifest.json',
+            targetType,
+            'top',
+            { search: topConceptSearchTerm },
+            {
+              addonId: 'com.linvo.cinemeta',
+              addonName: 'Cinemeta',
+              catalogName: `Concept ${topConceptSearchTerm}`,
+            },
+          ).catch(() => []),
+        );
+      }
+
+      if (similarFetches.length > 0) {
+        Promise.all(similarFetches)
+          .then((lists) => {
+            const mergedMap = new Map<string, StremioMediaItem>();
+            for (const list of lists) {
+              for (const sim of list) {
+                if (sim && sim.id && sim.id !== finalItem.id && !mergedMap.has(sim.id)) {
+                  mergedMap.set(sim.id, sim);
+                }
+              }
+            }
+            if (mergedMap.size > 0) {
+              setDossierSimilarPool(Array.from(mergedMap.values()));
             }
           })
           .catch(() => {});
@@ -1580,7 +1727,7 @@ export const App: React.FC = () => {
         await earlyStreamPromise;
       }
     },
-    [addons, currentUser],
+    [addons, currentUser, triggerServerCheckCompleteToast],
   );
 
   // Start screening an item
@@ -1610,6 +1757,31 @@ export const App: React.FC = () => {
       });
     },
     [addons, currentUser],
+  );
+
+  // Feature 1: Intercept Play on Details Page if background server testing is still running
+  const requestScreeningFromDossier = useCallback(
+    (
+      item: StremioMediaItem,
+      episode?: StremioEpisodeVideo,
+      stream?: StremioStreamItem,
+      resumeSec = 0,
+      preloadedStreams?: StremioStreamItem[],
+    ) => {
+      if (dossierLoadingStreams || dossierBenchmarkingServers) {
+        setDossierPendingPlayRequest({
+          item,
+          episode,
+          stream,
+          resumeSec,
+          streams: preloadedStreams,
+        });
+        return;
+      }
+      setDossierItem(null);
+      startScreeningItem(item, episode, stream, resumeSec, preloadedStreams);
+    },
+    [dossierBenchmarkingServers, dossierLoadingStreams, startScreeningItem],
   );
 
   const availableServiceTabs = useMemo(() => {
@@ -2316,24 +2488,31 @@ export const App: React.FC = () => {
     return Array.from(set).sort((a, b) => a - b);
   }, [dossierItem]);
 
-  // Compute Similar Movies / Series ("More Like This") for the active Details Page item
-  const similarDossierItems = useMemo<StremioMediaItem[]>(() => {
-    if (!dossierItem) return [];
-    const targetGenres = new Set(
-      dossierItem.genres.map((g) => g.trim().toLowerCase()).filter(Boolean),
-    );
-    const targetCast = new Set(
-      dossierItem.cast.map((c) => c.trim().toLowerCase()).filter(Boolean),
-    );
-    const targetDirectors = new Set(
-      dossierItem.director.map((d) => d.trim().toLowerCase()).filter(Boolean),
-    );
+  // Feature 2: Intelligent Concept, Era & Genre Similarity Engine for the active Details Page item
+  const similarDossierAnalysis = useMemo(() => {
+    if (!dossierItem) {
+      return {
+        items: [] as StremioMediaItem[],
+        matchedConceptLabels: [] as string[],
+        targetYear: null as number | null,
+      };
+    }
 
     const candidateMap = new Map<string, StremioMediaItem>();
+    for (const simItem of dossierSimilarPool) {
+      if (simItem.id !== dossierItem.id && !candidateMap.has(simItem.id)) {
+        candidateMap.set(simItem.id, simItem);
+      }
+    }
     for (const shelf of catalogShelves) {
       for (const item of shelf.items) {
         if (item.id !== dossierItem.id && !candidateMap.has(item.id)) {
           candidateMap.set(item.id, item);
+        } else if (item.id !== dossierItem.id) {
+          const existing = candidateMap.get(item.id)!;
+          if (!existing.description && item.description) {
+            candidateMap.set(item.id, { ...existing, ...item });
+          }
         }
       }
     }
@@ -2344,45 +2523,146 @@ export const App: React.FC = () => {
         }
       }
     }
-    for (const simItem of dossierSimilarPool) {
-      if (simItem.id !== dossierItem.id && !candidateMap.has(simItem.id)) {
-        candidateMap.set(simItem.id, simItem);
+
+    return rankSimilarMediaItems(dossierItem, Array.from(candidateMap.values()), 12);
+  }, [catalogShelves, dossierItem, dossierSimilarPool, genreExtraItemsByKey]);
+
+  const similarDossierItems = similarDossierAnalysis.items;
+
+  // Feature 3: Smart Natural-Language Suggestions Engine
+  const parsedSuggestionQuery = useMemo(
+    () => parseNaturalLanguageSuggestionQuery(suggestionPrompt),
+    [suggestionPrompt],
+  );
+
+  useEffect(() => {
+    if (activeNav !== 'suggestions' || !currentUser) return;
+    let cancelled = false;
+    const targetTypes: Array<'movie' | 'series'> =
+      suggestionTypeFilter === 'movie'
+        ? ['movie']
+        : suggestionTypeFilter === 'series'
+          ? ['series']
+          : parsedSuggestionQuery.mediaTypeFilter === 'movie'
+            ? ['movie']
+            : parsedSuggestionQuery.mediaTypeFilter === 'series'
+              ? ['series']
+              : ['movie', 'series'];
+
+    const fetchPromises: Promise<StremioMediaItem[]>[] = [];
+    for (const mType of targetTypes) {
+      for (const searchTerm of parsedSuggestionQuery.cinemetaSearchTerms.slice(0, 2)) {
+        fetchPromises.push(
+          fetchAddonCatalog(
+            'https://v3-cinemeta.strem.io/manifest.json',
+            mType,
+            'top',
+            { search: searchTerm },
+            {
+              addonId: 'com.linvo.cinemeta',
+              addonName: 'Cinemeta',
+              catalogName: `Suggestion ${searchTerm}`,
+            },
+          ).catch(() => []),
+        );
+      }
+      for (const genreName of parsedSuggestionQuery.matchedGenres.slice(0, 2)) {
+        fetchPromises.push(
+          fetchAddonCatalog(
+            'https://v3-cinemeta.strem.io/manifest.json',
+            mType,
+            'top',
+            { genre: genreName },
+            {
+              addonId: 'com.linvo.cinemeta',
+              addonName: 'Cinemeta',
+              catalogName: `Suggestion Genre ${genreName}`,
+            },
+          )
+            .then((list) =>
+              Array.isArray(list)
+                ? list.map((it) => (it.genres.length > 0 ? it : { ...it, genres: [genreName] }))
+                : [],
+            )
+            .catch(() => []),
+        );
       }
     }
 
-    const scored = Array.from(candidateMap.values()).map((candidate) => {
-      let score = 0;
-      if (candidate.type === dossierItem.type) {
-        score += 3;
-      }
-      for (const g of candidate.genres) {
-        if (targetGenres.has(g.trim().toLowerCase())) {
-          score += 4;
+    if (fetchPromises.length === 0) return;
+    setSuggestionLoadingRemote(true);
+    Promise.all(fetchPromises)
+      .then((results) => {
+        if (cancelled) return;
+        const map = new Map<string, StremioMediaItem>();
+        for (const list of results) {
+          for (const item of list) {
+            if (!item || !item.id) continue;
+            const prev = map.get(item.id);
+            if (!prev) {
+              map.set(item.id, item);
+            } else {
+              map.set(item.id, {
+                ...prev,
+                description: prev.description || item.description,
+                genres: prev.genres.length >= item.genres.length ? prev.genres : item.genres,
+                imdbRating: prev.imdbRating || item.imdbRating,
+                year: prev.year || item.year,
+                releaseInfo: prev.releaseInfo || item.releaseInfo,
+              });
+            }
+          }
         }
-      }
-      for (const c of candidate.cast) {
-        if (targetCast.has(c.trim().toLowerCase())) {
-          score += 3;
-        }
-      }
-      for (const d of candidate.director) {
-        if (targetDirectors.has(d.trim().toLowerCase())) {
-          score += 4;
-        }
-      }
-      const ratingNum = Number.parseFloat(candidate.imdbRating || '0');
-      if (Number.isFinite(ratingNum) && ratingNum > 0) {
-        score += ratingNum * 0.25;
-      }
-      return { candidate, score };
-    });
+        setSuggestionRemotePool(Array.from(map.values()));
+      })
+      .finally(() => {
+        if (!cancelled) setSuggestionLoadingRemote(false);
+      });
 
-    return scored
-      .filter((entry) => entry.score > 1)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 12)
-      .map((entry) => entry.candidate);
-  }, [catalogShelves, dossierItem, dossierSimilarPool, genreExtraItemsByKey]);
+    return () => {
+      cancelled = true;
+    };
+  }, [activeNav, currentUser, parsedSuggestionQuery, suggestionTypeFilter]);
+
+  const scoredSuggestionResults = useMemo(() => {
+    const candidateMap = new Map<string, StremioMediaItem>();
+    for (const item of suggestionRemotePool) {
+      if (item && item.id) {
+        candidateMap.set(item.id, item);
+      }
+    }
+    for (const shelf of catalogShelves) {
+      for (const item of shelf.items) {
+        if (!candidateMap.has(item.id)) {
+          candidateMap.set(item.id, item);
+        } else {
+          const prev = candidateMap.get(item.id)!;
+          if (!prev.description && item.description) {
+            candidateMap.set(item.id, { ...prev, description: item.description });
+          }
+        }
+      }
+    }
+    for (const extraList of Object.values(genreExtraItemsByKey)) {
+      for (const item of extraList) {
+        if (!candidateMap.has(item.id)) {
+          candidateMap.set(item.id, item);
+        }
+      }
+    }
+    return scoreCandidatesForSuggestionPrompt(
+      parsedSuggestionQuery,
+      Array.from(candidateMap.values()),
+      suggestionTypeFilter,
+      36,
+    );
+  }, [
+    catalogShelves,
+    genreExtraItemsByKey,
+    parsedSuggestionQuery,
+    suggestionRemotePool,
+    suggestionTypeFilter,
+  ]);
 
   // Close Movie/Series Details Page on Escape key when player is not active
   useEffect(() => {
@@ -2488,6 +2768,15 @@ export const App: React.FC = () => {
           >
             <Tv size={14} />
             <span>TV Series</span>
+          </button>
+          <button
+            type="button"
+            className={`dock-nav-btn ${effectiveNav === 'suggestions' ? 'active' : ''}`}
+            onClick={() => handleNavigateSection('suggestions')}
+            title="Intelligent Movie & Series Suggestions by Concept, Plot, Genre & Year"
+          >
+            <Sparkles size={14} />
+            <span>Suggestions</span>
           </button>
           <button
             type="button"
@@ -3296,6 +3585,176 @@ export const App: React.FC = () => {
           </div>
         )}
 
+        {/* SMART SUGGESTIONS VIEW (Concept, Plot Description, Genre & Year Semantic Discovery) */}
+        {currentUser && effectiveNav === 'suggestions' && (
+          <div className="spatial-scroll-flow padded-top">
+            <section className="catalog-shelf suggestions-hero-panel">
+              <div className="suggestions-panel-header">
+                <div className="shelf-title-group">
+                  <span className="pause-kicker mono">SEMANTIC DISCOVERY ENGINE</span>
+                  <h2>Smart Movie &amp; Series Suggestions</h2>
+                  <p className="suggestions-subcopy">
+                    Describe a plot concept, atmosphere, genre, or release era (for example:{' '}
+                    <em>"post-apocalyptic survival after a virus"</em>,{' '}
+                    <em>"deep space exploration after 2015"</em>, or{' '}
+                    <em>"dark bloody vampire thriller"</em>) and we’ll match titles by concept,
+                    synopsis keywords, genre, and year.
+                  </p>
+                </div>
+
+                <form
+                  className="suggestions-prompt-form"
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    if (suggestionInput.trim()) {
+                      setSuggestionPrompt(suggestionInput.trim());
+                    }
+                  }}
+                >
+                  <div className="suggestions-prompt-input-wrap">
+                    <Sparkles size={16} className="suggestions-prompt-icon" />
+                    <input
+                      type="text"
+                      className="suggestions-prompt-input"
+                      placeholder="Describe the movie or series vibe, plot concept, genre, or year…"
+                      value={suggestionInput}
+                      onChange={(e) => {
+                        setSuggestionInput(e.target.value);
+                        setSuggestionPrompt(e.target.value);
+                      }}
+                    />
+                    {suggestionInput && (
+                      <button
+                        type="button"
+                        className="clear-search-btn"
+                        onClick={() => {
+                          setSuggestionInput('');
+                          setSuggestionPrompt('');
+                        }}
+                        title="Clear prompt"
+                      >
+                        <X size={14} />
+                      </button>
+                    )}
+                  </div>
+                  <div className="suggestions-type-switch">
+                    {(
+                      [
+                        { id: 'all', label: 'All Titles' },
+                        { id: 'movie', label: 'Movies Only' },
+                        { id: 'series', label: 'TV Series Only' },
+                      ] as const
+                    ).map((opt) => (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        className={`genre-pill ${suggestionTypeFilter === opt.id ? 'active' : ''}`}
+                        onClick={() => setSuggestionTypeFilter(opt.id)}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+                </form>
+
+                {/* Quick Concept Inspiration Chips */}
+                <div className="suggestions-quick-chips">
+                  {QUICK_SUGGESTION_PROMPTS.map((preset) => {
+                    const isActive =
+                      suggestionPrompt.trim().toLowerCase() === preset.prompt.toLowerCase();
+                    return (
+                      <button
+                        key={preset.label}
+                        type="button"
+                        className={`genre-pill ${isActive ? 'active' : ''}`}
+                        onClick={() => {
+                          setSuggestionInput(preset.prompt);
+                          setSuggestionPrompt(preset.prompt);
+                        }}
+                      >
+                        {preset.label}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/* Detected Intelligence Signals Strip */}
+                {suggestionPrompt.trim() && (
+                  <div className="suggestions-signals-strip mono">
+                    <span>DETECTED SIGNALS:</span>
+                    {parsedSuggestionQuery.matchedClusters.map((c) => (
+                      <span key={c.id} className="signal-tag concept">
+                        Concept: {c.label}
+                      </span>
+                    ))}
+                    {parsedSuggestionQuery.matchedGenres.length > 0 && (
+                      <span className="signal-tag genre">
+                        Genres: {parsedSuggestionQuery.matchedGenres.slice(0, 4).join(' · ')}
+                      </span>
+                    )}
+                    {parsedSuggestionQuery.yearRange && (
+                      <span className="signal-tag era">
+                        Era: {parsedSuggestionQuery.yearRange.label}
+                      </span>
+                    )}
+                    {parsedSuggestionQuery.minRating && (
+                      <span className="signal-tag era">
+                        IMDb {parsedSuggestionQuery.minRating}+ ★
+                      </span>
+                    )}
+                    {parsedSuggestionQuery.significantKeywords.length > 0 && (
+                      <span className="signal-tag keywords">
+                        Keywords: {parsedSuggestionQuery.significantKeywords.slice(0, 5).join(', ')}
+                      </span>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              <div className="shelf-header" style={{ marginTop: 18 }}>
+                <div className="shelf-title-group">
+                  <h3>
+                    {suggestionLoadingRemote
+                      ? 'Analyzing Concept & Matching Titles…'
+                      : `Recommended Matches (${scoredSuggestionResults.length})`}
+                  </h3>
+                  <span className="shelf-subtitle mono">
+                    RANKED BY CONCEPT SIMILARITY, SYNOPSIS KEYWORDS, GENRE &amp; RELEASE ERA
+                  </span>
+                </div>
+              </div>
+
+              {scoredSuggestionResults.length > 0 ? (
+                <div className="poster-grid">
+                  {scoredSuggestionResults.map(({ item, matchReasonLabel }) => (
+                    <div key={`sug-${item.id}`} className="suggestion-card-wrapper">
+                      <PosterCard
+                        item={item}
+                        inLibrary={isInLibrary(item.id)}
+                        onPlay={(i) => openItemDossier(i)}
+                        onOpenDossier={openItemDossier}
+                        onToggleLibrary={toggleLibraryItem}
+                      />
+                      <div className="suggestion-match-reason-pill mono" title={matchReasonLabel}>
+                        <Sparkles size={11} />
+                        <span>{matchReasonLabel}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="empty-state-box">
+                  <p>
+                    {suggestionLoadingRemote
+                      ? 'Searching across catalogs for matching concepts and plots…'
+                      : 'Type a concept, mood, plot description, genre, or year above (or click one of the concept presets) to discover matching movies and series.'}
+                  </p>
+                </div>
+              )}
+            </section>
+          </div>
+        )}
+
         {/* WATCHLIST / LIBRARY VIEW (Authenticated Users Only — With Custom Collection Tabs & Personal 1-5★ Ratings) */}
         {currentUser && effectiveNav === 'library' && (
           <div className="spatial-scroll-flow padded-top">
@@ -4004,8 +4463,7 @@ export const App: React.FC = () => {
                           (s) => s.isTopResponsive && !s.unreachable,
                         );
                         const resumePos = progressMap[target.id]?.positionSec ?? 0;
-                        setDossierItem(null);
-                        startScreeningItem(
+                        requestScreeningFromDossier(
                           target,
                           target.videos[0],
                           preRankedBest,
@@ -4034,8 +4492,7 @@ export const App: React.FC = () => {
                           const preRankedBest = currentStreams.find(
                             (s) => s.isTopResponsive && !s.unreachable,
                           );
-                          setDossierItem(null);
-                          startScreeningItem(
+                          requestScreeningFromDossier(
                             target,
                             target.videos[0],
                             preRankedBest,
@@ -4262,8 +4719,7 @@ export const App: React.FC = () => {
                           className="dossier-stream-row details-episode-card"
                           onClick={() => {
                             const target = dossierItem;
-                            setDossierItem(null);
-                            startScreeningItem(target, ep, undefined, 0);
+                            requestScreeningFromDossier(target, ep, undefined, 0);
                           }}
                           role="button"
                           tabIndex={0}
@@ -4271,8 +4727,7 @@ export const App: React.FC = () => {
                             if (e.key === 'Enter' || e.key === ' ') {
                               e.preventDefault();
                               const target = dossierItem;
-                              setDossierItem(null);
-                              startScreeningItem(target, ep, undefined, 0);
+                              requestScreeningFromDossier(target, ep, undefined, 0);
                             }
                           }}
                         >
@@ -4359,8 +4814,7 @@ export const App: React.FC = () => {
                             }
                             const target = dossierItem;
                             const currentStreams = [...dossierStreams];
-                            setDossierItem(null);
-                            startScreeningItem(target, undefined, st, 0, currentStreams);
+                            requestScreeningFromDossier(target, undefined, st, 0, currentStreams);
                           }}
                         >
                           <div style={{ flex: 1, minWidth: 0 }}>
@@ -4416,7 +4870,14 @@ export const App: React.FC = () => {
                       Similar {dossierItem.type === 'series' ? 'TV Series' : 'Movies'} You May Like
                     </h3>
                     <span className="shelf-subtitle mono">
-                      MATCHED BY GENRE ({dossierItem.genres.slice(0, 3).join(' · ') || 'TRENDING'}) &amp; IMDb RATING
+                      MATCHED BY{' '}
+                      {similarDossierAnalysis.matchedConceptLabels.length > 0
+                        ? `CONCEPT (${similarDossierAnalysis.matchedConceptLabels.join(' · ').toUpperCase()}) · `
+                        : 'PLOT KEYWORDS · '}
+                      GENRE ({dossierItem.genres.slice(0, 3).join(' · ').toUpperCase() || 'TRENDING'})
+                      {similarDossierAnalysis.targetYear
+                        ? ` · ERA (${similarDossierAnalysis.targetYear})`
+                        : ''}
                     </span>
                   </div>
                 </div>
@@ -4442,6 +4903,78 @@ export const App: React.FC = () => {
               </div>
             </div>
           </aside>
+
+          {/* Feature 1: Background Server Testing Confirmation Popup */}
+          {dossierPendingPlayRequest && (
+            <div
+              className="server-testing-modal-backdrop"
+              onClick={(e) => {
+                e.stopPropagation();
+                setDossierPendingPlayRequest(null);
+              }}
+            >
+              <div
+                className="server-testing-modal-card"
+                role="dialog"
+                aria-modal="true"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <div className="server-testing-modal-badge mono">
+                  <RefreshCw size={13} className="spin-icon" />
+                  <span>OPTIMIZING SERVERS IN BACKGROUND</span>
+                </div>
+                <h3>Servers Are Still Being Verified</h3>
+                <p>
+                  We’re testing server speeds and filtering out offline streams in the background
+                  {dossierStreams.length > 0
+                    ? ` (${dossierStreams.length} servers loaded so far)`
+                    : ''}
+                  . You can start watching right now while testing finishes, or wait a moment.
+                </p>
+                <div className="server-testing-modal-actions">
+                  <button
+                    type="button"
+                    className="neon-primary-btn"
+                    onClick={() => {
+                      const req = dossierPendingPlayRequest;
+                      const latestStreams =
+                        dossierStreams.length > 0 ? [...dossierStreams] : req.streams;
+                      const bestStream =
+                        req.stream ||
+                        latestStreams?.find((s) => s.isTopResponsive && !s.unreachable);
+                      setDossierPendingPlayRequest(null);
+                      setDossierItem(null);
+                      startScreeningItem(
+                        req.item,
+                        req.episode,
+                        bestStream,
+                        req.resumeSec,
+                        latestStreams,
+                      );
+                    }}
+                  >
+                    <Play size={16} fill="currentColor" />
+                    <span>Continue Anyway</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="glass-secondary-btn"
+                    onClick={() => setDossierPendingPlayRequest(null)}
+                  >
+                    <span>Cancel</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Global 1.6s Green Toast when Background Server Checkup Completes (Player OR Details Page) */}
+      {serverCheckToast && (
+        <div className="global-server-check-green-toast" role="status" aria-live="polite">
+          <Check size={15} />
+          <span>{serverCheckToast}</span>
         </div>
       )}
 
@@ -4460,6 +4993,12 @@ export const App: React.FC = () => {
                 : undefined
           }
           initialPositionSec={playingSession.resumeSec}
+          onServerCheckComplete={() =>
+            triggerServerCheckCompleteToast(
+              playingSession.media.id,
+              'Server checkup complete · Best streams ready',
+            )
+          }
           onClose={() => {
             if (latestPlayerProgressRef.current) {
               const finalEntry = latestPlayerProgressRef.current;

@@ -29,9 +29,16 @@ import {
   sortAudioTracksByLanguagePriority,
   sortStreamsByDecreasingQuality,
   StremioAddonManifest,
+  StremioMediaItem,
   StremioStreamItem,
   upgradeLegacyDefaultAddonUrl,
 } from '../src/addons/stremioProtocol';
+import {
+  detectConceptClustersForText,
+  parseNaturalLanguageSuggestionQuery,
+  rankSimilarMediaItems,
+  scoreCandidatesForSuggestionPrompt,
+} from '../src/intelligence/recommendationEngine';
 
 describe('streamZ Security Boundaries', () => {
   it('blocks loopback, cloud metadata, and private LAN SSRF targets', () => {
@@ -726,5 +733,110 @@ describe('Commercial SQLite WAL Database (Per-User Auth, Watch History & Dedupli
     const adminList = db.adminListUsers(adminId);
     expect(adminList).toHaveLength(2);
     expect(adminList.every((u) => u.passwordHash.startsWith('scrypt$'))).toBe(true);
+  });
+
+  it('ranks similar movies and natural-language suggestions by concept (post-apocalyptic, space, blood/vampire), genre, and release era', () => {
+    const baseMovie: StremioMediaItem = {
+      id: 'tt-target',
+      type: 'movie',
+      name: '28 Years Later',
+      description:
+        'Survivors in a post-apocalyptic wasteland fight for survival after a deadly rage virus outbreak.',
+      year: '2025',
+      releaseInfo: '2025',
+      imdbRating: '8.1',
+      genres: ['Sci-Fi', 'Horror', 'Thriller'],
+      cast: ['Cillian Murphy'],
+      director: ['Danny Boyle'],
+      writer: [],
+      trailers: [],
+      videos: [],
+    };
+
+    const candidates: StremioMediaItem[] = [
+      {
+        id: 'tt-romcom-1998',
+        type: 'movie',
+        name: 'Summer Wedding',
+        description: 'Two lovers plan a romantic wedding in Paris.',
+        year: '1998',
+        releaseInfo: '1998',
+        imdbRating: '7.4',
+        genres: ['Romance', 'Comedy'],
+        cast: [],
+        director: [],
+        writer: [],
+        trailers: [],
+        videos: [],
+      },
+      {
+        id: 'tt-space-2014',
+        type: 'movie',
+        name: 'Beyond the Wormhole',
+        description:
+          'Astronauts aboard an interstellar spacecraft travel through a wormhole to colonize a distant alien planet.',
+        year: '2019',
+        releaseInfo: '2019',
+        imdbRating: '8.6',
+        genres: ['Sci-Fi', 'Adventure'],
+        cast: [],
+        director: [],
+        writer: [],
+        trailers: [],
+        videos: [],
+      },
+      {
+        id: 'tt-apoc-2024',
+        type: 'movie',
+        name: 'Fallout Protocol',
+        description:
+          'In a dystopian post-apocalyptic world ravaged by a deadly pandemic virus, a group of survivors searches for a safe bunker.',
+        year: '2024',
+        releaseInfo: '2024',
+        imdbRating: '8.0',
+        genres: ['Sci-Fi', 'Thriller', 'Horror'],
+        cast: [],
+        director: [],
+        writer: [],
+        trailers: [],
+        videos: [],
+      },
+      {
+        id: 'tt-blood-vampire-2025',
+        type: 'movie',
+        name: 'Crimson Fangs',
+        description:
+          'An ancient immortal vampire unleashes a bloody supernatural slaughter across the city.',
+        year: '2025',
+        releaseInfo: '2025',
+        imdbRating: '7.9',
+        genres: ['Horror', 'Action'],
+        cast: [],
+        director: [],
+        writer: [],
+        trailers: [],
+        videos: [],
+      },
+    ];
+
+    const clusters = detectConceptClustersForText(baseMovie.description!);
+    expect(clusters[0]?.id).toBe('post-apocalyptic');
+
+    const similar = rankSimilarMediaItems(baseMovie, candidates, 5);
+    expect(similar.items[0]?.id).toBe('tt-apoc-2024');
+    expect(similar.matchedConceptLabels).toContain('Post-Apocalyptic & Survival');
+
+    const spacePrompt = parseNaturalLanguageSuggestionQuery(
+      'interstellar space exploration with astronauts after 2015',
+    );
+    expect(spacePrompt.matchedClusters.some((c) => c.id === 'space-cosmos')).toBe(true);
+    expect(spacePrompt.yearRange?.min).toBe(2015);
+    const spaceScored = scoreCandidatesForSuggestionPrompt(spacePrompt, candidates);
+    expect(spaceScored[0]?.item.id).toBe('tt-space-2014');
+
+    const bloodPrompt = parseNaturalLanguageSuggestionQuery('bloody vampire action horror 2025');
+    expect(bloodPrompt.matchedClusters.some((c) => c.id === 'blood-vampire-gore')).toBe(true);
+    const bloodScored = scoreCandidatesForSuggestionPrompt(bloodPrompt, candidates);
+    expect(bloodScored[0]?.item.id).toBe('tt-blood-vampire-2025');
   });
 });
