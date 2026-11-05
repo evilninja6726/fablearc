@@ -340,9 +340,7 @@ export async function unwrapMediaStreamUrlWithStatus(
       if (err instanceof Error && err.message.startsWith('Blocked unsafe')) {
         throw err;
       }
-      if (hopTimeoutMs <= 3000) {
-        unreachable = true;
-      }
+      // Do not mark a stream permanently unreachable/Offline in cache merely because a hop timed out
       break;
     }
   }
@@ -1637,7 +1635,7 @@ export function registerStreamzApiMiddlewares(
             const unwrapStart = Date.now();
             const unwrapped = await unwrapMediaStreamUrlWithStatus(
               rawUrl,
-              isPingOnly ? 1800 : 2200,
+              isPingOnly ? 2600 : 2800,
             );
             const unwrapMs = Math.max(8, Date.now() - unwrapStart);
             const resolvedUrl = unwrapped.url;

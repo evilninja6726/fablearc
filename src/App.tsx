@@ -1432,12 +1432,7 @@ export const App: React.FC = () => {
           const measured = measuredById.get(itemStream.id);
           return measured ? { ...itemStream, ...measured } : itemStream;
         });
-        const topWinner = merged.find((s) => s.isTopResponsive && !s.unreachable);
-        if (!topWinner) return sortStreamsByDecreasingQuality(merged);
-        const rest = sortStreamsByDecreasingQuality(
-          merged.filter((s) => s.id !== topWinner.id),
-        );
-        return [topWinner, ...rest];
+        return sortStreamsByDecreasingQuality(merged);
       };
 
       let firstWaveBenchmarked = false;
@@ -4347,7 +4342,7 @@ export const App: React.FC = () => {
                       return (
                         <div
                           key={st.id}
-                          className={`dossier-stream-row ${st.isTopResponsive ? 'top-responsive-server' : ''}`}
+                          className="dossier-stream-row"
                           style={{ cursor: 'pointer', opacity: st.unreachable ? 0.55 : 1 }}
                           onClick={() => {
                             if (st.kind === 'external' && st.externalUrl) {

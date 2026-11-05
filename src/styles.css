@@ -6469,12 +6469,6 @@ select {
 }
 
 /* Background Benchmark Badges */
-.dossier-stream-row.top-responsive-server,
-.popover-option-row.top-responsive-server {
-  border-color: rgba(16, 185, 129, 0.55);
-  background: rgba(16, 185, 129, 0.08);
-}
-
 .server-ping-badge {
   display: inline-flex;
   align-items: center;

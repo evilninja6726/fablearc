@@ -141,6 +141,19 @@ describe('Default Addons & Decreasing Stream Quality Sorting', () => {
     expect(canBrowserPlayAudioCodecNatively('mp3')).toBe(true);
     expect(canBrowserPlayAudioCodecNatively('opus')).toBe(true);
     expect(canBrowserPlayAudioCodecNatively('dts')).toBe(false);
+
+    const ds4kInfo = extractStreamQualityInfo(
+      'HdHub 2160p',
+      '[PixelDrain] [💾 2.3GB] Sinners.2025.1080p.10Bit.HEVC.DS4K.WEB-DL.Hindi-English.mkv',
+    );
+    expect(ds4kInfo.qualityScore).toBe(1080);
+    expect(ds4kInfo.qualityBadge).toBe('1080p FHD');
+
+    const sampleClipInfo = extractStreamQualityInfo(
+      'HdHub 2160p',
+      '[PixelDrain] [💾 125.17 MB] SAMPLE-Sinners.2025.1080p.DS4K.WEB-DL.mkv',
+    );
+    expect(sampleClipInfo.isPromo).toBe(true);
   });
 
   it('parses resolution quality and sorts streams in strictly decreasing order (4K -> 1080p -> 720p -> 480p)', () => {

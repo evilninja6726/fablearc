@@ -169,6 +169,7 @@ export function isDiscordOrPromoSpam(text: string): boolean {
     lower.includes('/signin.mp4') ||
     lower.includes('configure addon') ||
     lower.includes('webBLOCKS') ||
+    /(?:^|[\s[\]()_.-])sample-[a-z0-9]/i.test(text) ||
     /\.(apk|exe|msi|dmg|bat|sh)(\?|$|\|)/i.test(lower)
   );
 }
@@ -208,26 +209,35 @@ export function extractStreamQualityInfo(
 
   let qualityScore = 0;
   let qualityBadge = 'HD';
+  // Strip "DS4K" (Downscaled from 4K to 1080p/720p) before checking for 4K so 1080p.DS4K is never mislabeled as 4K UHD
+  const isDownscaled4k = /\bds4k\b/i.test(combined);
+  const resText = combined.replace(/\bds4k\b/gi, '');
 
-  if (/\b(2160p|4k|uhd)\b/i.test(combined)) {
-    qualityScore = 2160;
-    qualityBadge = '4K UHD';
-  } else if (/\b(1440p|2k|qhd)\b/i.test(combined)) {
-    qualityScore = 1440;
-    qualityBadge = '1440p QHD';
-  } else if (/\b(1080p|fhd|full\s*hd)\b/i.test(combined)) {
+  if (isDownscaled4k && /\b(1080p|fhd|full\s*hd)\b/i.test(resText)) {
     qualityScore = 1080;
     qualityBadge = '1080p FHD';
-  } else if (/\b(720p|hd)\b/i.test(combined)) {
+  } else if (isDownscaled4k && /\b(720p)\b/i.test(resText)) {
     qualityScore = 720;
     qualityBadge = '720p HD';
-  } else if (/\b(576p|480p|sd|dvdrip)\b/i.test(combined)) {
+  } else if (/\b(2160p|4k|uhd)\b/i.test(resText)) {
+    qualityScore = 2160;
+    qualityBadge = '4K UHD';
+  } else if (/\b(1440p|2k|qhd)\b/i.test(resText)) {
+    qualityScore = 1440;
+    qualityBadge = '1440p QHD';
+  } else if (/\b(1080p|fhd|full\s*hd)\b/i.test(resText)) {
+    qualityScore = 1080;
+    qualityBadge = '1080p FHD';
+  } else if (/\b(720p|hd)\b/i.test(resText)) {
+    qualityScore = 720;
+    qualityBadge = '720p HD';
+  } else if (/\b(576p|480p|sd|dvdrip)\b/i.test(resText)) {
     qualityScore = 480;
     qualityBadge = '480p SD';
-  } else if (/\b(360p|240p|cam|ts)\b/i.test(combined)) {
+  } else if (/\b(360p|240p|cam|ts)\b/i.test(resText)) {
     qualityScore = 360;
     qualityBadge = '360p';
-  } else if (/\b(bluray|remux|web-dl|webrip)\b/i.test(combined)) {
+  } else if (/\b(bluray|remux|web-dl|webrip)\b/i.test(resText)) {
     qualityScore = 900;
     qualityBadge = 'HD Remux';
   }
@@ -389,10 +399,21 @@ export function sortStreamsByDecreasingQuality(
     const kindDiff = kindPriority[a.kind] - kindPriority[b.kind];
     if (kindDiff !== 0) return kindDiff;
 
-    // 1. Decreasing quality score (4K 2160 -> 1440 -> 1080 -> 720 -> 480 -> 360)
+    // 1. Strictly decreasing quality score (4K 2160 -> 1440 -> 1080 -> 720 -> 480 -> 360)
+    // Never allow a 1080p stream to be sorted above a 4K stream
     const scoreA = a.qualityScore ?? 0;
     const scoreB = b.qualityScore ?? 0;
     if (scoreB !== scoreA) return scoreB - scoreA;
+
+    // 1b. Within the same quality tier, keep reachable/untested streams above confirmed Offline streams
+    const unreachA = a.unreachable ? 1 : 0;
+    const unreachB = b.unreachable ? 1 : 0;
+    if (unreachA !== unreachB) return unreachA - unreachB;
+
+    // 1c. Within the same quality tier, prioritize benchmarked top-responsive server first
+    const topA = a.isTopResponsive ? 1 : 0;
+    const topB = b.isTopResponsive ? 1 : 0;
+    if (topB !== topA) return topB - topA;
 
     // 2. Priority to Multi-Audio / Dual-Audio over Single-Audio within the same quality tier
     const hasMultiA = (a.audioScore ?? (a.isMultiAudio ? 1 : 0)) > 0 ? 1 : 0;
@@ -2323,11 +2344,9 @@ export async function rankStreamsByResponsiveness(
       isTopResponsive: true,
     };
 
-    // Remaining healthy/untested streams stay in exact decreasing quality order,
-    // while confirmed unreachable/HTTP-only streams are demoted below healthy direct streams
-    const others = annotated.filter((s) => s.id !== bestStreamId);
-    const healthyOrUntested = others.filter((s) => !s.unreachable);
-    const demotedDead = others.filter((s) => s.unreachable);
+    const withWinner = annotated.map((s) =>
+      s.id === bestStreamId ? { ...s, isTopResponsive: true } : s,
+    );
 
     // Layer 2 & 3: Immediately preconnect browser TLS to the winning CDN origin AND pre-warm /api/media-probe!
     warmBrowserCdnConnection(topWinner.resolvedDirectUrl || topWinner.url);
@@ -2335,7 +2354,8 @@ export async function rankStreamsByResponsiveness(
       probeMediaStream(topWinner.url, authToken ?? undefined).catch(() => {});
     }
 
-    return [topWinner, ...healthyOrUntested, ...demotedDead];
+    // Preserve strict decreasing quality order (4K -> 1080p -> 720p -> 480p) so 1080p never jumps above 4K!
+    return sortStreamsByDecreasingQuality(withWinner);
   } catch {
     return sortedBase;
   }

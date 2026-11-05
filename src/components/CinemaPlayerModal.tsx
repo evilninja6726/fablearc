@@ -656,18 +656,12 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         const measured = measuredById.get(itemStream.id);
         return measured ? { ...itemStream, ...measured } : itemStream;
       });
-      const topWinner = merged.find((s) => s.isTopResponsive && !s.unreachable);
-      if (!topWinner) return sortStreamsByDecreasingQuality(merged);
-      const rest = sortStreamsByDecreasingQuality(
-        merged.filter((s) => s.id !== topWinner.id),
-      );
-      return [topWinner, ...rest];
+      return sortStreamsByDecreasingQuality(merged);
     };
 
     const pickBestPlayableStream = (
       list: StremioStreamItem[],
     ): StremioStreamItem | null =>
-      list.find((s) => s.isTopResponsive && !s.unreachable) ??
       list.find(
         (s) =>
           s.kind === 'direct' &&
@@ -3157,7 +3151,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                         <button
                           key={stream.id}
                           type="button"
-                          className={`popover-option-row ${isSelected ? 'selected' : ''} ${stream.isTopResponsive ? 'top-responsive-server' : ''}`}
+                          className={`popover-option-row ${isSelected ? 'selected' : ''}`}
                           style={{ opacity: stream.unreachable ? 0.55 : 1 }}
                           onClick={() => {
                             if (stream.kind === 'external' && stream.externalUrl) {
