@@ -588,18 +588,17 @@ export const App: React.FC = () => {
     [],
   );
 
-  // Feature 3: Smart Suggestions Tab state
-  const [suggestionInput, setSuggestionInput] = useState<string>(
-    QUICK_SUGGESTION_PROMPTS[0].prompt,
-  );
-  const [suggestionPrompt, setSuggestionPrompt] = useState<string>(
-    QUICK_SUGGESTION_PROMPTS[0].prompt,
-  );
+  // Feature 3: Smart Suggestions Tab state (nothing selected by default; infinite scroll enabled)
+  const [suggestionInput, setSuggestionInput] = useState<string>('');
+  const [suggestionPrompt, setSuggestionPrompt] = useState<string>('');
   const [suggestionTypeFilter, setSuggestionTypeFilter] = useState<'all' | 'movie' | 'series'>(
     'all',
   );
   const [suggestionRemotePool, setSuggestionRemotePool] = useState<StremioMediaItem[]>([]);
   const [suggestionLoadingRemote, setSuggestionLoadingRemote] = useState<boolean>(false);
+  const [suggestionVisibleCount, setSuggestionVisibleCount] = useState<number>(48);
+  const [suggestionNextSkip, setSuggestionNextSkip] = useState<number>(100);
+  const suggestionFetchingMoreRef = useRef<boolean>(false);
 
   const dossierProviderCategories = useMemo(() => {
     const counts = new Map<string, number>();
@@ -2117,20 +2116,6 @@ export const App: React.FC = () => {
     visibleGenreCount,
   ]);
 
-  // Vertical Infinite Scroll handler on main viewport to progressively load more alphabetical genre pairs
-  const handleMainViewportScroll = useCallback(
-    (e: React.UIEvent<HTMLDivElement>) => {
-      const el = e.currentTarget;
-      const distanceToBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-      if (distanceToBottom < 900 && visibleGenreCount < ALPHABETICAL_GENRES.length) {
-        setVisibleGenreCount((prev) =>
-          Math.min(ALPHABETICAL_GENRES.length, prev + 3),
-        );
-      }
-    },
-    [visibleGenreCount],
-  );
-
   // Top Moving Cards Pool: Interleave trending Movies & Series from the top shelves so the Top Hero Deck moves through diverse titles!
   const heroMovingCards = useMemo(() => {
     const seen = new Set<string>();
@@ -2529,11 +2514,16 @@ export const App: React.FC = () => {
 
   const similarDossierItems = similarDossierAnalysis.items;
 
-  // Feature 3: Smart Natural-Language Suggestions Engine
+  // Feature 3: Smart Natural-Language Suggestions Engine with Deep Infinite Scroll
   const parsedSuggestionQuery = useMemo(
     () => parseNaturalLanguageSuggestionQuery(suggestionPrompt),
     [suggestionPrompt],
   );
+
+  useEffect(() => {
+    setSuggestionVisibleCount(48);
+    setSuggestionNextSkip(100);
+  }, [suggestionPrompt, suggestionTypeFilter]);
 
   useEffect(() => {
     if (activeNav !== 'suggestions' || !currentUser) return;
@@ -2550,8 +2540,13 @@ export const App: React.FC = () => {
               : ['movie', 'series'];
 
     const fetchPromises: Promise<StremioMediaItem[]>[] = [];
+    const genresToQuery =
+      parsedSuggestionQuery.matchedGenres.length > 0
+        ? parsedSuggestionQuery.matchedGenres.slice(0, 3)
+        : ['Action', 'Sci-Fi', 'Thriller', 'Drama'];
+
     for (const mType of targetTypes) {
-      for (const searchTerm of parsedSuggestionQuery.cinemetaSearchTerms.slice(0, 2)) {
+      for (const searchTerm of parsedSuggestionQuery.cinemetaSearchTerms.slice(0, 3)) {
         fetchPromises.push(
           fetchAddonCatalog(
             'https://v3-cinemeta.strem.io/manifest.json',
@@ -2566,7 +2561,7 @@ export const App: React.FC = () => {
           ).catch(() => []),
         );
       }
-      for (const genreName of parsedSuggestionQuery.matchedGenres.slice(0, 2)) {
+      for (const genreName of genresToQuery) {
         fetchPromises.push(
           fetchAddonCatalog(
             'https://v3-cinemeta.strem.io/manifest.json',
@@ -2624,6 +2619,86 @@ export const App: React.FC = () => {
     };
   }, [activeNav, currentUser, parsedSuggestionQuery, suggestionTypeFilter]);
 
+  const loadMoreSuggestionsOnScroll = useCallback(() => {
+    setSuggestionVisibleCount((prev) => prev + 48);
+    if (suggestionFetchingMoreRef.current || suggestionNextSkip > 600) return;
+    suggestionFetchingMoreRef.current = true;
+    const currentSkip = suggestionNextSkip;
+    setSuggestionNextSkip((prev) => prev + 100);
+
+    const targetTypes: Array<'movie' | 'series'> =
+      suggestionTypeFilter === 'movie'
+        ? ['movie']
+        : suggestionTypeFilter === 'series'
+          ? ['series']
+          : ['movie', 'series'];
+    const genresToQuery =
+      parsedSuggestionQuery.matchedGenres.length > 0
+        ? parsedSuggestionQuery.matchedGenres.slice(0, 2)
+        : ['Action', 'Sci-Fi', 'Thriller', 'Horror'];
+
+    const pagePromises: Promise<StremioMediaItem[]>[] = [];
+    for (const mType of targetTypes) {
+      for (const genreName of genresToQuery) {
+        pagePromises.push(
+          fetchAddonCatalog(
+            'https://v3-cinemeta.strem.io/manifest.json',
+            mType,
+            'top',
+            { genre: genreName, skip: currentSkip },
+            {
+              addonId: 'com.linvo.cinemeta',
+              addonName: 'Cinemeta',
+              catalogName: `Suggestion Page ${genreName}`,
+            },
+          )
+            .then((list) =>
+              Array.isArray(list)
+                ? list.map((it) => (it.genres.length > 0 ? it : { ...it, genres: [genreName] }))
+                : [],
+            )
+            .catch(() => []),
+        );
+      }
+    }
+
+    Promise.all(pagePromises)
+      .then((lists) => {
+        setSuggestionRemotePool((prev) => {
+          const map = new Map<string, StremioMediaItem>(prev.map((i) => [i.id, i]));
+          for (const list of lists) {
+            for (const item of list) {
+              if (item && item.id && !map.has(item.id)) {
+                map.set(item.id, item);
+              }
+            }
+          }
+          return Array.from(map.values());
+        });
+      })
+      .finally(() => {
+        suggestionFetchingMoreRef.current = false;
+      });
+  }, [parsedSuggestionQuery.matchedGenres, suggestionNextSkip, suggestionTypeFilter]);
+
+  // Vertical Infinite Scroll handler on main viewport to progressively load more alphabetical genre pairs & suggestions
+  const handleMainViewportScroll = useCallback(
+    (e: React.UIEvent<HTMLDivElement>) => {
+      const el = e.currentTarget;
+      const distanceToBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+      if (distanceToBottom < 900) {
+        if (activeNav === 'suggestions') {
+          loadMoreSuggestionsOnScroll();
+        } else if (visibleGenreCount < ALPHABETICAL_GENRES.length) {
+          setVisibleGenreCount((prev) =>
+            Math.min(ALPHABETICAL_GENRES.length, prev + 3),
+          );
+        }
+      }
+    },
+    [activeNav, loadMoreSuggestionsOnScroll, visibleGenreCount],
+  );
+
   const scoredSuggestionResults = useMemo(() => {
     const candidateMap = new Map<string, StremioMediaItem>();
     for (const item of suggestionRemotePool) {
@@ -2654,7 +2729,7 @@ export const App: React.FC = () => {
       parsedSuggestionQuery,
       Array.from(candidateMap.values()),
       suggestionTypeFilter,
-      36,
+      2000,
     );
   }, [
     catalogShelves,
@@ -3585,20 +3660,15 @@ export const App: React.FC = () => {
           </div>
         )}
 
-        {/* SMART SUGGESTIONS VIEW (Concept, Plot Description, Genre & Year Semantic Discovery) */}
+        {/* SMART SUGGESTIONS VIEW (Simple User-Friendly Discovery with % Match & Infinite Scroll) */}
         {currentUser && effectiveNav === 'suggestions' && (
           <div className="spatial-scroll-flow padded-top">
             <section className="catalog-shelf suggestions-hero-panel">
               <div className="suggestions-panel-header">
                 <div className="shelf-title-group">
-                  <span className="pause-kicker mono">SEMANTIC DISCOVERY ENGINE</span>
-                  <h2>Smart Movie &amp; Series Suggestions</h2>
+                  <h2>Suggestions</h2>
                   <p className="suggestions-subcopy">
-                    Describe a plot concept, atmosphere, genre, or release era (for example:{' '}
-                    <em>"post-apocalyptic survival after a virus"</em>,{' '}
-                    <em>"deep space exploration after 2015"</em>, or{' '}
-                    <em>"dark bloody vampire thriller"</em>) and we’ll match titles by concept,
-                    synopsis keywords, genre, and year.
+                    Type any movie description, vibe, genre, or year to find similar titles.
                   </p>
                 </div>
 
@@ -3606,9 +3676,7 @@ export const App: React.FC = () => {
                   className="suggestions-prompt-form"
                   onSubmit={(e) => {
                     e.preventDefault();
-                    if (suggestionInput.trim()) {
-                      setSuggestionPrompt(suggestionInput.trim());
-                    }
+                    setSuggestionPrompt(suggestionInput.trim());
                   }}
                 >
                   <div className="suggestions-prompt-input-wrap">
@@ -3616,7 +3684,7 @@ export const App: React.FC = () => {
                     <input
                       type="text"
                       className="suggestions-prompt-input"
-                      placeholder="Describe the movie or series vibe, plot concept, genre, or year…"
+                      placeholder="Type a description, concept (e.g. post-apocalyptic, space, vampire), genre, or year…"
                       value={suggestionInput}
                       onChange={(e) => {
                         setSuggestionInput(e.target.value);
@@ -3631,7 +3699,7 @@ export const App: React.FC = () => {
                           setSuggestionInput('');
                           setSuggestionPrompt('');
                         }}
-                        title="Clear prompt"
+                        title="Clear"
                       >
                         <X size={14} />
                       </button>
@@ -3640,9 +3708,9 @@ export const App: React.FC = () => {
                   <div className="suggestions-type-switch">
                     {(
                       [
-                        { id: 'all', label: 'All Titles' },
-                        { id: 'movie', label: 'Movies Only' },
-                        { id: 'series', label: 'TV Series Only' },
+                        { id: 'all', label: 'All' },
+                        { id: 'movie', label: 'Movies' },
+                        { id: 'series', label: 'TV Series' },
                       ] as const
                     ).map((opt) => (
                       <button
@@ -3661,6 +3729,7 @@ export const App: React.FC = () => {
                 <div className="suggestions-quick-chips">
                   {QUICK_SUGGESTION_PROMPTS.map((preset) => {
                     const isActive =
+                      Boolean(suggestionPrompt.trim()) &&
                       suggestionPrompt.trim().toLowerCase() === preset.prompt.toLowerCase();
                     return (
                       <button
@@ -3668,8 +3737,13 @@ export const App: React.FC = () => {
                         type="button"
                         className={`genre-pill ${isActive ? 'active' : ''}`}
                         onClick={() => {
-                          setSuggestionInput(preset.prompt);
-                          setSuggestionPrompt(preset.prompt);
+                          if (isActive) {
+                            setSuggestionInput('');
+                            setSuggestionPrompt('');
+                          } else {
+                            setSuggestionInput(preset.prompt);
+                            setSuggestionPrompt(preset.prompt);
+                          }
                         }}
                       >
                         {preset.label}
@@ -3677,77 +3751,47 @@ export const App: React.FC = () => {
                     );
                   })}
                 </div>
-
-                {/* Detected Intelligence Signals Strip */}
-                {suggestionPrompt.trim() && (
-                  <div className="suggestions-signals-strip mono">
-                    <span>DETECTED SIGNALS:</span>
-                    {parsedSuggestionQuery.matchedClusters.map((c) => (
-                      <span key={c.id} className="signal-tag concept">
-                        Concept: {c.label}
-                      </span>
-                    ))}
-                    {parsedSuggestionQuery.matchedGenres.length > 0 && (
-                      <span className="signal-tag genre">
-                        Genres: {parsedSuggestionQuery.matchedGenres.slice(0, 4).join(' · ')}
-                      </span>
-                    )}
-                    {parsedSuggestionQuery.yearRange && (
-                      <span className="signal-tag era">
-                        Era: {parsedSuggestionQuery.yearRange.label}
-                      </span>
-                    )}
-                    {parsedSuggestionQuery.minRating && (
-                      <span className="signal-tag era">
-                        IMDb {parsedSuggestionQuery.minRating}+ ★
-                      </span>
-                    )}
-                    {parsedSuggestionQuery.significantKeywords.length > 0 && (
-                      <span className="signal-tag keywords">
-                        Keywords: {parsedSuggestionQuery.significantKeywords.slice(0, 5).join(', ')}
-                      </span>
-                    )}
-                  </div>
-                )}
               </div>
 
               <div className="shelf-header" style={{ marginTop: 18 }}>
                 <div className="shelf-title-group">
-                  <h3>
-                    {suggestionLoadingRemote
-                      ? 'Analyzing Concept & Matching Titles…'
-                      : `Recommended Matches (${scoredSuggestionResults.length})`}
-                  </h3>
-                  <span className="shelf-subtitle mono">
-                    RANKED BY CONCEPT SIMILARITY, SYNOPSIS KEYWORDS, GENRE &amp; RELEASE ERA
-                  </span>
+                  <h3>Recommended Matches</h3>
                 </div>
               </div>
 
               {scoredSuggestionResults.length > 0 ? (
                 <div className="poster-grid">
-                  {scoredSuggestionResults.map(({ item, matchReasonLabel }) => (
-                    <div key={`sug-${item.id}`} className="suggestion-card-wrapper">
-                      <PosterCard
-                        item={item}
-                        inLibrary={isInLibrary(item.id)}
-                        onPlay={(i) => openItemDossier(i)}
-                        onOpenDossier={openItemDossier}
-                        onToggleLibrary={toggleLibraryItem}
-                      />
-                      <div className="suggestion-match-reason-pill mono" title={matchReasonLabel}>
-                        <Sparkles size={11} />
-                        <span>{matchReasonLabel}</span>
-                      </div>
-                    </div>
-                  ))}
+                  {scoredSuggestionResults
+                    .slice(0, suggestionVisibleCount)
+                    .map(({ item, matchPercent, matchReasonLabel }) => {
+                      const tierClass =
+                        matchPercent >= 75
+                          ? 'high-match'
+                          : matchPercent >= 45
+                            ? 'mid-match'
+                            : 'low-match';
+                      return (
+                        <div key={`sug-${item.id}`} className="suggestion-card-wrapper">
+                          <PosterCard
+                            item={item}
+                            inLibrary={isInLibrary(item.id)}
+                            onPlay={(i) => openItemDossier(i)}
+                            onOpenDossier={openItemDossier}
+                            onToggleLibrary={toggleLibraryItem}
+                          />
+                          <div className={`suggestion-match-reason-pill mono ${tierClass}`}>
+                            <span>{matchReasonLabel}</span>
+                          </div>
+                        </div>
+                      );
+                    })}
                 </div>
               ) : (
                 <div className="empty-state-box">
                   <p>
                     {suggestionLoadingRemote
-                      ? 'Searching across catalogs for matching concepts and plots…'
-                      : 'Type a concept, mood, plot description, genre, or year above (or click one of the concept presets) to discover matching movies and series.'}
+                      ? 'Finding matching titles…'
+                      : 'Type a description, genre, or year above to see matching titles.'}
                   </p>
                 </div>
               )}
@@ -4869,16 +4913,6 @@ export const App: React.FC = () => {
                     <h3 className="details-similar-heading">
                       Similar {dossierItem.type === 'series' ? 'TV Series' : 'Movies'} You May Like
                     </h3>
-                    <span className="shelf-subtitle mono">
-                      MATCHED BY{' '}
-                      {similarDossierAnalysis.matchedConceptLabels.length > 0
-                        ? `CONCEPT (${similarDossierAnalysis.matchedConceptLabels.join(' · ').toUpperCase()}) · `
-                        : 'PLOT KEYWORDS · '}
-                      GENRE ({dossierItem.genres.slice(0, 3).join(' · ').toUpperCase() || 'TRENDING'})
-                      {similarDossierAnalysis.targetYear
-                        ? ` · ERA (${similarDossierAnalysis.targetYear})`
-                        : ''}
-                    </span>
                   </div>
                 </div>
 

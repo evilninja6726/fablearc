@@ -973,73 +973,82 @@ export function parseNaturalLanguageSuggestionQuery(rawPrompt: string): ParsedSu
 export interface ScoredSuggestionItem {
   item: StremioMediaItem;
   score: number;
+  matchPercent: number;
   matchReasonLabel: string;
 }
 
 /**
  * Ranks candidate movies/series against a parsed natural-language suggestion query
- * and returns a clear explanation badge for each suggested title.
+ * from highest match (99% Match) down to lower matches (60% Match, 12% Match, etc.)
+ * without artificially truncating the pool so infinite scroll can display hundreds of titles.
  */
 export function scoreCandidatesForSuggestionPrompt(
   query: ParsedSuggestionPrompt,
   candidates: StremioMediaItem[],
   explicitMediaFilter: 'all' | 'movie' | 'series' = 'all',
-  limit = 36,
+  limit = 2000,
 ): ScoredSuggestionItem[] {
   const effectiveType =
     explicitMediaFilter !== 'all' ? explicitMediaFilter : query.mediaTypeFilter;
   const targetGenresLower = new Set(query.matchedGenres.map((g) => g.toLowerCase()));
   const targetClusterIds = new Set(query.matchedClusters.map((c) => c.id));
   const queryKeywords = new Set(query.significantKeywords);
-  const rawLower = query.rawPrompt.toLowerCase();
+  const rawLower = query.rawPrompt.trim().toLowerCase();
+  const hasPrompt = rawLower.length > 0;
 
-  const scored: ScoredSuggestionItem[] = [];
+  const rawScored: Array<{ item: StremioMediaItem; score: number }> = [];
 
   for (const item of candidates) {
     if (effectiveType !== 'all' && item.type !== effectiveType) {
       continue;
     }
 
-    let score = 0;
-    const reasons: string[] = [];
-
     const itemYear = extractReleaseYear(item);
     const itemRating = Number.parseFloat(item.imdbRating || '0');
+    const validRating = Number.isFinite(itemRating) && itemRating > 0 ? itemRating : 6.2;
 
-    // Check strict year range if user specified one
-    if (query.yearRange) {
-      if (itemYear) {
-        if (itemYear >= query.yearRange.min && itemYear <= query.yearRange.max) {
-          score += 9;
-          reasons.push(`${itemYear}`);
+    if (!hasPrompt) {
+      // Default discovery ranking when no prompt is entered yet
+      const recencyBonus = itemYear && itemYear >= 2020 ? (itemYear - 2018) * 0.45 : 0;
+      const baseScore = validRating * 2.2 + recencyBonus;
+      rawScored.push({ item, score: baseScore });
+      continue;
+    }
+
+    let score = 0;
+
+    // Year / Era match
+    if (query.yearRange && itemYear) {
+      if (itemYear >= query.yearRange.min && itemYear <= query.yearRange.max) {
+        score += 12;
+      } else {
+        const dist = Math.min(
+          Math.abs(itemYear - query.yearRange.min),
+          Math.abs(itemYear - query.yearRange.max),
+        );
+        if (dist <= 2) {
+          score += 5;
+        } else if (dist <= 5) {
+          score += 1.5;
         } else {
-          const dist = Math.min(
-            Math.abs(itemYear - query.yearRange.min),
-            Math.abs(itemYear - query.yearRange.max),
-          );
-          if (dist <= 2) {
-            score += 3;
-          } else {
-            score -= 6;
-          }
+          score -= 4;
         }
       }
     }
 
-    // Check minimum rating if requested
+    // Minimum rating if requested
     if (query.minRating) {
-      if (Number.isFinite(itemRating) && itemRating >= query.minRating) {
-        score += 6;
-      } else if (Number.isFinite(itemRating) && itemRating > 0 && itemRating < query.minRating - 0.8) {
-        score -= 4;
+      if (validRating >= query.minRating) {
+        score += 7;
+      } else if (validRating < query.minRating - 0.8) {
+        score -= 3;
       }
     }
 
-    // 1. Direct Title / Phrase match (e.g. "like Interstellar")
+    // 1. Direct Title / Phrase match
     const itemNameLower = item.name.toLowerCase();
     if (rawLower.length >= 3 && itemNameLower.includes(rawLower)) {
-      score += 18;
-      reasons.push('Title Match');
+      score += 22;
     }
 
     // 2. Semantic Concept Cluster Match
@@ -1047,10 +1056,7 @@ export function scoreCandidatesForSuggestionPrompt(
     const itemClusters = detectConceptClustersForText(itemText);
     for (const ic of itemClusters) {
       if (targetClusterIds.has(ic.id)) {
-        score += 12;
-        if (!reasons.includes(ic.label)) {
-          reasons.push(ic.label);
-        }
+        score += 14;
       }
     }
 
@@ -1064,50 +1070,67 @@ export function scoreCandidatesForSuggestionPrompt(
     for (const qkw of queryKeywords) {
       if (itemKeywords.has(qkw)) {
         matchedKwCount += 1;
-        score += 5.5;
+        score += 6.5;
       }
     }
     if (matchedKwCount >= 2) {
-      score += 4;
+      score += 4.5;
     }
 
     // 4. Genre Match
-    const matchedItemGenres: string[] = [];
+    let matchedGenreCount = 0;
     for (const g of item.genres) {
       if (targetGenresLower.has(g.trim().toLowerCase())) {
-        matchedItemGenres.push(g);
-        score += 4.5;
+        matchedGenreCount += 1;
+        score += 5;
       }
     }
-    if (matchedItemGenres.length >= 2) {
-      score += 3.5;
-    }
-    if (matchedItemGenres.length > 0 && reasons.length < 2) {
-      reasons.push(matchedItemGenres.slice(0, 2).join(' · '));
+    if (matchedGenreCount >= 2) {
+      score += 4;
     }
 
-    // 5. IMDb Quality Weight
-    if (Number.isFinite(itemRating) && itemRating > 0) {
-      score += itemRating * 0.4;
-    }
+    // 5. IMDb Quality Baseline (allows all candidates to be ranked down to low % matches)
+    score += validRating * 0.45;
 
-    if (score >= 4.5) {
-      if (reasons.length === 0) {
-        if (item.genres.length > 0) {
-          reasons.push(item.genres.slice(0, 2).join(' · '));
-        } else {
-          reasons.push('Recommended Match');
-        }
-      }
-      scored.push({
-        item,
-        score,
-        matchReasonLabel: reasons.slice(0, 2).join(' · '),
-      });
-    }
+    rawScored.push({ item, score });
   }
 
-  return scored.sort((a, b) => b.score - a.score).slice(0, limit);
+  rawScored.sort((a, b) => b.score - a.score);
+  const sliced = rawScored.slice(0, limit);
+  if (sliced.length === 0) return [];
+
+  const maxScore = Math.max(sliced[0].score, 1);
+  const minScore = sliced[sliced.length - 1].score;
+  const scoreSpan = Math.max(maxScore - minScore, 1);
+
+  return sliced.map((entry, idx) => {
+    let pct: number;
+    if (!hasPrompt) {
+      // Smoothly distribute default recommendations from 98% down to 45%
+      const ratio = sliced.length > 1 ? 1 - idx / (sliced.length - 1) : 1;
+      pct = Math.round(45 + ratio * 53);
+    } else if (entry.score >= 22) {
+      const topNorm = Math.min(1, (entry.score - 22) / Math.max(12, maxScore - 22));
+      pct = Math.round(90 + topNorm * 9);
+    } else if (entry.score >= 12) {
+      const midHighNorm = (entry.score - 12) / 10;
+      pct = Math.round(72 + midHighNorm * 17);
+    } else if (entry.score >= 5.5) {
+      const midNorm = (entry.score - 5.5) / 6.5;
+      pct = Math.round(45 + midNorm * 26);
+    } else {
+      const lowNorm = Math.max(0, (entry.score - minScore) / scoreSpan);
+      pct = Math.max(8, Math.min(44, Math.round(8 + lowNorm * 34)));
+    }
+
+    const clampedPct = Math.max(8, Math.min(99, pct));
+    return {
+      item: entry.item,
+      score: entry.score,
+      matchPercent: clampedPct,
+      matchReasonLabel: `${clampedPct}% Match`,
+    };
+  });
 }
 
 export const QUICK_SUGGESTION_PROMPTS: Array<{

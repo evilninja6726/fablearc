@@ -6715,16 +6715,28 @@ select {
 .suggestion-match-reason-pill {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 5px;
-  padding: 4px 8px;
+  padding: 4px 10px;
   border-radius: 6px;
-  background: rgba(15, 23, 42, 0.85);
-  border: 1px solid rgba(245, 197, 24, 0.28);
+  background: rgba(16, 185, 129, 0.14);
+  border: 1px solid rgba(16, 185, 129, 0.38);
+  color: #6ee7b7;
+  font-size: 11px;
+  font-weight: 700;
+  width: fit-content;
+}
+
+.suggestion-match-reason-pill.mid-match {
+  background: rgba(245, 197, 24, 0.14);
+  border-color: rgba(245, 197, 24, 0.36);
   color: #fde047;
-  font-size: 10.5px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+}
+
+.suggestion-match-reason-pill.low-match {
+  background: rgba(148, 163, 184, 0.12);
+  border-color: rgba(148, 163, 184, 0.28);
+  color: #cbd5e1;
 }
 
 @media (max-width: 768px) {
