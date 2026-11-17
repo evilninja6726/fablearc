@@ -1,0 +1,2 @@
+# Mark internal agent instruction manuals as documentation so repository language metrics reflect application source code
+.agents/** linguist-documentation=true
