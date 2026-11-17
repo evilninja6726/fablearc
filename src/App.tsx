@@ -82,6 +82,7 @@ import {
   loadLocalRecommendationPreferences,
   parseNaturalLanguageSuggestionQuery,
   rankSimilarMediaItems,
+  recordLocalRecommendationFeedback,
   resetLocalRecommendationPreferences,
   saveLocalRecommendationPreferences,
   scoreCandidatesForSuggestionPrompt,
@@ -147,6 +148,10 @@ interface PosterCardProps {
 }
 
 let latestAddonsForHoverPrefetch: InstalledAddon[] = [];
+const cinemetaSynopsisHydrationCache = new Map<
+  string,
+  Partial<StremioMediaItem> | null
+>();
 
 const PosterCard: React.FC<PosterCardProps> = React.memo(({
   item,
@@ -683,6 +688,26 @@ export const App: React.FC = () => {
         } catch {}
         return next;
       });
+      if (typeof patch.userRating === 'number') {
+        if (patch.userRating >= 4) {
+          recordLocalRecommendationFeedback({ rawItemId: mediaId, eventType: 'like' });
+          setPreferenceVersionTick((t) => t + 1);
+        } else if (patch.userRating <= 2) {
+          recordLocalRecommendationFeedback({ rawItemId: mediaId, eventType: 'dislike' });
+          setPreferenceVersionTick((t) => t + 1);
+        }
+      }
+      if (patch.status === 'favorites') {
+        recordLocalRecommendationFeedback({ rawItemId: mediaId, eventType: 'like' });
+        setPreferenceVersionTick((t) => t + 1);
+      } else if (patch.status === 'completed') {
+        recordLocalRecommendationFeedback({
+          rawItemId: mediaId,
+          eventType: 'watch_complete',
+          completionRatio: 1,
+        });
+        setPreferenceVersionTick((t) => t + 1);
+      }
     },
     [],
   );
@@ -2201,22 +2226,27 @@ export const App: React.FC = () => {
         setAuthModalOpen(true);
         return;
       }
-      setLibraryItems((prev) => {
-        const exists = prev.some((existing) => existing.id === item.id);
-        const nextWatchlist = exists
-          ? prev.filter((existing) => existing.id !== item.id)
-          : [item, ...prev];
-        setUserToastCard({
-          kind: 'success',
-          text: exists
-            ? `Removed "${item.name}" from your Watchlist.`
-            : `Added "${item.name}" to your Watchlist.`,
+      const alreadyExists = libraryItems.some((existing) => existing.id === item.id);
+      const nextWatchlist = alreadyExists
+        ? libraryItems.filter((existing) => existing.id !== item.id)
+        : [item, ...libraryItems];
+      setLibraryItems(nextWatchlist);
+      if (!alreadyExists) {
+        recordLocalRecommendationFeedback({
+          rawItemId: item.imdbId || item.id,
+          eventType: 'save',
         });
-        persistWatchlistToDb(nextWatchlist);
-        return nextWatchlist;
+        setPreferenceVersionTick((t) => t + 1);
+      }
+      setUserToastCard({
+        kind: 'success',
+        text: alreadyExists
+          ? `Removed "${item.name}" from your Watchlist.`
+          : `Added "${item.name}" to your Watchlist.`,
       });
+      persistWatchlistToDb(nextWatchlist);
     },
-    [currentUser, persistWatchlistToDb],
+    [currentUser, libraryItems, persistWatchlistToDb],
   );
 
   const handleApplyStreamingCatalogsConfig = async (e: React.FormEvent) => {
@@ -2526,10 +2556,104 @@ export const App: React.FC = () => {
   const similarDossierItems = similarDossierAnalysis.items;
 
   // Feature 3: Smart Natural-Language Suggestions Engine with Deep Infinite Scroll
+  // 380ms debounce so typing doesn't hammer Cinemeta or recompute BM25 on every keystroke (#10a)
+  useEffect(() => {
+    const trimmed = suggestionInput.trim();
+    if (!trimmed) {
+      setSuggestionPrompt('');
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      setSuggestionPrompt(trimmed);
+    }, 380);
+    return () => window.clearTimeout(timer);
+  }, [suggestionInput]);
+
   const parsedSuggestionQuery = useMemo(
     () => parseNaturalLanguageSuggestionQuery(suggestionPrompt),
     [suggestionPrompt],
   );
+
+  // Subtle active constraint / intent pills shown directly under the Suggestions search bar (#10c)
+  const activeSuggestionConstraintPills = useMemo(() => {
+    if (!suggestionPrompt.trim()) return [] as Array<{ label: string; kind: 'include' | 'exclude' }>;
+    const intent = parsedSuggestionQuery.intent;
+    const pills: Array<{ label: string; kind: 'include' | 'exclude' }> = [];
+
+    if (intent.mediaTypes && intent.mediaTypes.length === 1) {
+      pills.push({
+        label: intent.mediaTypes[0] === 'movie' ? 'Movies Only' : 'TV Series Only',
+        kind: 'include',
+      });
+    }
+    if (intent.yearRange) {
+      const yrLabel =
+        intent.yearRange.label ||
+        (intent.yearRange.min && intent.yearRange.max && intent.yearRange.min === intent.yearRange.max
+          ? `${intent.yearRange.min}`
+          : `${intent.yearRange.min ?? 1900}–${intent.yearRange.max ?? 2030}`);
+      pills.push({ label: `Year: ${yrLabel}`, kind: 'include' });
+    }
+    if (intent.minRating) {
+      pills.push({ label: `IMDb ${intent.minRating.value}+`, kind: 'include' });
+    }
+    if (intent.runtime) {
+      if (intent.runtime.maxMinutes && intent.runtime.minMinutes) {
+        pills.push({
+          label: `${intent.runtime.minMinutes}–${intent.runtime.maxMinutes}m`,
+          kind: 'include',
+        });
+      } else if (intent.runtime.maxMinutes) {
+        pills.push({ label: `Under ${intent.runtime.maxMinutes}m`, kind: 'include' });
+      } else if (intent.runtime.minMinutes) {
+        pills.push({ label: `${intent.runtime.minMinutes}m+`, kind: 'include' });
+      }
+    }
+    for (const anchor of intent.titleAnchors || []) {
+      if (anchor.relationship === 'avoid' || anchor.relationship === 'less_like') {
+        pills.push({ label: `Not like ${anchor.title}`, kind: 'exclude' });
+      } else {
+        pills.push({ label: `Like ${anchor.title}`, kind: 'include' });
+      }
+    }
+    for (const g of (intent.genres || []).slice(0, 3)) {
+      pills.push({
+        label: g.polarity === 'exclude' ? `No ${g.value}` : g.value,
+        kind: g.polarity === 'exclude' ? 'exclude' : 'include',
+      });
+    }
+    for (const ex of intent.contentExclusions || []) {
+      const cleanEx = ex.value.replace(/^content:/i, '').replace(/[_-]+/g, ' ');
+      pills.push({
+        label: `No ${cleanEx.charAt(0).toUpperCase()}${cleanEx.slice(1)}`,
+        kind: 'exclude',
+      });
+    }
+    for (const c of [
+      ...(intent.concepts || []),
+      ...(intent.themes || []),
+      ...(intent.tones || []),
+    ]) {
+      if (c.polarity === 'exclude') {
+        const cleanLabel = c.value.split(':').pop()?.replace(/[_-]+/g, ' ') || c.value;
+        pills.push({
+          label: `Avoid ${cleanLabel}`,
+          kind: 'exclude',
+        });
+      }
+    }
+
+    // Deduplicate case-insensitively and cap at 7 clean pills
+    const seen = new Set<string>();
+    return pills
+      .filter((p) => {
+        const key = p.label.toLowerCase();
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .slice(0, 7);
+  }, [parsedSuggestionQuery, suggestionPrompt]);
 
   useEffect(() => {
     setSuggestionVisibleCount(48);
@@ -2637,7 +2761,25 @@ export const App: React.FC = () => {
             }
           }
         }
-        setSuggestionRemotePool(Array.from(map.values()));
+        const hydratedPool = Array.from(map.values()).map((it) => {
+          const ttId = it.imdbId || (it.id.startsWith('tt') ? it.id : '');
+          const mType = it.type === 'series' ? 'series' : 'movie';
+          const cacheKey = ttId ? `${mType}:${ttId}` : '';
+          const cachedPatch = cacheKey ? cinemetaSynopsisHydrationCache.get(cacheKey) : null;
+          if (!cachedPatch) return it;
+          return {
+            ...it,
+            description: it.description || cachedPatch.description,
+            genres: it.genres.length > 0 ? it.genres : cachedPatch.genres || [],
+            runtime: it.runtime || cachedPatch.runtime,
+            director: it.director.length > 0 ? it.director : cachedPatch.director || [],
+            cast: it.cast.length > 0 ? it.cast : cachedPatch.cast || [],
+            imdbRating: it.imdbRating || cachedPatch.imdbRating,
+            releaseInfo: it.releaseInfo || cachedPatch.releaseInfo,
+            year: it.year || cachedPatch.year,
+          };
+        });
+        setSuggestionRemotePool(hydratedPool);
       })
       .finally(() => {
         if (!cancelled) setSuggestionLoadingRemote(false);
@@ -2647,6 +2789,200 @@ export const App: React.FC = () => {
       cancelled = true;
     };
   }, [activeNav, currentUser, parsedSuggestionQuery, suggestionTypeFilter]);
+
+  const attemptedSynopsisHydrationRef = useRef<Set<string>>(new Set());
+
+  // Background Cinemeta /meta/ Synopsis Hydration (0 Bytes on Render — Direct Browser CORS Fetch) (#10b):
+  // Enriches top un-hydrated catalog items with full synopses, runtime, cast & directors so BM25 + taxonomy
+  // matching works on deep plot details ("time loop", "virus outbreak", "without gore", etc.).
+  useEffect(() => {
+    if (activeNav !== 'suggestions' || !currentUser || suggestionRemotePool.length === 0) {
+      return;
+    }
+
+    // 1. Apply any patches already present in cinemetaSynopsisHydrationCache (e.g. from an earlier aborted wave)
+    let hasSyncCacheUpdates = false;
+    const syncApplied = suggestionRemotePool.map((it) => {
+      if (it.description && it.description.trim().length > 20) return it;
+      const ttId = it.imdbId || (it.id.startsWith('tt') ? it.id : '');
+      if (!ttId) return it;
+      const mType = it.type === 'series' ? 'series' : 'movie';
+      const cached = cinemetaSynopsisHydrationCache.get(`${mType}:${ttId}`);
+      if (!cached) return it;
+      const nextDesc = it.description || cached.description;
+      const nextRuntime = it.runtime || cached.runtime;
+      const nextGenres = it.genres.length > 0 ? it.genres : cached.genres || [];
+      const nextDirector = it.director.length > 0 ? it.director : cached.director || [];
+      const nextCast = it.cast.length > 0 ? it.cast : cached.cast || [];
+      if (
+        nextDesc !== it.description ||
+        nextRuntime !== it.runtime ||
+        nextGenres.length !== it.genres.length ||
+        nextDirector.length !== it.director.length ||
+        nextCast.length !== it.cast.length
+      ) {
+        hasSyncCacheUpdates = true;
+        return {
+          ...it,
+          description: nextDesc,
+          genres: nextGenres,
+          runtime: nextRuntime,
+          director: nextDirector,
+          cast: nextCast,
+          imdbRating: it.imdbRating || cached.imdbRating,
+          releaseInfo: it.releaseInfo || cached.releaseInfo,
+        };
+      }
+      return it;
+    });
+    if (hasSyncCacheUpdates) {
+      setSuggestionRemotePool(syncApplied);
+      return;
+    }
+
+    // 2. Select up to 28 un-attempted items missing descriptions
+    const missingItems = suggestionRemotePool
+      .filter((it) => {
+        if (it.description && it.description.trim().length > 20) return false;
+        const ttId = it.imdbId || (it.id.startsWith('tt') ? it.id : '');
+        if (!ttId) return false;
+        const mType = it.type === 'series' ? 'series' : 'movie';
+        const cacheKey = `${mType}:${ttId}`;
+        return (
+          !cinemetaSynopsisHydrationCache.has(cacheKey) &&
+          !attemptedSynopsisHydrationRef.current.has(cacheKey)
+        );
+      })
+      .slice(0, 28);
+
+    if (missingItems.length === 0) return;
+
+    const abortCtrl = new AbortController();
+    let cancelled = false;
+
+    const hydrateWave = async () => {
+      const updates = new Map<string, Partial<StremioMediaItem>>();
+      const concurrency = 4;
+      let cursor = 0;
+
+      const worker = async () => {
+        while (!cancelled && cursor < missingItems.length) {
+          const item = missingItems[cursor++]!;
+          const ttId = item.imdbId || item.id;
+          const mType = item.type === 'series' ? 'series' : 'movie';
+          const cacheKey = `${mType}:${ttId}`;
+          if (attemptedSynopsisHydrationRef.current.has(cacheKey)) continue;
+          attemptedSynopsisHydrationRef.current.add(cacheKey);
+
+          try {
+            const resp = await fetch(
+              `https://v3-cinemeta.strem.io/meta/${encodeURIComponent(mType)}/${encodeURIComponent(ttId)}.json`,
+              {
+                method: 'GET',
+                headers: { Accept: 'application/json' },
+                signal: abortCtrl.signal,
+              },
+            );
+            if (!resp.ok) {
+              cinemetaSynopsisHydrationCache.set(cacheKey, null);
+              continue;
+            }
+            const data = (await resp.json()) as { meta?: Record<string, unknown> };
+            const meta = data?.meta;
+            if (!meta || typeof meta !== 'object') {
+              cinemetaSynopsisHydrationCache.set(cacheKey, null);
+              continue;
+            }
+            const patch: Partial<StremioMediaItem> = {
+              description:
+                typeof meta.description === 'string' && meta.description.trim()
+                  ? meta.description.trim()
+                  : undefined,
+              genres: Array.isArray(meta.genres)
+                ? meta.genres.filter((g): g is string => typeof g === 'string')
+                : undefined,
+              runtime: typeof meta.runtime === 'string' ? meta.runtime : undefined,
+              director: Array.isArray(meta.director)
+                ? meta.director.filter((d): d is string => typeof d === 'string')
+                : undefined,
+              cast: Array.isArray(meta.cast)
+                ? meta.cast.filter((c): c is string => typeof c === 'string')
+                : undefined,
+              imdbRating:
+                typeof meta.imdbRating === 'string'
+                  ? meta.imdbRating
+                  : typeof meta.imdbRating === 'number'
+                    ? String(meta.imdbRating)
+                    : undefined,
+              releaseInfo:
+                typeof meta.releaseInfo === 'string' ? meta.releaseInfo : undefined,
+            };
+            if (cinemetaSynopsisHydrationCache.size >= 600) {
+              const oldest = cinemetaSynopsisHydrationCache.keys().next().value;
+              if (oldest) cinemetaSynopsisHydrationCache.delete(oldest);
+            }
+            cinemetaSynopsisHydrationCache.set(cacheKey, patch);
+            if (patch.description || patch.runtime || (patch.genres && patch.genres.length > 0)) {
+              updates.set(item.id, patch);
+            }
+          } catch {
+            if (abortCtrl.signal.aborted) {
+              attemptedSynopsisHydrationRef.current.delete(cacheKey);
+              return;
+            }
+            cinemetaSynopsisHydrationCache.set(cacheKey, null);
+          }
+        }
+      };
+
+      await Promise.all(
+        Array.from({ length: Math.min(concurrency, missingItems.length) }, () => worker()),
+      );
+
+      if (!cancelled && updates.size > 0) {
+        setSuggestionRemotePool((prev) => {
+          let changed = false;
+          const next = prev.map((it) => {
+            const p = updates.get(it.id);
+            if (!p) return it;
+            const nextDesc = it.description || p.description;
+            const nextRuntime = it.runtime || p.runtime;
+            const nextGenres = it.genres.length > 0 ? it.genres : p.genres || [];
+            const nextDirector = it.director.length > 0 ? it.director : p.director || [];
+            const nextCast = it.cast.length > 0 ? it.cast : p.cast || [];
+            if (
+              nextDesc === it.description &&
+              nextRuntime === it.runtime &&
+              nextGenres.length === it.genres.length &&
+              nextDirector.length === it.director.length &&
+              nextCast.length === it.cast.length
+            ) {
+              return it;
+            }
+            changed = true;
+            return {
+              ...it,
+              description: nextDesc,
+              genres: nextGenres,
+              runtime: nextRuntime,
+              director: nextDirector,
+              cast: nextCast,
+              imdbRating: it.imdbRating || p.imdbRating,
+              releaseInfo: it.releaseInfo || p.releaseInfo,
+            };
+          });
+          return changed ? next : prev;
+        });
+      }
+    };
+
+    hydrateWave().catch(() => {});
+
+    return () => {
+      cancelled = true;
+      abortCtrl.abort();
+    };
+  }, [activeNav, currentUser, suggestionRemotePool]);
 
   const loadMoreSuggestionsOnScroll = useCallback(() => {
     setSuggestionVisibleCount((prev) => prev + 48);
@@ -3768,8 +4104,11 @@ export const App: React.FC = () => {
                       }
                       value={suggestionInput}
                       onChange={(e) => {
-                        setSuggestionInput(e.target.value);
-                        setSuggestionPrompt(e.target.value);
+                        const val = e.target.value;
+                        setSuggestionInput(val);
+                        if (!val.trim()) {
+                          setSuggestionPrompt('');
+                        }
                       }}
                     />
                     {suggestionInput && (
@@ -3805,6 +4144,55 @@ export const App: React.FC = () => {
                     ))}
                   </div>
                 </form>
+
+                {Boolean(suggestionPrompt.trim()) &&
+                  (activeSuggestionConstraintPills.length > 0 ||
+                    Boolean(parsedSuggestionQuery.intent.clarificationQuestion)) && (
+                    <div
+                      className="suggestions-active-constraints-row"
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        flexWrap: 'wrap',
+                        gap: 6,
+                        marginTop: 10,
+                      }}
+                    >
+                      {activeSuggestionConstraintPills.map((pill) => (
+                        <span
+                          key={pill.label}
+                          className="mono"
+                          style={{
+                            fontSize: 11,
+                            padding: '3px 9px',
+                            borderRadius: 999,
+                            background:
+                              pill.kind === 'exclude'
+                                ? 'rgba(239, 68, 68, 0.12)'
+                                : 'rgba(245, 176, 65, 0.12)',
+                            border:
+                              pill.kind === 'exclude'
+                                ? '1px solid rgba(239, 68, 68, 0.32)'
+                                : '1px solid rgba(245, 176, 65, 0.32)',
+                            color: pill.kind === 'exclude' ? '#FCA5A5' : '#F8D486',
+                          }}
+                        >
+                          {pill.label}
+                        </span>
+                      ))}
+                      {parsedSuggestionQuery.intent.clarificationQuestion && (
+                        <span
+                          style={{
+                            fontSize: 12,
+                            color: 'var(--text-muted, #9499A6)',
+                            marginLeft: 4,
+                          }}
+                        >
+                          {parsedSuggestionQuery.intent.clarificationQuestion}
+                        </span>
+                      )}
+                    </div>
+                  )}
               </div>
 
               <div className="shelf-header" style={{ marginTop: 18 }}>
@@ -4819,7 +5207,10 @@ export const App: React.FC = () => {
                           className="dossier-stream-row details-episode-card"
                           onClick={() => {
                             const target = dossierItem;
-                            requestScreeningFromDossier(target, ep, undefined, 0);
+                            const saved = progressMap[target.id];
+                            const epResume =
+                              saved?.episodeId === ep.id ? saved.positionSec : 0;
+                            requestScreeningFromDossier(target, ep, undefined, epResume);
                           }}
                           role="button"
                           tabIndex={0}
@@ -4827,7 +5218,10 @@ export const App: React.FC = () => {
                             if (e.key === 'Enter' || e.key === ' ') {
                               e.preventDefault();
                               const target = dossierItem;
-                              requestScreeningFromDossier(target, ep, undefined, 0);
+                              const saved = progressMap[target.id];
+                              const epResume =
+                                saved?.episodeId === ep.id ? saved.positionSec : 0;
+                              requestScreeningFromDossier(target, ep, undefined, epResume);
                             }
                           }}
                         >
@@ -4914,7 +5308,14 @@ export const App: React.FC = () => {
                             }
                             const target = dossierItem;
                             const currentStreams = [...dossierStreams];
-                            requestScreeningFromDossier(target, undefined, st, 0, currentStreams);
+                            const resumePos = progressMap[target.id]?.positionSec ?? 0;
+                            requestScreeningFromDossier(
+                              target,
+                              undefined,
+                              st,
+                              resumePos,
+                              currentStreams,
+                            );
                           }}
                         >
                           <div style={{ flex: 1, minWidth: 0 }}>
@@ -5097,6 +5498,20 @@ export const App: React.FC = () => {
                 [finalEntry.mediaId]: finalEntry,
               }));
               flushWatchProgressToDb(finalEntry);
+              if (
+                finalEntry.durationSec > 300 &&
+                finalEntry.positionSec / finalEntry.durationSec >= 0.85
+              ) {
+                recordLocalRecommendationFeedback({
+                  rawItemId: finalEntry.mediaId,
+                  eventType: 'watch_complete',
+                  completionRatio: Math.min(
+                    1,
+                    finalEntry.positionSec / finalEntry.durationSec,
+                  ),
+                });
+                setPreferenceVersionTick((t) => t + 1);
+              }
               latestPlayerProgressRef.current = null;
             }
             setPlayingSession(null);

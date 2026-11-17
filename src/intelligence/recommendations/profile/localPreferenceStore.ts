@@ -147,64 +147,94 @@ function readExistingAppSignalsFromLocalStorage(): {
     // Ignore storage read errors
   }
 
-  // 2. Read fablearc_watch_history_v1
+  // 2. Read fablearc_watch_history_v1 AND streamz_progress_v3 (supporting both progressSec and positionSec)
   try {
-    const rawHistory = window.localStorage.getItem('fablearc_watch_history_v1');
-    if (rawHistory) {
-      const parsedHist = JSON.parse(rawHistory) as Record<
+    const historyPayloads: Array<
+      Record<
         string,
         {
           mediaId?: string;
           progressSec?: number;
+          positionSec?: number;
           durationSec?: number;
           updatedAtIso?: string;
         }
-      >;
-      if (parsedHist && typeof parsedHist === 'object') {
-        for (const [key, entry] of Object.entries(parsedHist)) {
-          const id = entry?.mediaId || key;
-          if (!id) continue;
-          const canId = normalizeIdToCanonicalIfImdb(id);
-          const prog = Number(entry?.progressSec || 0);
-          const dur = Number(entry?.durationSec || 0);
-          const ratio = dur > 0 ? Math.min(1, prog / dur) : 0;
-          const ts = entry?.updatedAtIso || nowIso;
+      >
+    > = [];
 
-          if (ratio >= 0.85) {
-            watchedIds.push(canId);
-            derivedEvents.push({
-              eventId: `hist-complete-${canId}`,
-              userId: 'local-user',
-              canonicalItemId: canId,
-              eventType: 'watch_complete',
-              timestamp: ts,
-              watchDurationSeconds: prog,
-              itemDurationSeconds: dur,
-              completionRatio: ratio,
-            });
-          } else if (ratio >= 0.35) {
-            derivedEvents.push({
-              eventId: `hist-progress-${canId}`,
-              userId: 'local-user',
-              canonicalItemId: canId,
-              eventType: 'watch_progress',
-              timestamp: ts,
-              watchDurationSeconds: prog,
-              itemDurationSeconds: dur,
-              completionRatio: ratio,
-            });
-          } else if (prog > 30 && ratio > 0 && ratio < 0.12) {
-            derivedEvents.push({
-              eventId: `hist-skip-${canId}`,
-              userId: 'local-user',
-              canonicalItemId: canId,
-              eventType: 'skip',
-              timestamp: ts,
-              watchDurationSeconds: prog,
-              itemDurationSeconds: dur,
-              completionRatio: ratio,
-            });
+    const candidateKeys: string[] = ['fablearc_watch_history_v1'];
+    // Prefer active user-scoped progress key if only one exists or fallback to base `streamz_progress_v3`
+    const userScopedKeys: string[] = [];
+    for (let i = 0; i < window.localStorage.length; i++) {
+      const k = window.localStorage.key(i);
+      if (k && k.startsWith('streamz_progress_v3_u')) {
+        userScopedKeys.push(k);
+      }
+    }
+    if (userScopedKeys.length === 1) {
+      candidateKeys.push(userScopedKeys[0]!);
+    } else {
+      candidateKeys.push('streamz_progress_v3');
+    }
+
+    for (const k of candidateKeys) {
+      try {
+        const raw = window.localStorage.getItem(k);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (parsed && typeof parsed === 'object') {
+            historyPayloads.push(parsed);
           }
+        }
+      } catch {
+        // Ignore a single malformed storage entry without aborting valid entries
+      }
+    }
+
+    for (const parsedHist of historyPayloads) {
+      for (const [key, entry] of Object.entries(parsedHist)) {
+        const id = entry?.mediaId || key;
+        if (!id) continue;
+        const canId = normalizeIdToCanonicalIfImdb(id);
+        const prog = Number(entry?.progressSec ?? entry?.positionSec ?? 0);
+        const dur = Number(entry?.durationSec || 0);
+        const ratio = dur > 0 ? Math.min(1, prog / dur) : 0;
+        const ts = entry?.updatedAtIso || nowIso;
+
+        if (ratio >= 0.85) {
+          watchedIds.push(canId);
+          derivedEvents.push({
+            eventId: `hist-complete-${canId}`,
+            userId: 'local-user',
+            canonicalItemId: canId,
+            eventType: 'watch_complete',
+            timestamp: ts,
+            watchDurationSeconds: prog,
+            itemDurationSeconds: dur,
+            completionRatio: ratio,
+          });
+        } else if (ratio >= 0.35) {
+          derivedEvents.push({
+            eventId: `hist-progress-${canId}`,
+            userId: 'local-user',
+            canonicalItemId: canId,
+            eventType: 'watch_progress',
+            timestamp: ts,
+            watchDurationSeconds: prog,
+            itemDurationSeconds: dur,
+            completionRatio: ratio,
+          });
+        } else if (prog > 30 && ratio > 0 && ratio < 0.12) {
+          derivedEvents.push({
+            eventId: `hist-skip-${canId}`,
+            userId: 'local-user',
+            canonicalItemId: canId,
+            eventType: 'skip',
+            timestamp: ts,
+            watchDurationSeconds: prog,
+            itemDurationSeconds: dur,
+            completionRatio: ratio,
+          });
         }
       }
     }

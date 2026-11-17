@@ -786,4 +786,59 @@ describe('Hybrid Movie & TV Recommendation Intelligence Engine (Master Specifica
     expect(diversity).toBeGreaterThanOrEqual(0.45);
     expect(pipelineRun.diagnostics.latencyMsByStage.total).toBeLessThan(200);
   });
+
+  it('12. Lexical Corpus Index Content-Checksum Cache Invalidation: rebuilds BM25 index immediately when middle-item synopses are hydrated in background', async () => {
+    const { getOrBuildLexicalIndex } = await import(
+      '../src/intelligence/recommendations/understanding/lexicalIndex'
+    );
+    const baseItems = [
+      normalizeMediaItem(
+        makeItem({
+          id: 'tt9000001',
+          name: 'Alpha Horizon',
+          description: 'An astronaut explores Mars.',
+          genres: ['Sci-Fi'],
+        }),
+      ),
+      normalizeMediaItem(
+        makeItem({
+          id: 'tt9000002',
+          name: 'Silent Colony',
+          description: '', // Initially un-hydrated catalog item!
+          genres: ['Sci-Fi'],
+        }),
+      ),
+      normalizeMediaItem(
+        makeItem({
+          id: 'tt9000003',
+          name: 'Omega Drift',
+          description: 'A detective solves a bank heist.',
+          genres: ['Crime'],
+        }),
+      ),
+    ];
+
+    const queryStems = ['paradox', 'surviv'];
+    const idxBefore = getOrBuildLexicalIndex(baseItems);
+    expect(idxBefore.scoreBm25('imdb:tt9000002', queryStems)).toBe(0);
+
+    // Hydrate ONLY the middle item (same array length, same first & last canonicalId!)
+    const hydratedItems = [
+      baseItems[0]!,
+      normalizeMediaItem(
+        makeItem({
+          id: 'tt9000002',
+          name: 'Silent Colony',
+          description:
+            'Scientists trapped inside a quantum chronosphere paradox loop fight to survive.',
+          genres: ['Sci-Fi', 'Thriller'],
+        }),
+      ),
+      baseItems[2]!,
+    ];
+
+    const idxAfter = getOrBuildLexicalIndex(hydratedItems);
+    expect(idxAfter).not.toBe(idxBefore);
+    expect(idxAfter.scoreBm25('imdb:tt9000002', queryStems)).toBeGreaterThan(0.1);
+  });
 });

@@ -808,8 +808,8 @@ describe('Strix-Style E2E & Security Audit Suite', () => {
     expect(cinemaPlayerTsx).toContain('syncSplitPlayback');
     expect(cinemaPlayerTsx).toContain('audioBlockedByBrowser');
 
-    // 3. Verify vite.config.ts /api/media-stream strictly enforces -vn audio/mpeg and never copies video streams
-    expect(viteConfigTs).toContain("res.setHeader('Content-Type', 'audio/mpeg')");
+    // 3. Verify vite.config.ts /api/media-stream strictly enforces -vn audio-only (48k Opus / 64k MP3) and never copies video streams
+    expect(viteConfigTs).toContain("useOpusCodec ? 'audio/webm; codecs=\"opus\"' : 'audio/mpeg'");
     expect(viteConfigTs).toContain("res.setHeader('X-Stream-Mode', 'audio-only')");
     expect(viteConfigTs).not.toContain("'video/x-matroska'");
 
@@ -1063,5 +1063,142 @@ describe('Strix-Style E2E & Security Audit Suite', () => {
     // Safe no-op in non-DOM/invalid-URL environments
     expect(() => warmBrowserCdnConnection('https://cdn.example.com/movie.mp4')).not.toThrow();
     expect(() => warmBrowserCdnConnection('not-a-valid-url')).not.toThrow();
+  });
+
+  it('E2E Flow #13: 10-Point Production Hardening Suite (Render 5 GB Bandwidth Savers, Pacer, Brotli/Gzip, Stall Hysteresis, Next-Stream Failover, Deferred Seek, Seamless Audio & Minimal Suggestions)', async () => {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const { createRealTimeBurstPacer } = await import('../vite.config');
+    const { buildTranscodedStreamUrl, getStreamProviderGroupRank } = await import(
+      '../src/addons/stremioProtocol'
+    );
+
+    const rootDir = path.resolve(__dirname, '..');
+    const appTsx = fs.readFileSync(path.join(rootDir, 'src/App.tsx'), 'utf8');
+    const cinemaPlayerTsx = fs.readFileSync(
+      path.join(rootDir, 'src/components/CinemaPlayerModal.tsx'),
+      'utf8',
+    );
+
+    // 1. Live HTTP E2E check of Brotli & Gzip JSON compression on /api/user/state (#5)
+    const { token, state } = ctx.db.registerUser({
+      displayName: 'Bandwidth Optimizer',
+      email: 'bandwidth@fablearc.test',
+      password: 'ValidPass123!',
+    });
+    // Seed watchlist items so JSON payload exceeds the 512-byte compression threshold
+    ctx.db.syncUserWatchlist(
+      state.user.id,
+      Array.from({ length: 12 }, (_, idx) => ({
+        id: `tt10000${idx}`,
+        name: `Sci-Fi Benchmark Title ${idx} — Deep Space Survival Edition`,
+        type: 'movie',
+        poster: `https://images.metahub.space/poster/medium/tt10000${idx}/img`,
+        imdbRating: '8.4',
+        releaseInfo: '2025',
+      })),
+    );
+
+    const brResp = await fetch(`${ctx.baseUrl}/api/user/state`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Origin: 'https://fablearc.vercel.app',
+        'Accept-Encoding': 'br, gzip',
+      },
+    });
+    expect(brResp.status).toBe(200);
+    expect(brResp.headers.get('content-encoding')).toBe('br');
+    expect(brResp.headers.get('vary')).toContain('Origin');
+    expect(brResp.headers.get('vary')).toContain('Accept-Encoding');
+    const brDecoded = (await brResp.json()) as { watchlist: Array<{ id: string }> };
+    expect(brDecoded.watchlist).toHaveLength(12);
+
+    const qZeroResp = await fetch(`${ctx.baseUrl}/api/user/state`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Accept-Encoding': 'br;q=0, gzip;q=0',
+      },
+    });
+    expect(qZeroResp.status).toBe(200);
+    expect(qZeroResp.headers.get('content-encoding')).toBeNull();
+
+    const gzipResp = await fetch(`${ctx.baseUrl}/api/user/state`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Accept-Encoding': 'gzip',
+      },
+    });
+    expect(gzipResp.status).toBe(200);
+    expect(gzipResp.headers.get('content-encoding')).toBe('gzip');
+    const gzipDecoded = (await gzipResp.json()) as { watchlist: Array<{ id: string }> };
+    expect(gzipDecoded.watchlist).toHaveLength(12);
+
+    // 2. Live HTTP E2E check of /api/media-stream?fmt=opus (48k VBR Opus) AND default 64k MP3 (#5)
+    const opusUrl = buildTranscodedStreamUrl(
+      'https://cdn.example.com/movie.mkv',
+      0,
+      300,
+      token,
+      'audio',
+      'opus',
+    );
+    expect(opusUrl).toContain('fmt=opus');
+
+    const opusAbort = new AbortController();
+    const opusResp = await fetch(
+      `${ctx.baseUrl}/api/media-stream?url=${encodeURIComponent('https://93.184.216.34/video.mkv')}&audioTrack=0&start=0&fmt=opus&token=${encodeURIComponent(token)}`,
+      { signal: opusAbort.signal },
+    );
+    expect(opusResp.status).toBe(200);
+    expect(opusResp.headers.get('content-type')).toBe('audio/webm; codecs="opus"');
+    expect(opusResp.headers.get('x-audio-codec')).toBe('opus-48k');
+    expect(opusResp.headers.get('x-stream-mode')).toBe('audio-only');
+    await opusResp.body?.cancel().catch(() => {});
+    opusAbort.abort();
+
+    // 3. Direct E2E verification of createRealTimeBurstPacer: flushes 128 KB burst immediately in 0ms, paces excess, and drains 100% on EOF without tail truncation (#5)
+    const pacer = createRealTimeBurstPacer(131072, 10000);
+    const emittedChunks: Buffer[] = [];
+    pacer.on('data', (c: Buffer) => emittedChunks.push(c));
+    pacer.write(Buffer.alloc(200000, 7));
+    const immediateBytes = emittedChunks.reduce((acc, c) => acc + c.byteLength, 0);
+    expect(immediateBytes).toBeGreaterThanOrEqual(131072);
+    expect(immediateBytes).toBeLessThan(150000);
+    await new Promise<void>((resolve) => {
+      pacer.once('end', () => resolve());
+      pacer.end();
+    });
+    const finalDrainedBytes = emittedChunks.reduce((acc, c) => acc + c.byteLength, 0);
+    expect(finalDrainedBytes).toBe(200000);
+
+    // 4. Verify Player Fixes #1, #2, #3, #4, #6, #7, #8, #9 & Minimal Suggestions #10
+    expect(cinemaPlayerTsx).toContain('getBufferedAheadSec');
+    expect(cinemaPlayerTsx).toContain('isRecoveringFromStallRef');
+    expect(cinemaPlayerTsx).toContain('recordMidMovieStallAndMaybeSelfHeal');
+    expect(cinemaPlayerTsx).toContain('currentIndex + 1');
+    expect(cinemaPlayerTsx).toContain('intendedPositionSecRef');
+    expect(cinemaPlayerTsx).toContain('pendingDeferredSeekRef');
+    expect(cinemaPlayerTsx).toContain('isAudioHotSwappingRef');
+    expect(cinemaPlayerTsx).toContain('hls.audioTracks');
+    expect(cinemaPlayerTsx).toContain('selectedStreamRowRef');
+    expect(cinemaPlayerTsx).toContain('scrollIntoView');
+    expect(cinemaPlayerTsx).toContain("block: 'center'");
+    expect(cinemaPlayerTsx).toContain('HIN · #1');
+    expect(cinemaPlayerTsx).toContain('ENG · #2');
+
+    expect(getStreamProviderGroupRank({ addonId: 'pengu', addonName: 'PenguPlay' })).toBeLessThan(
+      getStreamProviderGroupRank({ addonId: 'hdhub', addonName: 'HdHub' }),
+    );
+    expect(getStreamProviderGroupRank({ addonId: 'hdhub', addonName: 'HdHub' })).toBeLessThan(
+      getStreamProviderGroupRank({
+        addonId: 'com.cncverse.stremiobridge.pwoi7q4u220fz',
+        addonName: 'CNCVerse · Hindi & Indian OTT',
+      }),
+    );
+
+    expect(appTsx).toContain('cinemetaSynopsisHydrationCache');
+    expect(appTsx).toContain('activeSuggestionConstraintPills');
+    // Verify Suggestions poster cards remain strictly minimal (no 👍 / ✕ clutter buttons on cards)
+    expect(appTsx).not.toContain('Not Interested');
   });
 });

@@ -321,9 +321,26 @@ let cachedIndexSignature = '';
 let cachedIndexInstance: LexicalCorpusIndex | null = null;
 
 export function getOrBuildLexicalIndex(items: NormalizedMediaItem[]): LexicalCorpusIndex {
+  // Compute a fast rolling content checksum across all items (canonicalId + synopsis length + genres/themes count)
+  // so background synopsis hydration or metadata enrichment immediately invalidates and rebuilds the BM25 index.
+  let hash = 2166136261 >>> 0;
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i]!;
+    const idLen = it.canonicalId.length;
+    const firstCode = idLen > 0 ? it.canonicalId.charCodeAt(0) : 0;
+    const lastCode = idLen > 0 ? it.canonicalId.charCodeAt(idLen - 1) : 0;
+    const synLen = it.synopsis ? it.synopsis.length : 0;
+    const genreCount = it.genres.length;
+    const mix =
+      (((idLen << 16) ^ (firstCode << 8) ^ lastCode) +
+        (synLen * 31) +
+        (genreCount * 131)) >>>
+      0;
+    hash = Math.imul(hash ^ mix, 16777619) >>> 0;
+  }
   const firstId = items[0]?.canonicalId || '';
   const lastId = items[items.length - 1]?.canonicalId || '';
-  const signature = `${items.length}:${firstId}:${lastId}`;
+  const signature = `${items.length}:${firstId}:${lastId}:${hash.toString(36)}`;
   if (cachedIndexInstance && cachedIndexSignature === signature) {
     return cachedIndexInstance;
   }

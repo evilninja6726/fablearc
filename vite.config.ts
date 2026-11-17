@@ -10,6 +10,12 @@ import {
   type ServerResponse,
 } from 'node:http';
 import { Agent as HttpsAgent, request as httpsRequest } from 'node:https';
+import { Transform } from 'node:stream';
+import {
+  brotliCompressSync,
+  constants as zlibConstants,
+  gzipSync,
+} from 'node:zlib';
 import ffmpegPath from 'ffmpeg-static';
 import {
   AdminUserSummary,
@@ -53,21 +59,241 @@ function readJsonBody<T = Record<string, unknown>>(req: IncomingMessage): Promis
   });
 }
 
+function appendVaryHeader(res: ServerResponse, token: string): void {
+  const existing = res.getHeader('Vary');
+  const existingStr = Array.isArray(existing)
+    ? existing.join(', ')
+    : typeof existing === 'string'
+      ? existing
+      : '';
+  const parts = existingStr
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (!parts.some((p) => p.toLowerCase() === token.toLowerCase())) {
+    parts.push(token);
+  }
+  res.setHeader('Vary', parts.join(', '));
+}
+
+function acceptsContentEncoding(acceptEncodingHeader: string, encoding: 'br' | 'gzip'): boolean {
+  if (!acceptEncodingHeader) return false;
+  const clauses = acceptEncodingHeader.split(',');
+  for (const rawClause of clauses) {
+    const [namePart, ...params] = rawClause.trim().toLowerCase().split(';');
+    if (namePart?.trim() !== encoding) continue;
+    let q = 1;
+    for (const p of params) {
+      const [k, v] = p.trim().split('=');
+      if (k?.trim() === 'q' && v !== undefined) {
+        const parsed = Number.parseFloat(v.trim());
+        if (Number.isFinite(parsed)) q = parsed;
+      }
+    }
+    if (q > 0) return true;
+  }
+  return false;
+}
+
 function sendJson(
   res: ServerResponse,
   statusCode: number,
   data: unknown,
   extraHeaders?: Record<string, string>,
+  req?: IncomingMessage,
 ): void {
+  if (res.headersSent || res.writableEnded) {
+    return;
+  }
   res.statusCode = statusCode;
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('X-Content-Type-Options', 'nosniff');
   if (extraHeaders) {
     for (const [k, v] of Object.entries(extraHeaders)) {
-      res.setHeader(k, v);
+      if (k.toLowerCase() === 'vary') {
+        for (const t of v.split(',').map((s) => s.trim()).filter(Boolean)) {
+          appendVaryHeader(res, t);
+        }
+      } else {
+        res.setHeader(k, v);
+      }
     }
   }
-  res.end(JSON.stringify(data));
+  const serialized = JSON.stringify(data) ?? 'null';
+  const rawBuf = Buffer.from(serialized, 'utf8');
+  const isHead = (req?.method || (res as unknown as { req?: IncomingMessage }).req?.method) === 'HEAD';
+  const acceptEncoding =
+    req && typeof req.headers['accept-encoding'] === 'string'
+      ? req.headers['accept-encoding']
+      : '';
+
+  if (rawBuf.byteLength >= 512) {
+    appendVaryHeader(res, 'Accept-Encoding');
+    if (acceptEncoding) {
+      if (acceptsContentEncoding(acceptEncoding, 'br')) {
+        const compressed = brotliCompressSync(rawBuf, {
+          params: {
+            [zlibConstants.BROTLI_PARAM_QUALITY]: 4,
+          },
+        });
+        res.setHeader('Content-Encoding', 'br');
+        res.setHeader('Content-Length', String(compressed.byteLength));
+        if (isHead) {
+          res.end();
+        } else {
+          res.end(compressed);
+        }
+        return;
+      }
+      if (acceptsContentEncoding(acceptEncoding, 'gzip')) {
+        const compressed = gzipSync(rawBuf, { level: 6 });
+        res.setHeader('Content-Encoding', 'gzip');
+        res.setHeader('Content-Length', String(compressed.byteLength));
+        if (isHead) {
+          res.end();
+        } else {
+          res.end(compressed);
+        }
+        return;
+      }
+    }
+  }
+
+  res.setHeader('Content-Length', String(rawBuf.byteLength));
+  if (isHead) {
+    res.end();
+  } else {
+    res.end(rawBuf);
+  }
+}
+
+/**
+ * Real-Time Burst + Token-Bucket Stream Pacer for `/api/media-stream`:
+ * - Flushes the first `initialBurstBytes` (~128 KB = ~18-22s of audio) immediately in 0ms
+ *   so `<audio>` startup, seeks, and track switches achieve `canplay` instantaneously.
+ * - Thereafter paces output at ~1.22x real-time while honoring downstream TCP backpressure
+ *   so FFmpeg never dumps 80-115 MB of future unplayed audio across Render's 5 GB monthly budget!
+ */
+export function createRealTimeBurstPacer(
+  initialBurstBytes: number,
+  sustainedBytesPerSec: number,
+): Transform {
+  let availableTokens = initialBurstBytes;
+  const maxBucketBytes = Math.max(initialBurstBytes, sustainedBytesPerSec * 6);
+  let lastRefillMs = Date.now();
+  const pendingQueue: Buffer[] = [];
+  let queuedBytes = 0;
+  let drainTimer: ReturnType<typeof setTimeout> | null = null;
+  let pendingCallback: (() => void) | null = null;
+  let downstreamPaused = false;
+  let isPumping = false;
+
+  const refillTokens = () => {
+    const now = Date.now();
+    const elapsedSec = Math.max(0, (now - lastRefillMs) / 1000);
+    lastRefillMs = now;
+    if (elapsedSec > 0) {
+      availableTokens = Math.min(
+        maxBucketBytes,
+        availableTokens + elapsedSec * sustainedBytesPerSec,
+      );
+    }
+  };
+
+  const pumpQueue = (stream: Transform) => {
+    if (isPumping || stream.destroyed) return;
+    isPumping = true;
+    try {
+      if (drainTimer) {
+        clearTimeout(drainTimer);
+        drainTimer = null;
+      }
+      refillTokens();
+
+      while (!downstreamPaused && pendingQueue.length > 0 && availableTokens >= 1024) {
+        const head = pendingQueue[0]!;
+        const sendLen = Math.min(head.byteLength, Math.floor(availableTokens));
+        if (sendLen <= 0) break;
+
+        let canContinue = true;
+        if (sendLen === head.byteLength) {
+          pendingQueue.shift();
+          availableTokens -= sendLen;
+          queuedBytes = Math.max(0, queuedBytes - sendLen);
+          canContinue = stream.push(head);
+        } else {
+          const slice = head.subarray(0, sendLen);
+          pendingQueue[0] = head.subarray(sendLen);
+          availableTokens -= sendLen;
+          queuedBytes = Math.max(0, queuedBytes - sendLen);
+          canContinue = stream.push(slice);
+        }
+        if (stream.destroyed) return;
+        if (!canContinue) {
+          downstreamPaused = true;
+          break;
+        }
+      }
+
+      // Release upstream FFmpeg stdout backpressure once RAM queue drops below 256 KB
+      if (!downstreamPaused && pendingCallback && queuedBytes < 256 * 1024) {
+        const cb = pendingCallback;
+        pendingCallback = null;
+        cb();
+        if (stream.destroyed) return;
+      }
+
+      if (!drainTimer && !downstreamPaused && pendingQueue.length > 0 && !stream.destroyed) {
+        drainTimer = setTimeout(() => pumpQueue(stream), 80);
+      }
+    } finally {
+      isPumping = false;
+    }
+  };
+
+  return new Transform({
+    read() {
+      if (downstreamPaused) {
+        downstreamPaused = false;
+        pumpQueue(this);
+      }
+    },
+    transform(chunk: Buffer, _encoding, callback) {
+      pendingQueue.push(chunk);
+      queuedBytes += chunk.byteLength;
+      if (queuedBytes >= 256 * 1024 || downstreamPaused) {
+        pendingCallback = callback;
+      } else {
+        callback();
+      }
+      pumpQueue(this);
+    },
+    flush(callback) {
+      if (drainTimer) {
+        clearTimeout(drainTimer);
+        drainTimer = null;
+      }
+      while (pendingQueue.length > 0 && !this.destroyed) {
+        this.push(pendingQueue.shift()!);
+      }
+      queuedBytes = 0;
+      callback();
+    },
+    destroy(err, callback) {
+      if (drainTimer) {
+        clearTimeout(drainTimer);
+        drainTimer = null;
+      }
+      pendingQueue.length = 0;
+      queuedBytes = 0;
+      if (pendingCallback) {
+        const cb = pendingCallback;
+        pendingCallback = null;
+        cb();
+      }
+      callback(err);
+    },
+  });
 }
 
 function extractBearerToken(req: IncomingMessage, parsedUrl?: URL): string | null {
@@ -828,13 +1054,13 @@ function parseFfmpegProbeOutput(stderr: string, resolvedUrl: string): MediaProbe
     }
   }
 
-  // Sort probed audio tracks: English first (priority 0), then Hindi (priority 1), then any other language (priority 2)
+  // Sort probed audio tracks: Hindi first (priority 0), then English (priority 1), then any other language (priority 2)
   // while preserving each track's true FFmpeg `audioIndex` for `-map 0:a:${audioIndex}`
   const getLangPriority = (t: ProbedAudioTrack): number => {
     const code = (t.langCode || '').toLowerCase();
     const text = `${t.langName} ${t.title || ''} ${t.label}`.toLowerCase();
-    if (code === 'eng' || code === 'en' || /\b(english|eng)\b/i.test(text)) return 0;
-    if (code === 'hin' || code === 'hi' || /\b(hindi|hin)\b/i.test(text)) return 1;
+    if (code === 'hin' || code === 'hi' || /\b(hindi|hin)\b/i.test(text)) return 0;
+    if (code === 'eng' || code === 'en' || /\b(english|eng)\b/i.test(text)) return 1;
     return 2;
   };
   audioTracks.sort((a, b) => {
@@ -1222,7 +1448,7 @@ export function registerStreamzApiMiddlewares(
         return;
       }
       const state = activeDb().getUserState(userId);
-      sendJson(res, 200, state);
+      sendJson(res, 200, state, undefined, req);
     } catch (err) {
       sendJson(res, 404, {
         error: err instanceof Error ? err.message : 'User state not found',
@@ -1426,12 +1652,16 @@ export function registerStreamzApiMiddlewares(
         () => safeUpstreamJsonFetch(targetUrl),
       );
 
-      res.statusCode = 200;
-      res.setHeader('Content-Type', 'application/json');
-      res.setHeader('X-Content-Type-Options', 'nosniff');
-      res.setHeader('X-Cache', cacheStatus);
-      res.setHeader('Cache-Control', `public, max-age=${ttlSec}`);
-      res.end(JSON.stringify(data));
+      sendJson(
+        res,
+        200,
+        data,
+        {
+          'X-Cache': cacheStatus,
+          'Cache-Control': `public, max-age=${ttlSec}`,
+        },
+        req,
+      );
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Upstream fetch error';
       const status = msg.startsWith('Blocked unsafe') ? 400 : 502;
@@ -1553,11 +1783,7 @@ export function registerStreamzApiMiddlewares(
         }
       }
 
-      res.statusCode = 200;
-      res.setHeader('Content-Type', 'application/json');
-      res.setHeader('X-Content-Type-Options', 'nosniff');
-      res.setHeader('X-Cache', cacheStatus);
-      res.end(JSON.stringify(data));
+      sendJson(res, 200, data, { 'X-Cache': cacheStatus }, req);
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Probe failed';
       const status = msg.startsWith('Blocked unsafe') ? 400 : 500;
@@ -1940,7 +2166,7 @@ export function registerStreamzApiMiddlewares(
         }),
       );
 
-      sendJson(res, 200, { results });
+      sendJson(res, 200, { results }, undefined, req);
     } catch (err) {
       sendJson(res, 500, {
         error: err instanceof Error ? err.message : 'Server health check failed',
@@ -1960,6 +2186,8 @@ export function registerStreamzApiMiddlewares(
       }
 
       const rawStreamUrl = (urlObj.searchParams.get('url') || '').trim();
+      const requestedFmt = (urlObj.searchParams.get('fmt') || 'mp3').trim().toLowerCase();
+      const useOpusCodec = requestedFmt === 'opus';
       const audioTrack = Math.max(
         0,
         parseInt(urlObj.searchParams.get('audioTrack') || '0', 10) || 0,
@@ -1982,8 +2210,12 @@ export function registerStreamzApiMiddlewares(
       res.once('close', markClientDisconnected);
 
       res.statusCode = 200;
-      res.setHeader('Content-Type', 'audio/mpeg');
+      res.setHeader(
+        'Content-Type',
+        useOpusCodec ? 'audio/webm; codecs="opus"' : 'audio/mpeg',
+      );
       res.setHeader('X-Stream-Mode', 'audio-only');
+      res.setHeader('X-Audio-Codec', useOpusCodec ? 'opus-48k' : 'mp3-64k');
       res.setHeader('Cache-Control', 'no-store');
       res.setHeader('X-Content-Type-Options', 'nosniff');
 
@@ -2067,41 +2299,83 @@ export function registerStreamzApiMiddlewares(
         args.push('-ss', String(startSec));
       }
 
-      // Strictly enforce Audio-Only (-vn) streaming MP3 output on the server:
-      // Guarantees zero video bytes ever leave Render HTTP Responses (~0.96 MB/min = ~99.5% bandwidth reduction)
-      // while flushing MP3 audio frames every 25ms with zero container buffering.
-      args.push(
-        '-i',
-        loopbackInputUrl,
-        '-vn',
-        '-map',
-        `0:a:${audioTrack}?`,
-        '-c:a',
-        'libmp3lame',
-        '-ac',
-        '2',
-        '-b:a',
-        '128k',
-        '-af',
-        'aresample=async=1:first_pts=0',
-        '-write_xing',
-        '0',
-        '-flush_packets',
-        '1',
-        '-f',
-        'mp3',
-        'pipe:1',
-      );
+      // Strictly enforce Audio-Only (-vn) ultra-low-bandwidth output on the server:
+      // - 48k VBR Opus (~0.35 MB/min = ~42 MB per 2hr movie) for modern browsers
+      // - 64k MP3 (~0.48 MB/min) fallback for legacy WebKit/test clients
+      // Paired with `createRealTimeBurstPacer` (128 KB instant burst + 1.22x real-time cap)
+      // so Render NEVER dumps unplayed future audio megabytes into `<audio>` buffers!
+      if (useOpusCodec) {
+        args.push(
+          '-i',
+          loopbackInputUrl,
+          '-vn',
+          '-map',
+          `0:a:${audioTrack}?`,
+          '-c:a',
+          'libopus',
+          '-ac',
+          '2',
+          '-b:a',
+          '48k',
+          '-vbr',
+          'on',
+          '-application',
+          'audio',
+          '-af',
+          'aresample=async=1:first_pts=0',
+          '-flush_packets',
+          '1',
+          '-f',
+          'webm',
+          'pipe:1',
+        );
+      } else {
+        args.push(
+          '-i',
+          loopbackInputUrl,
+          '-vn',
+          '-map',
+          `0:a:${audioTrack}?`,
+          '-c:a',
+          'libmp3lame',
+          '-ac',
+          '2',
+          '-b:a',
+          '64k',
+          '-af',
+          'aresample=async=1:first_pts=0',
+          '-write_xing',
+          '0',
+          '-flush_packets',
+          '1',
+          '-f',
+          'mp3',
+          'pipe:1',
+        );
+      }
 
       const ffmpegProc = spawn(ffmpegPath, args, {
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       userProcs.add(ffmpegProc);
+      // Drain FFmpeg stderr continuously so >64 KB warning output never deadlocks the child process
+      ffmpegProc.stderr?.resume();
 
-      ffmpegProc.stdout.pipe(res);
+      // 128 KB instant burst (~20s of Opus / ~16s of MP3) -> then 1.22x real-time pacing
+      const sustainedBytesPerSec = useOpusCodec ? 7400 : 9800;
+      const pacer = createRealTimeBurstPacer(128 * 1024, sustainedBytesPerSec);
 
-      const cleanup = () => {
+      const abortPipeline = () => {
         userProcs?.delete(ffmpegProc);
+        try {
+          ffmpegProc.stdout?.unpipe(pacer);
+          pacer.unpipe(res);
+        } catch {
+          // ignore
+        }
+        if (!pacer.destroyed) {
+          pacer.destroy();
+        }
         if (!ffmpegProc.killed) {
           ffmpegProc.kill('SIGKILL');
         }
@@ -2114,15 +2388,30 @@ export function registerStreamzApiMiddlewares(
         }
       };
 
-      req.on('close', cleanup);
-      res.on('close', cleanup);
-      ffmpegProc.on('error', cleanup);
-      ffmpegProc.on('close', cleanup);
+      ffmpegProc.stdout?.on('error', abortPipeline);
+      pacer.on('error', abortPipeline);
+      res.on('error', abortPipeline);
+      req.on('close', abortPipeline);
+      res.on('close', abortPipeline);
+      ffmpegProc.on('error', abortPipeline);
+      // On normal FFmpeg exit, ONLY unregister `ffmpegProc` and let `ffmpegProc.stdout` EOF
+      // drain `pacer` (`flush()`) naturally into `res` so trailing audio is never truncated!
+      ffmpegProc.on('close', () => {
+        userProcs?.delete(ffmpegProc);
+      });
+
+      ffmpegProc.stdout.pipe(pacer).pipe(res);
     } catch (err) {
       if (!res.headersSent) {
         const msg = err instanceof Error ? err.message : 'Stream pipeline error';
         const status = msg.startsWith('Blocked unsafe') ? 400 : 500;
         sendJson(res, status, { error: msg });
+      } else if (!res.writableEnded) {
+        try {
+          res.end();
+        } catch {
+          // ignore
+        }
       }
     }
   });

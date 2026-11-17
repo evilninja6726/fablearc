@@ -348,6 +348,122 @@ describe('Default Addons & Decreasing Stream Quality Sorting', () => {
     expect(sorted[2].audioBadge).toBe('Multi-Audio');
     expect(sorted[3].audioBadge).toBe('Dual Audio');
   });
+
+  it('groups streams by Provider Order (PenguPlay -> HdHub -> CNCVerse -> 111477 -> WebStreamr) inside each Quality tier, then Multi-Audio first (Option B)', () => {
+    const unsorted: StremioStreamItem[] = [
+      {
+        id: '1080p-hdhub-multi',
+        addonId: 'com.stremio.HdHub',
+        addonName: 'HdHub',
+        name: 'HdHub 1080p',
+        title: 'Film.2025.1080p.WEB-DL.Multi-Audio [2.8 GB]',
+        kind: 'direct',
+        url: 'https://pixeldrain.dev/u/hdhub1080m',
+        ...extractStreamQualityInfo('HdHub 1080p', 'Film.2025.1080p.WEB-DL.Multi-Audio [2.8 GB]'),
+      },
+      {
+        id: '1080p-pengu-single',
+        addonId: 'org.pengu.stream',
+        addonName: 'PenguPlay',
+        name: 'PenguPlay 1080p',
+        title: 'Film.2025.1080p.WEB-DL [2.4 GB]',
+        kind: 'direct',
+        url: 'https://fsl.cdn.example.com/pengu1080s.mkv',
+        ...extractStreamQualityInfo('PenguPlay 1080p', 'Film.2025.1080p.WEB-DL [2.4 GB]'),
+      },
+      {
+        id: '4k-webstreamr-multi',
+        addonId: 'webstreamr',
+        addonName: 'WebStreamr',
+        name: 'WebStreamr 4K',
+        title: 'Film.2025.2160p.Multi-Audio [12.0 GB]',
+        kind: 'direct',
+        url: 'https://cdn.example.com/webstreamr4k.mkv',
+        ...extractStreamQualityInfo('WebStreamr 4K', 'Film.2025.2160p.Multi-Audio [12.0 GB]'),
+      },
+      {
+        id: '4k-cnc-eng-multi',
+        addonId: 'com.cncverse.stremiobridge.p2tztbugmd1ys',
+        addonName: 'CNCVerse · English & 4K',
+        name: 'CNCVerse 4K',
+        title: 'Film.2025.2160p.UHD.Multi-Audio [14.0 GB]',
+        kind: 'direct',
+        url: 'https://cdn.example.com/cnc-eng-4k.mkv',
+        ...extractStreamQualityInfo('CNCVerse 4K', 'Film.2025.2160p.UHD.Multi-Audio [14.0 GB]'),
+      },
+      {
+        id: '4k-cnc-hin-single',
+        addonId: 'com.cncverse.stremiobridge.pwoi7q4u220fz',
+        addonName: 'CNCVerse · Hindi & Indian OTT',
+        name: 'CNCVerse Hindi 4K',
+        title: 'Film.2025.2160p.UHD [11.5 GB]',
+        kind: 'direct',
+        url: 'https://cdn.example.com/cnc-hin-4k.mkv',
+        ...extractStreamQualityInfo('CNCVerse Hindi 4K', 'Film.2025.2160p.UHD [11.5 GB]'),
+      },
+      {
+        id: '4k-hdhub-single',
+        addonId: 'com.stremio.HdHub',
+        addonName: 'HdHub',
+        name: 'HdHub 2160p',
+        title: 'Film.2025.2160p.UHD.WEB-DL [9.5 GB]',
+        kind: 'direct',
+        url: 'https://pixeldrain.dev/u/hdhub4ks',
+        ...extractStreamQualityInfo('HdHub 2160p', 'Film.2025.2160p.UHD.WEB-DL [9.5 GB]'),
+      },
+      {
+        id: '4k-hdhub-multi',
+        addonId: 'com.stremio.HdHub',
+        addonName: 'HdHub',
+        name: 'HdHub 2160p Multi',
+        title: 'Film.2025.2160p.UHD.Multi-Audio.Hin-Eng [10.8 GB]',
+        kind: 'direct',
+        url: 'https://pixeldrain.dev/u/hdhub4km',
+        ...extractStreamQualityInfo(
+          'HdHub 2160p Multi',
+          'Film.2025.2160p.UHD.Multi-Audio.Hin-Eng [10.8 GB]',
+        ),
+      },
+      {
+        id: '4k-pengu-single',
+        addonId: 'org.pengu.stream',
+        addonName: 'PenguPlay',
+        name: 'PenguPlay 4K',
+        title: 'Film.2025.2160p.WEB-DL [13.0 GB]',
+        kind: 'direct',
+        url: 'https://fsl.cdn.example.com/pengu4ks.mkv',
+        ...extractStreamQualityInfo('PenguPlay 4K', 'Film.2025.2160p.WEB-DL [13.0 GB]'),
+      },
+      {
+        id: '4k-pengu-multi',
+        addonId: 'org.pengu.stream',
+        addonName: 'PenguPlay',
+        name: 'PenguPlay 4K Multi',
+        title: 'Film.2025.2160p.WEB-DL.Multi-Audio [15.0 GB]',
+        kind: 'direct',
+        url: 'https://fsl.cdn.example.com/pengu4km.mkv',
+        ...extractStreamQualityInfo(
+          'PenguPlay 4K Multi',
+          'Film.2025.2160p.WEB-DL.Multi-Audio [15.0 GB]',
+        ),
+      },
+    ];
+
+    const sorted = sortStreamsByDecreasingQuality(unsorted);
+    expect(sorted.map((s) => s.id)).toEqual([
+      // 4K tier grouped strictly by provider, Multi-Audio first inside each provider:
+      '4k-pengu-multi',
+      '4k-pengu-single',
+      '4k-hdhub-multi',
+      '4k-hdhub-single',
+      '4k-cnc-hin-single',
+      '4k-cnc-eng-multi',
+      '4k-webstreamr-multi',
+      // 1080p tier grouped strictly by provider:
+      '1080p-pengu-single',
+      '1080p-hdhub-multi',
+    ]);
+  });
 });
 
 describe('Streaming Catalogs (pw.ers.netflix-catalog) & Stremio Protocol Engine', () => {
@@ -575,7 +691,7 @@ describe('Commercial SQLite WAL Database (Per-User Auth, Watch History & Dedupli
     expect((afterEditB.providers[0].manifest as { name: string }).name).toBe('PenguPlay');
   });
 
-  it('orders multi-audio tracks with priority to English first, then Hindi, then any other language', () => {
+  it('orders multi-audio tracks with priority to Hindi first (#1), then English (#2), then any other language', () => {
     const rawTracks: ProbedAudioTrack[] = [
       {
         audioIndex: 0,
@@ -616,10 +732,10 @@ describe('Commercial SQLite WAL Database (Per-User Auth, Watch History & Dedupli
     ];
 
     const sorted = sortAudioTracksByLanguagePriority(rawTracks);
-    expect(sorted.map((t) => t.langCode)).toEqual(['eng', 'hin', 'tam', 'jpn']);
+    expect(sorted.map((t) => t.langCode)).toEqual(['hin', 'eng', 'tam', 'jpn']);
     // Preserves true FFmpeg stream audioIndex so `-map 0:a:${audioIndex}` maps the exact track
-    expect(sorted[0].audioIndex).toBe(3);
-    expect(sorted[1].audioIndex).toBe(1);
+    expect(sorted[0].audioIndex).toBe(1);
+    expect(sorted[1].audioIndex).toBe(3);
   });
 
   it('coalesces concurrent requests (Single-Flight) and caches JSON payloads via StreamZCacheEngine', async () => {

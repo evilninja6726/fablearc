@@ -405,34 +405,40 @@ export function sortStreamsByDecreasingQuality(
     const scoreB = b.qualityScore ?? 0;
     if (scoreB !== scoreA) return scoreB - scoreA;
 
-    // 1b. Within the same quality tier, keep reachable/untested streams above confirmed Offline streams
+    // 2. Group by Provider within each Quality Tier (Option B: PenguPlay -> HdHub -> CNCVerse -> 111477 -> WebStreamr -> Other)
+    const provRankA = getStreamProviderGroupRank(a);
+    const provRankB = getStreamProviderGroupRank(b);
+    if (provRankA !== provRankB) return provRankA - provRankB;
+    if (provRankA >= 7) {
+      const catCmp = getStreamProviderCategory(a).localeCompare(
+        getStreamProviderCategory(b),
+      );
+      if (catCmp !== 0) return catCmp;
+    }
+
+    // 3. Within each Provider + Quality group, keep reachable/untested streams above Offline streams
     const unreachA = a.unreachable ? 1 : 0;
     const unreachB = b.unreachable ? 1 : 0;
     if (unreachA !== unreachB) return unreachA - unreachB;
 
-    // 1c. Within the same quality tier, prioritize benchmarked top-responsive server first
+    // 4. Priority to Multi-Audio (2) -> Dual-Audio (1) -> Single-Audio (0) within each Provider + Quality group
+    const audioA = a.audioScore ?? (a.isMultiAudio ? 1 : 0);
+    const audioB = b.audioScore ?? (b.isMultiAudio ? 1 : 0);
+    if (audioB !== audioA) return audioB - audioA;
+
+    // 5. Within the same Quality + Provider + Multi-Audio tier, prioritize benchmarked top-responsive server first
     const topA = a.isTopResponsive ? 1 : 0;
     const topB = b.isTopResponsive ? 1 : 0;
     if (topB !== topA) return topB - topA;
 
-    // 2. Priority to Multi-Audio / Dual-Audio over Single-Audio within the same quality tier
-    const hasMultiA = (a.audioScore ?? (a.isMultiAudio ? 1 : 0)) > 0 ? 1 : 0;
-    const hasMultiB = (b.audioScore ?? (b.isMultiAudio ? 1 : 0)) > 0 ? 1 : 0;
-    if (hasMultiB !== hasMultiA) return hasMultiB - hasMultiA;
-
-    // 2b. For direct streams in the same quality + multi-audio tier, prefer verified CORS-enabled CDNs (PixelDrain, 111477, BunnyCDN)
+    // 6. For direct streams in the same tier, prefer verified CORS-enabled CDNs (PixelDrain, 111477, BunnyCDN, FSL)
     if (a.kind === 'direct' && b.kind === 'direct') {
       const compatA = getBrowserStreamCompatibilityScore(a);
       const compatB = getBrowserStreamCompatibilityScore(b);
       if (compatB !== compatA) return compatB - compatA;
     }
 
-    // 2c. Sub-sort Multi-Audio (3+ langs) above Dual-Audio (2 langs) when on the same CDN tier
-    const audioA = a.audioScore ?? (a.isMultiAudio ? 1 : 0);
-    const audioB = b.audioScore ?? (b.isMultiAudio ? 1 : 0);
-    if (audioB !== audioA) return audioB - audioA;
-
-    // 2d. For P2P magnet streams in the same quality + audio tier, prioritize healthy swarms (seeders)
+    // 7. For P2P magnet streams in the same tier, prioritize healthy swarms (seeders)
     if (a.kind === 'magnet' && b.kind === 'magnet') {
       const seedsA = a.seeders ?? 0;
       const seedsB = b.seeders ?? 0;
@@ -442,7 +448,7 @@ export function sortStreamsByDecreasingQuality(
       if (seedsB !== seedsA) return seedsB - seedsA;
     }
 
-    // 3. Decreasing file size / bitrate
+    // 8. Decreasing file size / bitrate
     const sizeA = a.sizeBytes ?? 0;
     const sizeB = b.sizeBytes ?? 0;
     if (sizeB !== sizeA) return sizeB - sizeA;
@@ -1505,6 +1511,34 @@ export function getStreamProviderCategory(
   return stream.addonName?.trim() || stream.addonId?.trim() || 'Other';
 }
 
+/**
+ * Deterministic provider grouping order inside each quality tier ("All" list, Option B):
+ * PenguPlay -> HdHub -> CNCVerse (Hindi -> English -> Anime) -> 111477 -> WebStreamr -> Other
+ */
+export function getStreamProviderGroupRank(
+  stream: Pick<StremioStreamItem, 'addonId' | 'addonName'>,
+): number {
+  const cat = getStreamProviderCategory(stream);
+  switch (cat) {
+    case 'PenguPlay':
+      return 0;
+    case 'HdHub':
+      return 1;
+    case 'CNCVerse · Hindi & Indian OTT':
+      return 2;
+    case 'CNCVerse · English & 4K':
+      return 3;
+    case 'CNCVerse · Anime & Cartoons':
+      return 4;
+    case '111477':
+      return 5;
+    case 'WebStreamr':
+      return 6;
+    default:
+      return 7;
+  }
+}
+
 export async function fetchStreamsFromAddons(
   addons: InstalledAddon[],
   mediaType: string,
@@ -1803,8 +1837,8 @@ export interface ProbedAudioTrack {
 
 /**
  * Computes language priority rank for multi-audio tracks:
- * 0 = English (highest priority)
- * 1 = Hindi (second priority)
+ * 0 = Hindi (highest default priority)
+ * 1 = English (second priority)
  * 2 = Any other language (preserves original stream index order)
  */
 export function getAudioTrackLanguagePriority(
@@ -1814,21 +1848,21 @@ export function getAudioTrackLanguagePriority(
   const combined = `${track.langName || ''} ${track.title || ''} ${track.label || ''}`.toLowerCase();
 
   if (
-    code === 'eng' ||
-    code === 'en' ||
-    code.startsWith('en-') ||
-    code === 'english' ||
-    /\b(english|eng)\b/i.test(combined)
-  ) {
-    return 0;
-  }
-
-  if (
     code === 'hin' ||
     code === 'hi' ||
     code.startsWith('hi-') ||
     code === 'hindi' ||
     /\b(hindi|hin)\b/i.test(combined)
+  ) {
+    return 0;
+  }
+
+  if (
+    code === 'eng' ||
+    code === 'en' ||
+    code.startsWith('en-') ||
+    code === 'english' ||
+    /\b(english|eng)\b/i.test(combined)
   ) {
     return 1;
   }
@@ -1837,7 +1871,7 @@ export function getAudioTrackLanguagePriority(
 }
 
 /**
- * Sorts multi-audio tracks with English first, then Hindi, then any other language,
+ * Sorts multi-audio tracks with Hindi first, then English, then any other language,
  * while preserving each track's true FFmpeg `audioIndex` for accurate stream mapping.
  */
 export function sortAudioTracksByLanguagePriority(
@@ -2035,19 +2069,61 @@ export async function probeMediaStream(
   return probePromise;
 }
 
+let cachedOpusSupport: boolean | null = null;
+let audioOriginRoundRobinCounter = 0;
+
+export function canBrowserPlayOpusAudio(): boolean {
+  if (typeof document === 'undefined') return false;
+  if (cachedOpusSupport !== null) return cachedOpusSupport;
+  try {
+    const a = document.createElement('audio');
+    const res =
+      typeof a.canPlayType === 'function'
+        ? a.canPlayType('audio/webm; codecs="opus"')
+        : '';
+    cachedOpusSupport = res === 'probably' || res === 'maybe';
+  } catch {
+    cachedOpusSupport = false;
+  }
+  return cachedOpusSupport;
+}
+
+export function getAudioBackendOrigin(): string {
+  const rawPool = (
+    ((import.meta as unknown as { env?: Record<string, string> }).env
+      ?.VITE_AUDIO_BACKEND_ORIGINS || '')
+  ).trim();
+  if (rawPool) {
+    const origins = rawPool
+      .split(',')
+      .map((o) => o.trim().replace(/\/+$/, ''))
+      .filter(Boolean);
+    if (origins.length > 0) {
+      const idx = audioOriginRoundRobinCounter % origins.length;
+      audioOriginRoundRobinCounter = (audioOriginRoundRobinCounter + 1) % 100000;
+      return origins[idx]!;
+    }
+  }
+  return getCloudBackendOrigin();
+}
+
 export function buildTranscodedStreamUrl(
   streamUrl: string,
   audioTrackIndex = 0,
   startSec = 0,
   explicitToken?: string,
   mode: 'audio' | 'muxed' = 'audio',
+  explicitFormat?: 'opus' | 'mp3',
 ): string {
   const roundedStart = Math.max(0, Math.floor(startSec));
   const authToken = explicitToken ?? getClientAuthToken();
   const tokenParam = authToken ? `&token=${encodeURIComponent(authToken)}` : '';
   const modeParam = mode === 'audio' ? '&mode=audio' : '';
-  const backendOrigin = getCloudBackendOrigin();
-  return `${backendOrigin}/api/media-stream?url=${encodeURIComponent(streamUrl)}&audioTrack=${audioTrackIndex}&start=${roundedStart}${modeParam}${tokenParam}`;
+  const resolvedFmt =
+    explicitFormat ?? (canBrowserPlayOpusAudio() ? 'opus' : undefined);
+  const fmtParam = resolvedFmt ? `&fmt=${resolvedFmt}` : '';
+  const backendOrigin = getAudioBackendOrigin();
+  return `${backendOrigin}/api/media-stream?url=${encodeURIComponent(streamUrl)}&audioTrack=${audioTrackIndex}&start=${roundedStart}${modeParam}${fmtParam}${tokenParam}`;
 }
 
 export interface ServerHealthMetric {
