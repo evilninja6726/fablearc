@@ -262,6 +262,57 @@ const CROP_OPTIONS: Array<{
 const SILENT_WAV_DATA_URI =
   'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
 
+// Auto-failover timeout (seconds) when a direct stream stays stuck buffering without advancing frames
+export const STREAM_FAILOVER_TIMEOUT_SEC = 10;
+
+/**
+ * Checks whether an HTMLVideoElement has loaded metadata AND exposes a `seekable` byte/time range
+ * covering `targetSec`. On large 4K MKV files during initial buffering (`readyState === 1`), `seekable`
+ * is often `[0, 0]` until MKV Cues finish loading — assigning `video.currentTime = targetSec` too early
+ * causes browsers to silently clamp `currentTime` back to `0.00s` without throwing!
+ */
+export function canVideoSeekImmediatelyTo(
+  mediaEl:
+    | {
+        readyState: number;
+        seekable?: {
+          length: number;
+          start: (index: number) => number;
+          end: (index: number) => number;
+        };
+      }
+    | null
+    | undefined,
+  targetSec: number,
+): boolean {
+  if (!mediaEl || mediaEl.readyState < 1) return false;
+  if (targetSec <= 0) return true;
+  const ranges = mediaEl.seekable;
+  if (!ranges || ranges.length === 0) return false;
+  for (let i = 0; i < ranges.length; i++) {
+    try {
+      const start = ranges.start(i);
+      const end = ranges.end(i);
+      if (targetSec >= start - 0.5 && targetSec <= end + 0.5) {
+        return true;
+      }
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+/**
+ * Checks whether a deferred seek has landed close enough to `targetSec` (accounting for 4K HEVC/MKV
+ * GOP keyframe intervals up to ~12s on deep seeks while keeping tight 1.5s accuracy near 00:00).
+ */
+function isDeferredSeekSatisfied(actualSec: number, targetSec: number): boolean {
+  if (targetSec <= 0) return Math.abs(actualSec) <= 1.5;
+  const tol = Math.min(12, Math.max(1.5, targetSec * 0.45));
+  return Math.abs(actualSec - targetSec) <= tol;
+}
+
 export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
   media,
   addons,
@@ -386,6 +437,15 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
   const pendingDeferredSeekRef = useRef<number | null>(
     initialPositionSec > 0 ? Math.floor(initialPositionSec) : null,
   );
+  const pendingDeferredSeekSetAtMsRef = useRef<number>(
+    initialPositionSec > 0 ? Date.now() : 0,
+  );
+  const lastDeferredSeekAttemptMsRef = useRef<number>(0);
+  const mediaFragmentRetriedRef = useRef<boolean>(false);
+  const deferredSeekAssignedRef = useRef<boolean>(false);
+  const tryApplyPendingDeferredSeekRef = useRef<(video: HTMLVideoElement | null) => void>(
+    () => {},
+  );
   const isSourceTransitioningRef = useRef<boolean>(true);
   const isRecoveringFromStallRef = useRef<boolean>(false);
   const stallStartedAtMsRef = useRef<number>(0);
@@ -419,6 +479,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       scrubCommitTimerRef.current = null;
     }
     pendingSeekTargetRef.current = null;
+    setScrubPreviewSec(null);
   }, []);
   const [seekNonce, setSeekNonce] = useState<number>(0);
   const [probedDurationSec, setProbedDurationSec] = useState<number>(0);
@@ -440,7 +501,14 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
   activeStreamRef.current = activeStream;
   const [hasFreezeFrame, setHasFreezeFrame] = useState(false);
   const [scrubPreviewSec, setScrubPreviewSec] = useState<number | null>(null);
-  const [failoverCountdownSec, setFailoverCountdownSec] = useState<number>(30);
+  const [failoverCountdownSec, setFailoverCountdownSec] = useState<number>(
+    STREAM_FAILOVER_TIMEOUT_SEC,
+  );
+  const failoverRemainingRef = useRef<number>(STREAM_FAILOVER_TIMEOUT_SEC);
+  const resetFailoverCountdown = useCallback(() => {
+    failoverRemainingRef.current = STREAM_FAILOVER_TIMEOUT_SEC;
+    setFailoverCountdownSec(STREAM_FAILOVER_TIMEOUT_SEC);
+  }, []);
 
   /**
    * Captures the exact current decoded video frame onto the overlay canvas before seeking or switching streams.
@@ -471,7 +539,11 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
   currentTimeRef.current = currentTimeSec;
   const [nativeDurationSec, setNativeDurationSec] = useState(0);
   const [volume, setVolume] = useState(1);
+  const volumeRef = useRef<number>(1);
+  volumeRef.current = volume;
   const [isMuted, setIsMuted] = useState(false);
+  const isMutedRef = useRef<boolean>(false);
+  isMutedRef.current = isMuted;
   const [brightness, setBrightness] = useState(1);
   const [gestureHud, setGestureHud] = useState<{
     kind: 'brightness' | 'volume';
@@ -500,6 +572,8 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
   } | null>(null);
   const suppressNextClickRef = useRef(false);
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
+  const playbackSpeedRef = useRef<number>(1);
+  playbackSpeedRef.current = playbackSpeed;
   const [aspectMode, setAspectMode] = useState<AspectCropMode>('contain');
   const [activePopover, setActivePopover] = useState<BottomPopoverType>(null);
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -587,6 +661,9 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         );
         intendedPositionSecRef.current = resumeAtSec;
         pendingDeferredSeekRef.current = resumeAtSec > 0 ? resumeAtSec : null;
+        pendingDeferredSeekSetAtMsRef.current = resumeAtSec > 0 ? Date.now() : 0;
+        mediaFragmentRetriedRef.current = false;
+        deferredSeekAssignedRef.current = false;
         isSourceTransitioningRef.current = true;
         isRecoveringFromStallRef.current = false;
         isAudioHotSwappingRef.current = false;
@@ -600,7 +677,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         setCurrentTimeSec(resumeAtSec);
         setHasStartedPlayback(false);
         setIsBuffering(true);
-        setFailoverCountdownSec(30);
+        resetFailoverCountdown();
         setActiveStream(nextStream);
       }
     },
@@ -610,6 +687,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       clearPendingTransitionTimers,
       effectiveProviderCategory,
       filteredStreamsByProvider,
+      resetFailoverCountdown,
       streams,
     ],
   );
@@ -623,38 +701,56 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     return () => window.clearTimeout(t);
   }, [failoverToast]);
 
-  // 30-Second Stream Watchdog: if a direct stream stays stuck buffering or hasn't started playing within 30s, auto-switch to next stream
+  // 10-Second Stream Watchdog: if a direct stream stays stuck buffering or hasn't started playing within 10s, auto-switch to next stream
   const activeWatchdogStreamId = activeStream?.id ?? '';
   const activeWatchdogStreamKind = activeStream?.kind ?? '';
+  const hasFallbackStreamAvailable = streams.length > 1;
   useEffect(() => {
-    if (!activeWatchdogStreamId || activeWatchdogStreamKind !== 'direct') {
-      setIsBuffering(false);
-      setFailoverCountdownSec(30);
+    if (
+      !activeWatchdogStreamId ||
+      activeWatchdogStreamKind !== 'direct' ||
+      !hasFallbackStreamAvailable
+    ) {
+      if (!activeWatchdogStreamId || activeWatchdogStreamKind !== 'direct') {
+        setIsBuffering(false);
+      }
+      resetFailoverCountdown();
       return;
     }
 
-    // Only count down when waiting for initial playback or stuck buffering
+    // Only count down when waiting for initial playback or stuck buffering (and NOT paused by user!)
     const waitingForFrames = isBuffering || !hasStartedPlayback;
     if (!waitingForFrames) {
-      setFailoverCountdownSec(30);
+      resetFailoverCountdown();
       return;
     }
 
-    let remaining = 30;
-    setFailoverCountdownSec(30);
+    resetFailoverCountdown();
     const interval = window.setInterval(() => {
-      remaining -= 1;
-      if (remaining <= 0) {
-        remaining = 30;
-        setFailoverCountdownSec(30);
-        switchToNextStreamRef.current('Stream unresponsive for 30s');
+      if (userPausedRef.current) {
+        return;
+      }
+      failoverRemainingRef.current -= 1;
+      if (failoverRemainingRef.current <= 0) {
+        failoverRemainingRef.current = STREAM_FAILOVER_TIMEOUT_SEC;
+        setFailoverCountdownSec(STREAM_FAILOVER_TIMEOUT_SEC);
+        switchToNextStreamRef.current(
+          `Stream unresponsive for ${STREAM_FAILOVER_TIMEOUT_SEC}s`,
+        );
       } else {
-        setFailoverCountdownSec(remaining);
+        setFailoverCountdownSec(failoverRemainingRef.current);
       }
     }, 1000);
 
     return () => window.clearInterval(interval);
-  }, [activeWatchdogStreamId, activeWatchdogStreamKind, hasStartedPlayback, isBuffering]);
+  }, [
+    activeWatchdogStreamId,
+    activeWatchdogStreamKind,
+    hasFallbackStreamAvailable,
+    hasStartedPlayback,
+    isBuffering,
+    resetFailoverCountdown,
+  ]);
 
   // Fullscreen listener & toggle (supports standard Fullscreen API + WebKit/iOS Safari fallback)
   useEffect(() => {
@@ -1042,7 +1138,13 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     if (!video || !audio) return;
 
     const targetSpeed = isHold2xActive ? 2 : playbackSpeed;
-    const videoReady = video.readyState >= 2 && !video.seeking;
+    const pendingTarget = pendingDeferredSeekRef.current;
+    const waitingOnDeferredVideoSeek =
+      pendingTarget !== null &&
+      pendingTarget > 0 &&
+      !isDeferredSeekSatisfied(video.currentTime, pendingTarget);
+    const videoReady =
+      video.readyState >= 2 && !video.seeking && !waitingOnDeferredVideoSeek;
     const audioReady = audio.readyState >= 2 && !audio.seeking;
 
     if (videoReady && audioReady) {
@@ -1153,6 +1255,9 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       isAudioHotSwappingRef.current = false;
       isSourceTransitioningRef.current = true;
       pendingDeferredSeekRef.current = pos > 0 ? pos : null;
+      pendingDeferredSeekSetAtMsRef.current = pos > 0 ? Date.now() : 0;
+      mediaFragmentRetriedRef.current = false;
+      deferredSeekAssignedRef.current = false;
       streamStartOffsetRef.current = pos;
       setStreamStartOffsetSec(pos);
       directVideoLoadedUrlRef.current = null;
@@ -1176,6 +1281,10 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       const audio = audioRef.current;
       if (!video || !audio || userPausedRef.current) return;
 
+      if (pendingDeferredSeekRef.current !== null) {
+        tryApplyPendingDeferredSeekRef.current(video);
+      }
+
       if (video.readyState >= 2 && !video.seeking && audio.readyState >= 2) {
         syncSplitPlaybackRef.current();
         return;
@@ -1191,22 +1300,33 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       ) {
         // Reset lastSeekStartedAtMsRef so we only auto-reconnect once per 6s window
         lastSeekStartedAtMsRef.current = Date.now();
-        const targetSec = Math.max(0, Math.floor(currentTimeRef.current));
-        streamStartOffsetRef.current = targetSec;
-        setStreamStartOffsetSec(targetSec);
+        const targetSec = Math.max(
+          0,
+          Math.floor(pendingDeferredSeekRef.current ?? intendedPositionSecRef.current),
+        );
+        const baseCdnUrl = effectiveCdnUrl.split('#')[0];
+        if (Math.abs(streamStartOffsetRef.current - targetSec) > 1.5) {
+          streamStartOffsetRef.current = targetSec;
+          setStreamStartOffsetSec(targetSec);
+          setSeekNonce((n) => n + 1);
+        }
         try {
           cleanupMetaListener?.();
-          video.src = effectiveCdnUrl;
+          mediaFragmentRetriedRef.current = targetSec > 0;
+          video.src = targetSec > 0 ? `${baseCdnUrl}#t=${targetSec}` : baseCdnUrl;
           video.muted = true;
-          video.playbackRate = playbackSpeed;
+          video.playbackRate = playbackSpeedRef.current;
           video.load();
           const onMeta = () => {
             cleanupMetaListener = null;
             if (cancelled || userPausedRef.current) return;
-            try {
-              video.currentTime = targetSec;
-            } catch {
-              // ignore
+            if (targetSec > 0 && canVideoSeekImmediatelyTo(video, targetSec)) {
+              deferredSeekAssignedRef.current = true;
+              try {
+                video.currentTime = targetSec;
+              } catch {
+                // ignore
+              }
             }
             video.play().catch(() => {});
             syncSplitPlaybackRef.current();
@@ -1549,7 +1669,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     // Wait for /api/media-probe to finish unwrapping the CDN URL & selecting the audio track before opening the stream
     if (!isM3u8Playlist && probedStreamUrl !== activeStream.url) {
       setIsBuffering(true);
-      setFailoverCountdownSec(30);
+      resetFailoverCountdown();
       return;
     }
 
@@ -1576,7 +1696,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         audio.load();
       }
       setIsBuffering(true);
-      setFailoverCountdownSec(30);
+      resetFailoverCountdown();
       isSourceTransitioningRef.current = true;
       directVideoLoadedUrlRef.current = null;
       const hls = new Hls({
@@ -1631,16 +1751,21 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
           0,
           Math.floor(pendingDeferredSeekRef.current ?? targetInitialSec),
         );
-        if (desiredSec > 0 && Math.abs(video.currentTime - desiredSec) > 1.5) {
+        if (
+          desiredSec > 0 &&
+          !isDeferredSeekSatisfied(video.currentTime, desiredSec) &&
+          canVideoSeekImmediatelyTo(video, desiredSec)
+        ) {
+          deferredSeekAssignedRef.current = true;
           try {
             video.currentTime = desiredSec;
           } catch {
-            // Applied in loadedmetadata fallback if needed
+            // Applied via pendingDeferredSeekRef once seekable
           }
         }
-        video.muted = isMuted;
-        video.volume = volume;
-        video.playbackRate = playbackSpeed;
+        video.muted = isMutedRef.current;
+        video.volume = volumeRef.current;
+        video.playbackRate = playbackSpeedRef.current;
         if (!userPausedRef.current) {
           video.play().catch(() => {
             setIsPlaying(false);
@@ -1668,13 +1793,19 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       // 2. <audio> streams 48 kbps VBR Opus (-vn) from Render (~42 MB per full 2-hour movie!)
       // 3. If `isAudioHotSwappingRef.current` is active, <video> keeps playing uninterrupted with ZERO spinner!
       video.muted = true;
-      video.playbackRate = playbackSpeed;
+      video.playbackRate = playbackSpeedRef.current;
       if (directVideoLoadedUrlRef.current !== effectiveCdnUrl) {
         setIsBuffering(true);
-        setFailoverCountdownSec(30);
+        resetFailoverCountdown();
         isSourceTransitioningRef.current = true;
         directVideoLoadedUrlRef.current = effectiveCdnUrl;
-        video.src = effectiveCdnUrl;
+        pendingDeferredSeekSetAtMsRef.current = targetInitialSec > 0 ? Date.now() : 0;
+        mediaFragmentRetriedRef.current = targetInitialSec > 0;
+        deferredSeekAssignedRef.current = false;
+        video.src =
+          targetInitialSec > 0
+            ? `${effectiveCdnUrl.split('#')[0]}#t=${targetInitialSec}`
+            : effectiveCdnUrl;
         video.load();
         const onSplitMeta = () => {
           cleanupLoadedMeta = null;
@@ -1686,11 +1817,15 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                 Math.max(intendedPositionSecRef.current, streamStartOffsetRef.current),
             ),
           );
-          if (desiredSec > 0 && Math.abs(video.currentTime - desiredSec) > 1) {
-            try {
-              video.currentTime = desiredSec;
-            } catch {
-              // Ignore if not yet seekable
+          if (desiredSec > 0 && !isDeferredSeekSatisfied(video.currentTime, desiredSec)) {
+            pendingDeferredSeekRef.current = desiredSec;
+            if (canVideoSeekImmediatelyTo(video, desiredSec)) {
+              deferredSeekAssignedRef.current = true;
+              try {
+                video.currentTime = desiredSec;
+              } catch {
+                // Retried via pendingDeferredSeekRef as seekable ranges arrive
+              }
             }
           }
           syncSplitPlaybackRef.current();
@@ -1701,10 +1836,22 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         setIsBuffering(true);
         const desiredSec = streamStartOffsetRef.current;
         if (Math.abs(video.currentTime - desiredSec) > 1.2) {
-          try {
-            video.currentTime = desiredSec;
-          } catch {
-            // Ignore
+          if (desiredSec === 0 && video.readyState >= 1) {
+            try {
+              video.currentTime = 0;
+            } catch {
+              // Ignore
+            }
+          } else if (desiredSec > 0) {
+            pendingDeferredSeekRef.current = desiredSec;
+            if (canVideoSeekImmediatelyTo(video, desiredSec)) {
+              deferredSeekAssignedRef.current = true;
+              try {
+                video.currentTime = desiredSec;
+              } catch {
+                // Retried via pendingDeferredSeekRef as seekable ranges arrive
+              }
+            }
           }
         }
         if (video.paused && !userPausedRef.current) {
@@ -1720,15 +1867,15 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         streamStartOffsetRef.current = audioStartSec;
         const audioOnlyUrl = buildTranscodedStreamUrl(
           effectiveCdnUrl,
-          selectedAudioTrackIndex,
+          selectedAudioTrackIndexRef.current,
           audioStartSec,
           undefined,
           'audio',
         );
         audio.src = seekNonce > 0 ? `${audioOnlyUrl}&_sn=${seekNonce}` : audioOnlyUrl;
-        audio.muted = isMuted;
-        audio.volume = volume;
-        audio.playbackRate = playbackSpeed;
+        audio.muted = isMutedRef.current;
+        audio.volume = volumeRef.current;
+        audio.playbackRate = playbackSpeedRef.current;
         audio.load();
         if (isAudioHotSwappingRef.current) {
           const onHotSwapReady = () => {
@@ -1754,7 +1901,10 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
               });
           };
           audio.addEventListener('canplay', onHotSwapReady, { once: true });
-          cleanupHotSwap = () => audio.removeEventListener('canplay', onHotSwapReady);
+          cleanupHotSwap = () => {
+            audio.removeEventListener('canplay', onHotSwapReady);
+            isAudioHotSwappingRef.current = false;
+          };
         } else if (!userPausedRef.current) {
           audio
             .play()
@@ -1786,15 +1936,21 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         audio.removeAttribute('src');
         audio.load();
       }
-      video.muted = isMuted;
-      video.volume = volume;
-      video.playbackRate = playbackSpeed;
+      video.muted = isMutedRef.current;
+      video.volume = volumeRef.current;
+      video.playbackRate = playbackSpeedRef.current;
       if (directVideoLoadedUrlRef.current !== effectiveCdnUrl) {
         setIsBuffering(true);
-        setFailoverCountdownSec(30);
+        resetFailoverCountdown();
         isSourceTransitioningRef.current = true;
         directVideoLoadedUrlRef.current = effectiveCdnUrl;
-        video.src = effectiveCdnUrl;
+        pendingDeferredSeekSetAtMsRef.current = targetInitialSec > 0 ? Date.now() : 0;
+        mediaFragmentRetriedRef.current = targetInitialSec > 0;
+        deferredSeekAssignedRef.current = false;
+        video.src =
+          targetInitialSec > 0
+            ? `${effectiveCdnUrl.split('#')[0]}#t=${targetInitialSec}`
+            : effectiveCdnUrl;
         video.load();
         const onDirectMeta = () => {
           cleanupLoadedMeta = null;
@@ -1806,14 +1962,23 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                 Math.max(intendedPositionSecRef.current, streamStartOffsetRef.current),
             ),
           );
-          if (desiredSec > 0 && Math.abs(video.currentTime - desiredSec) > 1) {
-            try {
-              video.currentTime = desiredSec;
-            } catch {
-              // ignore
+          if (desiredSec > 0 && !isDeferredSeekSatisfied(video.currentTime, desiredSec)) {
+            pendingDeferredSeekRef.current = desiredSec;
+            if (canVideoSeekImmediatelyTo(video, desiredSec)) {
+              deferredSeekAssignedRef.current = true;
+              try {
+                video.currentTime = desiredSec;
+              } catch {
+                // Retried via pendingDeferredSeekRef as seekable ranges arrive
+              }
             }
           }
-          if (!userPausedRef.current) {
+          if (
+            !userPausedRef.current &&
+            (pendingDeferredSeekRef.current === null ||
+              isDeferredSeekSatisfied(video.currentTime, pendingDeferredSeekRef.current) ||
+              mediaFragmentRetriedRef.current)
+          ) {
             video.play().catch(() => {
               setIsPlaying(false);
             });
@@ -1821,7 +1986,11 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         };
         video.addEventListener('loadedmetadata', onDirectMeta, { once: true });
         cleanupLoadedMeta = () => video.removeEventListener('loadedmetadata', onDirectMeta);
-      } else if (video.paused && !userPausedRef.current) {
+      } else if (
+        video.paused &&
+        !userPausedRef.current &&
+        pendingDeferredSeekRef.current === null
+      ) {
         video.play().catch(() => {});
       }
     }
@@ -1844,7 +2013,6 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     probedStreamUrl,
     resolvedDirectUrl,
     seekNonce,
-    selectedAudioTrackIndex,
     streamRefreshNonce,
     useFfmpegAudioEngine,
   ]);
@@ -1928,11 +2096,133 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     }
   }, [activeStream?.kind, isMuted, isSplitAudioMode, volume]);
 
+  /**
+   * Applies any deferred forward/backward seek (`pendingDeferredSeekRef`) as soon as `video.seekable`
+   * actually covers the target timestamp, preventing HTML5 `<video>` from silently clamping `video.currentTime`
+   * back to `0.00s` when MKV `Cues` are still loading during `readyState === 1`.
+   * If `video.seekable` still doesn't cover `target` after 3.2s on a direct MKV/MP4 stream, falls back once
+   * to an HTML5 Media Fragment URI (`#t=<target>`) so the browser issues a fresh HTTP Range request!
+   */
+  const tryApplyPendingDeferredSeek = useCallback(
+    (video: HTMLVideoElement | null) => {
+      const target = pendingDeferredSeekRef.current;
+      if (!video || target === null) return;
+      if (target <= 0) {
+        pendingDeferredSeekRef.current = null;
+        mediaFragmentRetriedRef.current = false;
+        deferredSeekAssignedRef.current = false;
+        return;
+      }
+      if (isDeferredSeekSatisfied(video.currentTime, target)) {
+        pendingDeferredSeekRef.current = null;
+        mediaFragmentRetriedRef.current = false;
+        deferredSeekAssignedRef.current = false;
+        isSourceTransitioningRef.current = false;
+        return;
+      }
+
+      const now = Date.now();
+      if (!video.seeking && canVideoSeekImmediatelyTo(video, target)) {
+        if (now - lastDeferredSeekAttemptMsRef.current >= 350) {
+          lastDeferredSeekAttemptMsRef.current = now;
+          deferredSeekAssignedRef.current = true;
+          try {
+            video.currentTime = target;
+            if (!isSplitAudioMode && video.paused && !userPausedRef.current) {
+              video.play().catch(() => {});
+            }
+          } catch {
+            // Will retry on next progress / canplay tick
+          }
+        }
+        return;
+      }
+
+      const isM3u8 =
+        activeStreamIsHls || activeStreamUrl.toLowerCase().includes('.m3u8');
+      if (
+        !isM3u8 &&
+        video.readyState >= 1 &&
+        !video.seeking &&
+        !mediaFragmentRetriedRef.current &&
+        pendingDeferredSeekSetAtMsRef.current > 0 &&
+        now - pendingDeferredSeekSetAtMsRef.current >= 3200
+      ) {
+        const baseCdnUrl = (resolvedDirectUrl || activeStreamUrl).split('#')[0];
+        if (baseCdnUrl) {
+          mediaFragmentRetriedRef.current = true;
+          lastDeferredSeekAttemptMsRef.current = now;
+          resetFailoverCountdown();
+          directVideoLoadedUrlRef.current = resolvedDirectUrl || activeStreamUrl;
+          video.src = `${baseCdnUrl}#t=${target}`;
+          video.muted = isSplitAudioMode ? true : isMutedRef.current;
+          video.volume = volumeRef.current;
+          video.playbackRate = playbackSpeedRef.current;
+          video.load();
+          if (!userPausedRef.current) {
+            video.play().catch(() => {});
+          }
+        }
+        return;
+      }
+
+      // Safety valve: if `#t=` fallback already ran (or HLS stream lacks target range) and >= 4.2s elapsed
+      // with ready frames, release the deferred-seek latch so playback never deadlocks behind the spinner!
+      const anchorMs = Math.max(
+        pendingDeferredSeekSetAtMsRef.current,
+        lastDeferredSeekAttemptMsRef.current,
+      );
+      if (
+        (mediaFragmentRetriedRef.current || isM3u8) &&
+        anchorMs > 0 &&
+        now - anchorMs >= 4200 &&
+        video.readyState >= 2 &&
+        !video.seeking
+      ) {
+        const actualFloor = Math.max(0, Math.floor(video.currentTime));
+        pendingDeferredSeekRef.current = null;
+        deferredSeekAssignedRef.current = false;
+        isSourceTransitioningRef.current = false;
+        if (isSplitAudioMode && Math.abs(streamStartOffsetRef.current - actualFloor) > 3) {
+          intendedPositionSecRef.current = actualFloor;
+          streamStartOffsetRef.current = actualFloor;
+          setStreamStartOffsetSec(actualFloor);
+          setSeekNonce((n) => n + 1);
+        } else if (!isSplitAudioMode && video.paused && !userPausedRef.current) {
+          video.play().catch(() => {});
+        }
+      }
+    },
+    [
+      activeStreamIsHls,
+      activeStreamUrl,
+      isSplitAudioMode,
+      resetFailoverCountdown,
+      resolvedDirectUrl,
+    ],
+  );
+  tryApplyPendingDeferredSeekRef.current = tryApplyPendingDeferredSeek;
+
+  // Lightweight 400ms Deferred-Seek Heartbeat: ensures `tryApplyPendingDeferredSeek` fires reliably at 3.2s
+  // even when `<video>` is paused during a non-split buffered seek and stops emitting DOM progress events!
+  useEffect(() => {
+    if (!isBuffering || activeStreamKind !== 'direct') return;
+    const timer = window.setInterval(() => {
+      if (!userPausedRef.current && pendingDeferredSeekRef.current !== null) {
+        tryApplyPendingDeferredSeekRef.current(videoRef.current);
+      }
+    }, 400);
+    return () => window.clearInterval(timer);
+  }, [activeStreamKind, isBuffering]);
+
   const seekTo = useCallback(
     (nextSec: number) => {
       const video = videoRef.current;
       const audio = audioRef.current;
-      if (!video || activeStream?.kind !== 'direct') return;
+      if (!video || activeStream?.kind !== 'direct') {
+        setScrubPreviewSec(null);
+        return;
+      }
       clearPendingTransitionTimers();
       captureVideoFrameSnapshot();
       userPausedRef.current = false;
@@ -1942,19 +2232,20 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       intendedPositionSecRef.current = clamped;
       currentTimeRef.current = clamped;
       streamStartOffsetRef.current = clamped;
+      isSourceTransitioningRef.current = clamped > 0;
+      pendingDeferredSeekRef.current = clamped > 0 ? clamped : null;
+      pendingDeferredSeekSetAtMsRef.current = clamped > 0 ? Date.now() : 0;
+      lastDeferredSeekAttemptMsRef.current = 0;
+      mediaFragmentRetriedRef.current = false;
+      deferredSeekAssignedRef.current = false;
       setCurrentTimeSec(clamped);
       setScrubPreviewSec(null);
-      setFailoverCountdownSec(30);
+      resetFailoverCountdown();
 
       if (isSplitAudioMode) {
         setIsBuffering(true);
         isSeekingSplitRef.current = true;
         lastSeekStartedAtMsRef.current = Date.now();
-        if (video.readyState < 1) {
-          pendingDeferredSeekRef.current = clamped;
-        } else {
-          pendingDeferredSeekRef.current = null;
-        }
         const targetRelativeSec = clamped - streamStartOffsetSec;
         let isAudioBuffered = false;
         if (audio && targetRelativeSec >= 0 && audio.buffered && audio.buffered.length > 0) {
@@ -1967,13 +2258,25 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
             }
           }
         }
-        if (audio && isAudioBuffered && video.readyState >= 1) {
+        const canSeekVideoNow =
+          clamped === 0 ? video.readyState >= 1 : canVideoSeekImmediatelyTo(video, clamped);
+        if (clamped === 0 && (video.currentSrc || video.src || '').includes('#t=')) {
+          const cleanUrl = (resolvedDirectUrl || activeStream.url || '').split('#')[0];
+          if (cleanUrl) {
+            video.src = cleanUrl;
+            video.muted = true;
+            video.load();
+          }
+        }
+        if (audio && isAudioBuffered && canSeekVideoNow) {
           streamStartOffsetRef.current = streamStartOffsetSec;
+          lastDeferredSeekAttemptMsRef.current = Date.now();
+          deferredSeekAssignedRef.current = clamped > 0;
           try {
             video.currentTime = clamped;
             audio.currentTime = targetRelativeSec;
           } catch {
-            // ignore
+            // Retried via pendingDeferredSeekRef if needed
           }
           syncSplitPlayback();
         } else {
@@ -1982,40 +2285,72 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
           if (audio && !audio.paused) {
             audio.pause();
           }
-          if (video.readyState >= 1) {
+          if (canSeekVideoNow) {
+            lastDeferredSeekAttemptMsRef.current = Date.now();
+            deferredSeekAssignedRef.current = clamped > 0;
             try {
               video.currentTime = clamped;
             } catch {
-              // ignore
+              // Retried via pendingDeferredSeekRef if needed
             }
           }
           setStreamStartOffsetSec(clamped);
           setSeekNonce((prev) => prev + 1);
         }
       } else {
-        // Unified Seek Latch for Non-Split Direct & HLS Streams (CNCVerse / MP4 / M3U8):
-        // If `video.readyState < 1` (metadata not yet loaded while buffering), browsers silently drop `video.currentTime = clamped`.
-        // Latching `pendingDeferredSeekRef` + `streamStartOffsetSec` guarantees `loadedmetadata` / `MANIFEST_PARSED` seeks to `clamped` instead of resetting to 00:00!
+        // Unified Seek Latch for Non-Split Direct & HLS Streams (CNCVerse / PlavioHD / MP4 / MKV / M3U8):
+        // Never assign `video.currentTime = clamped` when `video.seekable` is still `[0, 0]` (e.g. MKV Cues still loading),
+        // because HTML5 `<video>` silently clamps `currentTime` to `0.00s` without throwing!
+        // Keep `pendingDeferredSeekRef` latched until `onSeeked` / `onTimeUpdate` confirms `currentTime` actually reached `clamped`.
         setStreamStartOffsetSec(clamped);
         setIsBuffering(true);
-        if (video.readyState >= 1) {
-          pendingDeferredSeekRef.current = null;
+        if (clamped === 0) {
+          if ((video.currentSrc || video.src || '').includes('#t=')) {
+            const cleanUrl = (resolvedDirectUrl || activeStream.url || '').split('#')[0];
+            if (cleanUrl) {
+              video.src = cleanUrl;
+              video.load();
+            }
+          } else if (video.readyState >= 1) {
+            try {
+              video.currentTime = 0;
+            } catch {
+              // ignore
+            }
+          }
+          if (video.paused && !userPausedRef.current) {
+            video.play().catch(() => {});
+          }
+          if (Math.abs(video.currentTime) <= 0.2 && video.readyState >= 3 && !video.seeking) {
+            setIsBuffering(false);
+            setHasFreezeFrame(false);
+          }
+        } else if (canVideoSeekImmediatelyTo(video, clamped)) {
+          lastDeferredSeekAttemptMsRef.current = Date.now();
+          deferredSeekAssignedRef.current = true;
           try {
             video.currentTime = clamped;
+            if (video.paused && !userPausedRef.current) {
+              video.play().catch(() => {});
+            }
           } catch {
-            pendingDeferredSeekRef.current = clamped;
+            // Kept in pendingDeferredSeekRef
           }
-        } else {
-          pendingDeferredSeekRef.current = clamped;
+        } else if (!video.paused) {
+          // Pause old 00:00 audio while waiting for `seekable` / 3.2s `#t=` fallback so pre-seek audio never plays behind the spinner!
+          video.pause();
         }
       }
     },
     [
       activeStream?.kind,
+      activeStream?.url,
       captureVideoFrameSnapshot,
       clearPendingTransitionTimers,
       effectiveDurationSec,
       isSplitAudioMode,
+      resetFailoverCountdown,
+      resolvedDirectUrl,
       streamStartOffsetSec,
       syncSplitPlayback,
     ],
@@ -2037,16 +2372,20 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       if (scrubPreviewSec === null) {
         captureVideoFrameSnapshot();
       }
-      setScrubPreviewSec(nextVal);
-      setCurrentTimeSec(nextVal);
+      const clampedVal = Math.max(0, Math.floor(nextVal));
+      intendedPositionSecRef.current = clampedVal;
+      currentTimeRef.current = clampedVal;
+      setScrubPreviewSec(clampedVal);
+      setCurrentTimeSec(clampedVal);
+      resetFailoverCountdown();
       if (scrubCommitTimerRef.current) {
         window.clearTimeout(scrubCommitTimerRef.current);
       }
       scrubCommitTimerRef.current = window.setTimeout(() => {
-        seekTo(nextVal);
+        seekTo(clampedVal);
       }, 180);
     },
-    [captureVideoFrameSnapshot, scrubPreviewSec, seekTo],
+    [captureVideoFrameSnapshot, resetFailoverCountdown, scrubPreviewSec, seekTo],
   );
 
   const showGestureHudBanner = useCallback(
@@ -2109,9 +2448,11 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       const maxDur = effectiveDurationSec > 0 ? effectiveDurationSec : 14400;
       const targetSec = Math.max(0, Math.min(maxDur, Math.floor(baseSec + stepSec)));
       pendingSeekTargetRef.current = targetSec;
+      intendedPositionSecRef.current = targetSec;
       currentTimeRef.current = targetSec;
       setCurrentTimeSec(targetSec);
       setScrubPreviewSec(targetSec);
+      resetFailoverCountdown();
 
       if (zoneSeekCommitTimerRef.current) {
         window.clearTimeout(zoneSeekCommitTimerRef.current);
@@ -2141,7 +2482,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         setSeekRipple(null);
       }, 850);
     },
-    [captureVideoFrameSnapshot, effectiveDurationSec, seekTo],
+    [captureVideoFrameSnapshot, effectiveDurationSec, resetFailoverCountdown, seekTo],
   );
 
   const [isScreenLocked, setIsScreenLocked] = useState(false);
@@ -2406,6 +2747,9 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     setEpisodeSeasonFilter(nextEpisode.season);
     intendedPositionSecRef.current = 0;
     pendingDeferredSeekRef.current = null;
+    pendingDeferredSeekSetAtMsRef.current = 0;
+    mediaFragmentRetriedRef.current = false;
+    deferredSeekAssignedRef.current = false;
     isSourceTransitioningRef.current = true;
     isRecoveringFromStallRef.current = false;
     isAudioHotSwappingRef.current = false;
@@ -2487,11 +2831,15 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
           return next;
         });
       } else if (e.key === 'ArrowLeft') {
-        e.preventDefault();
-        triggerZoneSeek('left');
+        if (activeStream?.kind === 'direct') {
+          e.preventDefault();
+          triggerZoneSeek('left');
+        }
       } else if (e.key === 'ArrowRight') {
-        e.preventDefault();
-        triggerZoneSeek('right');
+        if (activeStream?.kind === 'direct') {
+          e.preventDefault();
+          triggerZoneSeek('right');
+        }
       } else if (e.key === 'ArrowUp') {
         e.preventDefault();
         if (e.shiftKey) {
@@ -3044,6 +3392,11 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
               syncSplitPlayback();
             }
           }}
+          onError={() => {
+            if (isAudioHotSwappingRef.current) {
+              isAudioHotSwappingRef.current = false;
+            }
+          }}
         />
 
         {activeStream?.kind === 'direct' && activeStream.url && (
@@ -3061,10 +3414,14 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                   setIsBuffering(true);
                 }
               }}
-              onLoadedData={() => {
+              onLoadedData={(e) => {
+                tryApplyPendingDeferredSeek(e.currentTarget);
                 if (isSplitAudioMode) {
                   syncSplitPlayback();
                 }
+              }}
+              onProgress={(e) => {
+                tryApplyPendingDeferredSeek(e.currentTarget);
               }}
               onWaiting={() => {
                 if (videoWaitingTimerRef.current) {
@@ -3097,35 +3454,42 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                 }
               }}
               onSeeked={(e) => {
+                const vid = e.currentTarget;
+                const pendingTarget = pendingDeferredSeekRef.current;
                 if (
-                  pendingDeferredSeekRef.current !== null &&
-                  Math.abs(e.currentTarget.currentTime - pendingDeferredSeekRef.current) <= 3
+                  pendingTarget !== null &&
+                  (isDeferredSeekSatisfied(vid.currentTime, pendingTarget) ||
+                    (deferredSeekAssignedRef.current &&
+                      (pendingTarget <= 4 || vid.currentTime > 1.5)))
                 ) {
                   pendingDeferredSeekRef.current = null;
+                  mediaFragmentRetriedRef.current = false;
+                  deferredSeekAssignedRef.current = false;
                 }
-                isSourceTransitioningRef.current = false;
+                if (pendingDeferredSeekRef.current === null) {
+                  isSourceTransitioningRef.current = false;
+                } else {
+                  tryApplyPendingDeferredSeek(vid);
+                  return;
+                }
                 if (isSplitAudioMode) {
                   syncSplitPlayback();
                 } else {
                   setIsBuffering(false);
                   setHasFreezeFrame(false);
+                  if (vid.paused && !userPausedRef.current) {
+                    vid.play().catch(() => {});
+                  }
                 }
               }}
-              onCanPlay={() => {
-                const vid = videoRef.current;
-                const pendingTarget = pendingDeferredSeekRef.current;
+              onCanPlay={(e) => {
+                const vid = e.currentTarget;
+                tryApplyPendingDeferredSeek(vid);
                 if (
-                  vid &&
-                  pendingTarget !== null &&
-                  pendingTarget > 0 &&
-                  !vid.seeking &&
-                  Math.abs(vid.currentTime - pendingTarget) > 2
+                  pendingDeferredSeekRef.current !== null &&
+                  !isDeferredSeekSatisfied(vid.currentTime, pendingDeferredSeekRef.current)
                 ) {
-                  try {
-                    vid.currentTime = pendingTarget;
-                  } catch {
-                    // ignore
-                  }
+                  return;
                 }
                 if (isSplitAudioMode) {
                   syncSplitPlayback();
@@ -3148,7 +3512,17 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                   }
                 }
               }}
-              onCanPlayThrough={() => {
+              onCanPlayThrough={(e) => {
+                tryApplyPendingDeferredSeek(e.currentTarget);
+                if (
+                  pendingDeferredSeekRef.current !== null &&
+                  !isDeferredSeekSatisfied(
+                    e.currentTarget.currentTime,
+                    pendingDeferredSeekRef.current,
+                  )
+                ) {
+                  return;
+                }
                 isRecoveringFromStallRef.current = false;
                 if (isSplitAudioMode) {
                   syncSplitPlayback();
@@ -3156,7 +3530,17 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                   setIsBuffering(false);
                 }
               }}
-              onPlaying={() => {
+              onPlaying={(e) => {
+                tryApplyPendingDeferredSeek(e.currentTarget);
+                if (
+                  pendingDeferredSeekRef.current !== null &&
+                  !isDeferredSeekSatisfied(
+                    e.currentTarget.currentTime,
+                    pendingDeferredSeekRef.current,
+                  )
+                ) {
+                  return;
+                }
                 setIsPlaying(true);
                 isSourceTransitioningRef.current = false;
                 if (isSplitAudioMode) {
@@ -3176,7 +3560,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                   setIsBuffering(false);
                   setHasStartedPlayback(true);
                   setHasFreezeFrame(false);
-                  setFailoverCountdownSec(30);
+                  resetFailoverCountdown();
                 }
               }}
               onPlay={() => {
@@ -3235,49 +3619,40 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                 if (Number.isFinite(dur) && dur > 0) {
                   setNativeDurationSec(dur);
                 }
-                // Apply any deferred seek queued while video was at readyState === 0 (#3 & #4).
-                // Keep `pendingDeferredSeekRef` set until `onSeeked` or `onTimeUpdate` confirms the seek actually landed!
-                const pendingTarget = pendingDeferredSeekRef.current;
-                if (
-                  pendingTarget !== null &&
-                  pendingTarget > 0 &&
-                  Math.abs(e.currentTarget.currentTime - pendingTarget) > 1.2
-                ) {
-                  try {
-                    e.currentTarget.currentTime = pendingTarget;
-                  } catch {
-                    // Will retry in onCanPlay once seekable
-                  }
+                // Apply any deferred seek only once `video.seekable` covers it; otherwise keep latched!
+                if (pendingDeferredSeekRef.current !== null && pendingDeferredSeekRef.current > 0) {
+                  tryApplyPendingDeferredSeek(e.currentTarget);
                 } else {
                   pendingDeferredSeekRef.current = null;
                   isSourceTransitioningRef.current = false;
                 }
               }}
               onTimeUpdate={(e) => {
-                const actualPos = e.currentTarget.currentTime;
-                // Protect playback position against transient 0.00-2.0s timeupdate events before a deferred seek lands!
-                const expectedFloor = pendingDeferredSeekRef.current ?? intendedPositionSecRef.current;
+                const vid = e.currentTarget;
+                const actualPos = vid.currentTime;
+                if (pendingDeferredSeekRef.current !== null) {
+                  tryApplyPendingDeferredSeek(vid);
+                  if (
+                    pendingDeferredSeekRef.current !== null &&
+                    !isDeferredSeekSatisfied(actualPos, pendingDeferredSeekRef.current)
+                  ) {
+                    return;
+                  }
+                }
+                const expectedFloor = intendedPositionSecRef.current;
                 if (
                   expectedFloor > 4 &&
                   actualPos < Math.min(3, expectedFloor - 2) &&
-                  (isSourceTransitioningRef.current ||
-                    pendingDeferredSeekRef.current !== null ||
-                    e.currentTarget.seeking)
+                  (isSourceTransitioningRef.current || vid.seeking)
                 ) {
                   return;
                 }
 
-                if (
-                  pendingDeferredSeekRef.current !== null &&
-                  Math.abs(actualPos - pendingDeferredSeekRef.current) <= 3
-                ) {
-                  pendingDeferredSeekRef.current = null;
-                }
-                if (actualPos >= 0.25 && !e.currentTarget.seeking) {
+                if (actualPos >= 0.25 && !vid.seeking) {
                   isSourceTransitioningRef.current = false;
                 }
 
-                if (actualPos > 0.08 && !e.currentTarget.paused) {
+                if (actualPos > 0.08 && !vid.paused) {
                   if (
                     !isSplitAudioMode ||
                     isAudioHotSwappingRef.current ||
@@ -3288,13 +3663,13 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                     setHasFreezeFrame(false);
                   }
                 }
-                if (isSplitAudioMode && !e.currentTarget.paused && !isAudioHotSwappingRef.current) {
+                if (isSplitAudioMode && !vid.paused && !isAudioHotSwappingRef.current) {
                   syncSplitPlayback();
                 }
-                const dur = effectiveDurationSec || e.currentTarget.duration || 0;
-                intendedPositionSecRef.current = actualPos;
-                currentTimeRef.current = actualPos;
+                const dur = effectiveDurationSec || vid.duration || 0;
                 if (scrubPreviewSec === null && pendingSeekTargetRef.current === null) {
+                  intendedPositionSecRef.current = actualPos;
+                  currentTimeRef.current = actualPos;
                   setCurrentTimeSec(actualPos);
                 }
                 onProgressRef.current({
@@ -3330,12 +3705,11 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
           </>
         )}
 
-        {/* Centered Orbital Buffering Loader & 30-Second Auto-Failover Indicator */}
+        {/* Centered Orbital Buffering Loader & 10-Second Auto-Failover Indicator */}
         {(loadingStreams ||
           (activeStream?.kind === 'direct' && (isBuffering || !hasStartedPlayback))) && (
           <div
             className={`player-buffer-overlay ${hasStartedPlayback || hasFreezeFrame ? 'over-frozen-frame' : ''}`}
-            onClick={(e) => e.stopPropagation()}
           >
             <div className="buffer-orbital-spinner">
               <div className="orbital-ring outer" />
@@ -3363,7 +3737,10 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                   <button
                     type="button"
                     className="buffer-skip-btn"
-                    onClick={() => switchToNextStream('Switched server')}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      switchToNextStream('Switched server');
+                    }}
                   >
                     <span>Try Next Server</span>
                     <FastForward size={13} />
@@ -3721,6 +4098,9 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                             clearPendingTransitionTimers();
                             intendedPositionSecRef.current = resumeAtSec;
                             pendingDeferredSeekRef.current = resumeAtSec > 0 ? resumeAtSec : null;
+                            pendingDeferredSeekSetAtMsRef.current = resumeAtSec > 0 ? Date.now() : 0;
+                            mediaFragmentRetriedRef.current = false;
+                            deferredSeekAssignedRef.current = false;
                             isSourceTransitioningRef.current = true;
                             isRecoveringFromStallRef.current = false;
                             isAudioHotSwappingRef.current = false;
@@ -3729,6 +4109,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                             currentTimeRef.current = resumeAtSec;
                             setStreamStartOffsetSec(resumeAtSec);
                             setCurrentTimeSec(resumeAtSec);
+                            resetFailoverCountdown();
                             if (activeStream?.id === stream.id) {
                               directVideoLoadedUrlRef.current = null;
                               setStreamRefreshNonce((n) => n + 1);
@@ -4132,6 +4513,9 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                             clearPendingTransitionTimers();
                             intendedPositionSecRef.current = 0;
                             pendingDeferredSeekRef.current = null;
+                            pendingDeferredSeekSetAtMsRef.current = 0;
+                            mediaFragmentRetriedRef.current = false;
+                            deferredSeekAssignedRef.current = false;
                             isSourceTransitioningRef.current = true;
                             isRecoveringFromStallRef.current = false;
                             isAudioHotSwappingRef.current = false;

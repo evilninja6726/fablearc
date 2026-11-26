@@ -1088,32 +1088,41 @@ export const App: React.FC = () => {
     [currentUser],
   );
 
+  const addonsLatestRef = useRef<InstalledAddon[]>(addons);
+  addonsLatestRef.current = addons;
+
   // Automatically bootstrap default addons (or heal any missing default addons from an interrupted startup)
   // while preserving all existing user-configured addons and their enabled state.
   useEffect(() => {
-    const missingDefaultUrls = DEFAULT_BOOTSTRAP_MANIFEST_URLS.filter((defaultUrl) => {
+    const normalizeManifestKey = (rawUrl: string): { host: string; path: string } | null => {
       try {
-        const parsedDefault = new URL(defaultUrl);
-        const defaultHost = parsedDefault.hostname.toLowerCase();
-        const defaultPath = parsedDefault.pathname.replace(/\/+$/, '').toLowerCase();
-        const isMultiProfileHost =
-          defaultHost.includes('cncverse.dpdns.org') || defaultPath.includes('/u/p_');
-        return !addons.some((existing) => {
-          try {
-            const parsedExisting = new URL(existing.manifestUrl);
-            const existingHost = parsedExisting.hostname.toLowerCase();
-            if (isMultiProfileHost) {
-              const existingPath = parsedExisting.pathname.replace(/\/+$/, '').toLowerCase();
-              return existingHost === defaultHost && existingPath === defaultPath;
-            }
-            return existingHost === defaultHost;
-          } catch {
-            return false;
-          }
-        });
+        const parsed = new URL(rawUrl);
+        return {
+          host: parsed.hostname.toLowerCase(),
+          path: parsed.pathname.replace(/\/+$/, '').toLowerCase(),
+        };
       } catch {
-        return false;
+        return null;
       }
+    };
+
+    const missingDefaultUrls = DEFAULT_BOOTSTRAP_MANIFEST_URLS.filter((defaultUrl) => {
+      const parsedDefault = normalizeManifestKey(defaultUrl);
+      if (!parsedDefault) return false;
+      const defaultHost = parsedDefault.host;
+      const defaultPath = parsedDefault.path;
+      const isMultiProfileHost =
+        defaultHost.includes('cncverse.dpdns.org') ||
+        defaultHost.includes('plavio.site') ||
+        defaultPath.includes('/u/');
+      return !addons.some((existing) => {
+        const parsedExisting = normalizeManifestKey(existing.manifestUrl);
+        if (!parsedExisting) return false;
+        if (isMultiProfileHost) {
+          return parsedExisting.host === defaultHost && parsedExisting.path === defaultPath;
+        }
+        return parsedExisting.host === defaultHost;
+      });
     });
 
     if (missingDefaultUrls.length === 0) return;
@@ -1137,18 +1146,38 @@ export const App: React.FC = () => {
       );
 
       if (!cancelled && fetchedAddons.length > 0) {
-        setAddons((prev) => {
-          const merged = [...prev];
-          for (const next of fetchedAddons) {
-            if (!merged.some((existing) => existing.manifest.id === next.manifest.id)) {
-              merged.push(next);
+        const currentList = addonsLatestRef.current;
+        const merged = [...currentList];
+        let didAddAny = false;
+        for (const next of fetchedAddons) {
+          const nextKey = normalizeManifestKey(next.manifestUrl);
+          const isMultiProfile = Boolean(
+            nextKey &&
+              (nextKey.host.includes('cncverse.dpdns.org') ||
+                nextKey.host.includes('plavio.site') ||
+                nextKey.path.includes('/u/')),
+          );
+          const alreadyPresent = merged.some((existing) => {
+            const existingKey = normalizeManifestKey(existing.manifestUrl);
+            if (isMultiProfile && nextKey && existingKey) {
+              return existingKey.host === nextKey.host && existingKey.path === nextKey.path;
             }
+            return (
+              existing.manifest.id === next.manifest.id ||
+              existing.manifestUrl === next.manifestUrl
+            );
+          });
+          if (!alreadyPresent) {
+            merged.push(next);
+            didAddAny = true;
           }
+        }
+        if (didAddAny) {
+          setAddons(merged);
           if (authToken && currentUser && merged.length > 0) {
             persistProvidersToDb(merged);
           }
-          return merged;
-        });
+        }
       }
       if (!cancelled) {
         setBootstrappingAddons(false);

@@ -405,11 +405,11 @@ export function sortStreamsByDecreasingQuality(
     const scoreB = b.qualityScore ?? 0;
     if (scoreB !== scoreA) return scoreB - scoreA;
 
-    // 2. Group by Provider within each Quality Tier (Option B: PenguPlay -> HdHub -> CNCVerse -> 111477 -> WebStreamr -> Other)
+    // 2. Group by Provider within each Quality Tier (Option B: PenguPlay -> HdHub -> CNCVerse -> PlavioHD -> 111477 -> WebStreamr -> Other)
     const provRankA = getStreamProviderGroupRank(a);
     const provRankB = getStreamProviderGroupRank(b);
     if (provRankA !== provRankB) return provRankA - provRankB;
-    if (provRankA >= 7) {
+    if (provRankA >= 8) {
       const catCmp = getStreamProviderCategory(a).localeCompare(
         getStreamProviderCategory(b),
       );
@@ -1056,7 +1056,7 @@ export function buildApiUrl(path: string): string {
   return `${getCloudBackendOrigin()}${path}`;
 }
 
-function isDirectCorsFastPathUrl(url: string): boolean {
+export function isDirectCorsFastPathUrl(url: string): boolean {
   try {
     const parsed = new URL(url);
     const host = parsed.hostname.toLowerCase();
@@ -1075,6 +1075,8 @@ function isDirectCorsFastPathUrl(url: string): boolean {
       host === 'v3-cinemeta.strem.io' ||
       host === 'cncverse.dpdns.org' ||
       host.endsWith('.dpdns.org') ||
+      host === 'hd.plavio.site' ||
+      host.endsWith('.plavio.site') ||
       host === 'torrentio.strem.fun' ||
       host.endsWith('.strem.fun') ||
       host === 'hdhub.thevolecitor.qzz.io' ||
@@ -1290,6 +1292,14 @@ export async function fetchStremioManifest(rawInput: string): Promise<{
 
   const normalizedProfileId = String(data.id ?? '').toLowerCase();
   const normalizedActiveUrl = activeManifestUrl.toLowerCase();
+  let resolvedManifestId = String(data.id);
+  const multiUserTokenMatch = activeManifestUrl.match(/\/u\/([A-Za-z0-9_-]{6,})/i);
+  if (multiUserTokenMatch) {
+    const tokenTag = multiUserTokenMatch[1]!.slice(0, 8).toLowerCase();
+    if (!resolvedManifestId.toLowerCase().includes(tokenTag)) {
+      resolvedManifestId = `${resolvedManifestId}.${tokenTag}`;
+    }
+  }
   let resolvedManifestName = data.name;
   if (
     normalizedProfileId.includes('pwoi7q4u220fz') ||
@@ -1306,12 +1316,17 @@ export async function fetchStremioManifest(rawInput: string): Promise<{
     normalizedActiveUrl.includes('p_khcby2w1jpgc')
   ) {
     resolvedManifestName = 'CNCVerse · Anime & Cartoons';
+  } else if (
+    normalizedActiveUrl.includes('plavio.site') &&
+    !String(resolvedManifestName || '').toLowerCase().includes('plavio')
+  ) {
+    resolvedManifestName = 'PlavioHD';
   }
 
   return {
     manifestUrl: activeManifestUrl,
     manifest: {
-      id: data.id,
+      id: resolvedManifestId,
       version: typeof data.version === 'string' ? data.version : '1.0.0',
       name: resolvedManifestName,
       description:
@@ -1493,6 +1508,9 @@ export function getStreamProviderCategory(
   if (idLower.includes('hdhub') || nameLower.includes('hdhub')) {
     return 'HdHub';
   }
+  if (idLower.includes('plavio') || nameLower.includes('plavio')) {
+    return 'PlavioHD';
+  }
   if (idLower.includes('111477') || nameLower.includes('111477')) {
     return '111477';
   }
@@ -1513,7 +1531,7 @@ export function getStreamProviderCategory(
 
 /**
  * Deterministic provider grouping order inside each quality tier ("All" list, Option B):
- * PenguPlay -> HdHub -> CNCVerse (Hindi -> English -> Anime) -> 111477 -> WebStreamr -> Other
+ * PenguPlay -> HdHub -> CNCVerse (Hindi -> English -> Anime) -> PlavioHD -> 111477 -> WebStreamr -> Other
  */
 export function getStreamProviderGroupRank(
   stream: Pick<StremioStreamItem, 'addonId' | 'addonName'>,
@@ -1530,12 +1548,14 @@ export function getStreamProviderGroupRank(
       return 3;
     case 'CNCVerse · Anime & Cartoons':
       return 4;
-    case '111477':
+    case 'PlavioHD':
       return 5;
-    case 'WebStreamr':
+    case '111477':
       return 6;
-    default:
+    case 'WebStreamr':
       return 7;
+    default:
+      return 8;
   }
 }
 
@@ -1697,14 +1717,18 @@ export async function fetchStreamsFromAddons(
             if (candidateStreamUrl.toLowerCase().startsWith('magnet:')) {
               return;
             }
-            // Unwrap proxy wrapper query params (e.g. `http://140.238.244.130/proxy/bound?d=https%3A%2F%2Fpixeldrain.dev...`)
-            // so the browser connects directly to the underlying HTTPS CDN!
+            // Unwrap pure proxy wrapper query params (e.g. `http://140.238.244.130/proxy/bound?d=https%3A%2F%2Fpixeldrain.dev...`)
+            // while keeping dynamic `/extract/?index=...&url=...` resolver endpoints intact so their 302 Location is resolved accurately!
             try {
               const parsedCandidate = new URL(candidateStreamUrl);
-              const embeddedTarget =
-                parsedCandidate.searchParams.get('d') ||
-                parsedCandidate.searchParams.get('link') ||
-                parsedCandidate.searchParams.get('url');
+              const canUnwrapEmbeddedUrl = !parsedCandidate.pathname
+                .toLowerCase()
+                .includes('/extract/');
+              const embeddedTarget = canUnwrapEmbeddedUrl
+                ? parsedCandidate.searchParams.get('d') ||
+                  parsedCandidate.searchParams.get('link') ||
+                  parsedCandidate.searchParams.get('url')
+                : null;
               if (embeddedTarget && /^https?:\/\//i.test(embeddedTarget.trim())) {
                 candidateStreamUrl = embeddedTarget.trim();
               }
@@ -1722,6 +1746,7 @@ export async function fetchStreamsFromAddons(
                   (addonParsed.protocol === 'https:' &&
                     streamHost === addonParsed.hostname.toLowerCase()) ||
                   streamHost === 'hdhub.thevolecitor.qzz.io' ||
+                  streamHost.endsWith('.plavio.site') ||
                   streamHost.endsWith('.workers.dev') ||
                   streamHost.endsWith('.baby-beamup.club')
                 ) {
@@ -2664,6 +2689,9 @@ export async function fetchCommunityAddonsDirectory(): Promise<CommunityAddonDir
 export const DEFAULT_PENGUPLAY_MANIFEST_URL =
   'https://pengu.uk/%7B%22auth_token%22%3A%22jBIrOxA27mMz_WvoR_ZCAMR72uZegRCgWJzw9P0IIUQ%22%7D/manifest.json';
 
+export const DEFAULT_PLAVIO_MANIFEST_URL =
+  'https://hd.plavio.site/u/57rBC7jiSl9i_RIiqJ7kBg/manifest.json';
+
 /**
  * Automatically upgrades any legacy unauthenticated PenguPlay URL (`https://pengu.uk/manifest.json`)
  * stored in localStorage or SQLite DB to the authenticated PenguPlay URL.
@@ -2678,7 +2706,7 @@ export function upgradeLegacyDefaultAddonUrl(manifestUrl: string): string {
 
 /**
  * Default live Stremio addon manifest URLs installed automatically on startup.
- * Includes all user-requested default addons + Cinemeta & OpenSubtitles v3 for complete catalog, stream, meta, and subtitle coverage.
+ * Includes all user-requested default addons + PlavioHD + Cinemeta & OpenSubtitles v3 for complete catalog, stream, meta, and subtitle coverage.
  */
 export const DEFAULT_BOOTSTRAP_MANIFEST_URLS: string[] = [
   // Streaming Catalogs addon commented out (code preserved):
@@ -2686,6 +2714,7 @@ export const DEFAULT_BOOTSTRAP_MANIFEST_URLS: string[] = [
   'https://cncverse.dpdns.org/u/p_woi7q4u220fz/manifest.json',
   'https://cncverse.dpdns.org/u/p_2tztbugmd1ys/manifest.json',
   'https://cncverse.dpdns.org/u/p_khcby2w1jpgc/manifest.json',
+  DEFAULT_PLAVIO_MANIFEST_URL,
   'https://aiometadata.elfhosted.com/stremio/manifest.json',
   'https://87d6a6ef6b58-webstreamrmbg.baby-beamup.club/manifest.json',
   DEFAULT_PENGUPLAY_MANIFEST_URL,

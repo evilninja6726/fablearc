@@ -479,7 +479,9 @@ export async function unwrapMediaStreamUrlWithStatus(
       throw new Error('Blocked unsafe redirect target');
     }
 
-    // Check if current URL itself has a ?d=https://..., ?link=https://..., or ?url=https://... query parameter
+    // Check if current URL itself has a ?d=https://..., ?link=https://..., or ?url=https://... query parameter.
+    // Always enforce SSRF checks on embedded URLs, and only shortcut-unwrap non-`/extract/` wrapper paths
+    // so multi-index `/extract/?index=...&url=...` endpoints resolve via their true HTTP 302 Location!
     try {
       const parsedCurrent = new URL(current);
       const embeddedLink =
@@ -490,9 +492,11 @@ export async function unwrapMediaStreamUrlWithStatus(
         if (!isSafePublicUrl(embeddedLink, false)) {
           throw new Error('Blocked unsafe embedded redirect target');
         }
-        current = embeddedLink;
-        reachedReachableTarget = true;
-        continue;
+        if (!parsedCurrent.pathname.toLowerCase().includes('/extract/')) {
+          current = embeddedLink;
+          reachedReachableTarget = true;
+          continue;
+        }
       }
     } catch (err) {
       if (err instanceof Error && err.message.startsWith('Blocked unsafe')) {
@@ -532,9 +536,11 @@ export async function unwrapMediaStreamUrlWithStatus(
           if (!isSafePublicUrl(embedded, false)) {
             throw new Error('Blocked unsafe redirect target');
           }
-          current = embedded;
-          reachedReachableTarget = true;
-          break;
+          if (!parsedNext.pathname.toLowerCase().includes('/extract/')) {
+            current = embedded;
+            reachedReachableTarget = true;
+            break;
+          }
         }
         current = nextUrl;
         reachedReachableTarget = true;
@@ -704,8 +710,11 @@ function forwardLoopbackMediaRequest(
         try {
           let nextUrl = new URL(upRes.headers.location, targetUrl).toString();
           const parsedNext = new URL(nextUrl);
-          const embedded =
-            parsedNext.searchParams.get('link') || parsedNext.searchParams.get('url');
+          const embedded = !parsedNext.pathname.toLowerCase().includes('/extract/')
+            ? parsedNext.searchParams.get('d') ||
+              parsedNext.searchParams.get('link') ||
+              parsedNext.searchParams.get('url')
+            : null;
           if (embedded && /^https?:\/\//i.test(embedded)) {
             nextUrl = embedded;
           }

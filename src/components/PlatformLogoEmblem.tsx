@@ -495,6 +495,16 @@ export const AddonSvgEmblem: React.FC<AddonSvgEmblemProps> = ({
       );
     }
 
+    if (combined.includes('plavio')) {
+      // PlavioHD Play-Prism Emblem
+      return (
+        <>
+          <rect x="8.5" y="10.5" width="23" height="19" rx="5" fill="rgba(16,185,129,0.2)" stroke="#34D399" strokeWidth="1.6" />
+          <path d="M17.2 15.2l7.6 4.8-7.6 4.8v-9.6z" fill="#A7F3D0" />
+        </>
+      );
+    }
+
     if (combined.includes('111477')) {
       // Vault Numeric Monogram Badge
       return (

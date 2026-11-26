@@ -19,8 +19,11 @@ import {
   canBrowserPlayAudioCodecNatively,
   DEFAULT_BOOTSTRAP_MANIFEST_URLS,
   DEFAULT_PENGUPLAY_MANIFEST_URL,
+  DEFAULT_PLAVIO_MANIFEST_URL,
   extractStreamQualityInfo,
   getStreamProviderCategory,
+  getStreamProviderGroupRank,
+  isDirectCorsFastPathUrl,
   isOfflineStream,
   markStreamOfflineInCache,
   normalizeStremioMeta,
@@ -39,6 +42,10 @@ import {
   rankSimilarMediaItems,
   scoreCandidatesForSuggestionPrompt,
 } from '../src/intelligence/recommendationEngine';
+import {
+  canVideoSeekImmediatelyTo,
+  STREAM_FAILOVER_TIMEOUT_SEC,
+} from '../src/components/CinemaPlayerModal';
 
 describe('streamZ Security Boundaries', () => {
   it('blocks loopback, cloud metadata, and private LAN SSRF targets', () => {
@@ -119,6 +126,28 @@ describe('Default Addons & Decreasing Stream Quality Sorting', () => {
       'https://87d6a6ef6b58-webstreamrmbg.baby-beamup.club/manifest.json',
     );
     expect(DEFAULT_BOOTSTRAP_MANIFEST_URLS).toContain(DEFAULT_PENGUPLAY_MANIFEST_URL);
+    expect(DEFAULT_BOOTSTRAP_MANIFEST_URLS).toContain(DEFAULT_PLAVIO_MANIFEST_URL);
+    expect(DEFAULT_PLAVIO_MANIFEST_URL).toBe(
+      'https://hd.plavio.site/u/57rBC7jiSl9i_RIiqJ7kBg/manifest.json',
+    );
+    expect(isDirectCorsFastPathUrl(DEFAULT_PLAVIO_MANIFEST_URL)).toBe(true);
+    expect(
+      getStreamProviderCategory({
+        addonId: 'community.plaviohd',
+        addonName: 'PlavioHD',
+      }),
+    ).toBe('PlavioHD');
+    expect(
+      getStreamProviderGroupRank({
+        addonId: 'community.plaviohd',
+        addonName: 'PlavioHD',
+      }),
+    ).toBeLessThan(
+      getStreamProviderGroupRank({
+        addonId: 'org.111477.stremio',
+        addonName: '111477',
+      }),
+    );
     expect(upgradeLegacyDefaultAddonUrl('https://pengu.uk/manifest.json')).toBe(
       DEFAULT_PENGUPLAY_MANIFEST_URL,
     );
@@ -954,5 +983,59 @@ describe('Commercial SQLite WAL Database (Per-User Auth, Watch History & Dedupli
     expect(bloodPrompt.matchedClusters.some((c) => c.id === 'blood-vampire-gore')).toBe(true);
     const bloodScored = scoreCandidatesForSuggestionPrompt(bloodPrompt, candidates);
     expect(bloodScored[0]?.item.id).toBe('tt-blood-vampire-2025');
+  });
+
+  it('guards forward seeking during buffering via canVideoSeekImmediatelyTo and enforces 10s failover timeout', () => {
+    expect(STREAM_FAILOVER_TIMEOUT_SEC).toBe(10);
+
+    // 1. Metadata not yet loaded (readyState === 0) -> cannot assign currentTime immediately
+    expect(
+      canVideoSeekImmediatelyTo({ readyState: 0, seekable: { length: 0, start: () => 0, end: () => 0 } }, 1800),
+    ).toBe(false);
+
+    // 2. MKV header loaded (readyState === 1, duration known) while Cues index is still [0, 0] -> MUST return false so browser never clamps to 00:00!
+    expect(
+      canVideoSeekImmediatelyTo(
+        {
+          readyState: 1,
+          seekable: {
+            length: 1,
+            start: () => 0,
+            end: () => 0,
+          },
+        },
+        1800,
+      ),
+    ).toBe(false);
+
+    // 3. Empty seekable TimeRanges at readyState === 1 -> MUST return false
+    expect(
+      canVideoSeekImmediatelyTo(
+        {
+          readyState: 1,
+          seekable: {
+            length: 0,
+            start: () => 0,
+            end: () => 0,
+          },
+        },
+        600,
+      ),
+    ).toBe(false);
+
+    // 4. Seekable range covers target timestamp -> safe to assign video.currentTime immediately
+    expect(
+      canVideoSeekImmediatelyTo(
+        {
+          readyState: 1,
+          seekable: {
+            length: 1,
+            start: () => 0,
+            end: () => 10462,
+          },
+        },
+        1800,
+      ),
+    ).toBe(true);
   });
 });

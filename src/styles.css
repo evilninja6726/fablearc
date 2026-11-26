@@ -2253,6 +2253,11 @@ select {
   max-width: calc(100vw - 28px);
   box-sizing: border-box;
   overflow: hidden;
+  pointer-events: none;
+}
+
+.player-buffer-overlay button {
+  pointer-events: auto;
 }
 
 /* When seeking over a frozen frame, keep the loader compact and translucent so the video frame stays clearly visible */

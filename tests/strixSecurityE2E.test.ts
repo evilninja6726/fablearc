@@ -927,7 +927,9 @@ describe('Strix-Style E2E & Security Audit Suite', () => {
 
     // 2. Verify syncSplitPlayback NEVER calls video.pause() while video.seeking is true (which deadlocks HTML5 Range preloading)
     expect(cinemaPlayerTsx).toContain('if (!audioReady && !video.paused && !video.seeking)');
-    expect(cinemaPlayerTsx).toContain('const videoReady = video.readyState >= 2 && !video.seeking;');
+    expect(cinemaPlayerTsx).toContain(
+      'video.readyState >= 2 && !video.seeking && !waitingOnDeferredVideoSeek;',
+    );
 
     // 3. Verify rapid +10s/-10s taps/arrow keys coalesce via pendingSeekTargetRef & zoneSeekCommitTimerRef
     expect(cinemaPlayerTsx).toContain('pendingSeekTargetRef');
@@ -1200,5 +1202,12 @@ describe('Strix-Style E2E & Security Audit Suite', () => {
     expect(appTsx).toContain('activeSuggestionConstraintPills');
     // Verify Suggestions poster cards remain strictly minimal (no 👍 / ✕ clutter buttons on cards)
     expect(appTsx).not.toContain('Not Interested');
+
+    // 5. Verify Buffering-Seek Protection (canVideoSeekImmediatelyTo + Media Fragment fallback), 10s Auto-Failover, and PlavioHD multi-profile integration
+    expect(cinemaPlayerTsx).toContain('export const STREAM_FAILOVER_TIMEOUT_SEC = 10;');
+    expect(cinemaPlayerTsx).not.toContain('setFailoverCountdownSec(30)');
+    expect(cinemaPlayerTsx).toContain('tryApplyPendingDeferredSeek');
+    expect(cinemaPlayerTsx).toContain('canVideoSeekImmediatelyTo');
+    expect(appTsx).toContain("defaultHost.includes('plavio.site')");
   });
 });
