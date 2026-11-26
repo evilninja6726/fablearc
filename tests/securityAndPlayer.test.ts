@@ -985,8 +985,8 @@ describe('Commercial SQLite WAL Database (Per-User Auth, Watch History & Dedupli
     expect(bloodScored[0]?.item.id).toBe('tt-blood-vampire-2025');
   });
 
-  it('guards forward seeking during buffering via canVideoSeekImmediatelyTo and enforces 10s failover timeout', () => {
-    expect(STREAM_FAILOVER_TIMEOUT_SEC).toBe(10);
+  it('guards forward seeking during buffering via canVideoSeekImmediatelyTo and enforces 30s failover timeout', () => {
+    expect(STREAM_FAILOVER_TIMEOUT_SEC).toBe(30);
 
     // 1. Metadata not yet loaded (readyState === 0) -> cannot assign currentTime immediately
     expect(

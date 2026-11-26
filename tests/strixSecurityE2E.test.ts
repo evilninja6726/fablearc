@@ -1203,9 +1203,9 @@ describe('Strix-Style E2E & Security Audit Suite', () => {
     // Verify Suggestions poster cards remain strictly minimal (no 👍 / ✕ clutter buttons on cards)
     expect(appTsx).not.toContain('Not Interested');
 
-    // 5. Verify Buffering-Seek Protection (canVideoSeekImmediatelyTo + Media Fragment fallback), 10s Auto-Failover, and PlavioHD multi-profile integration
-    expect(cinemaPlayerTsx).toContain('export const STREAM_FAILOVER_TIMEOUT_SEC = 10;');
-    expect(cinemaPlayerTsx).not.toContain('setFailoverCountdownSec(30)');
+    // 5. Verify Buffering-Seek Protection (canVideoSeekImmediatelyTo), 30s Auto-Failover, and PlavioHD multi-profile integration
+    expect(cinemaPlayerTsx).toContain('export const STREAM_FAILOVER_TIMEOUT_SEC = 30;');
+    expect(cinemaPlayerTsx).toContain('resetFailoverCountdown()');
     expect(cinemaPlayerTsx).toContain('tryApplyPendingDeferredSeek');
     expect(cinemaPlayerTsx).toContain('canVideoSeekImmediatelyTo');
     expect(appTsx).toContain("defaultHost.includes('plavio.site')");

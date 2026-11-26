@@ -122,6 +122,7 @@ export interface StremioStreamItem {
   responsivenessScore?: number;
   serverStatusBadge?: string;
   unreachable?: boolean;
+  supportsByteRange?: boolean;
   resolvedDirectUrl?: string;
 }
 
@@ -336,8 +337,19 @@ export function sortStreamsByDecreasingQuality(
 
   const getBrowserStreamCompatibilityScore = (s: StremioStreamItem): number => {
     const urlLower = (s.url || '').toLowerCase();
+    const resolvedLower = (s.resolvedDirectUrl || '').toLowerCase();
     const metaLower = `${s.name} ${s.title} ${urlLower}`.toLowerCase();
     let score = 0;
+
+    // 0. Demote non-Range HTTP 200 mirrors (`supportsByteRange === false` or `video-downloads.googleusercontent.com`)
+    // below true 206 Partial Content servers so forward/backward seeking works reliably!
+    if (
+      s.supportsByteRange === false ||
+      urlLower.includes('video-downloads.googleusercontent.com') ||
+      resolvedLower.includes('video-downloads.googleusercontent.com')
+    ) {
+      score -= 220;
+    }
 
     // 1. Strongly prefer verified direct HTTP Range CDNs with CORS by actual URL host (PixelDrain, 111477, BunnyCDN, FSLDownload)
     if (urlLower.includes('pixeldrain.dev') || urlLower.includes('pixeldrain.com')) {
@@ -416,10 +428,24 @@ export function sortStreamsByDecreasingQuality(
       if (catCmp !== 0) return catCmp;
     }
 
-    // 3. Within each Provider + Quality group, keep reachable/untested streams above Offline streams
+    // 3. Within each Provider + Quality group, keep reachable & byte-range seekable streams above non-Range/Offline streams
     const unreachA = a.unreachable ? 1 : 0;
     const unreachB = b.unreachable ? 1 : 0;
     if (unreachA !== unreachB) return unreachA - unreachB;
+
+    const noRangeA =
+      a.supportsByteRange === false ||
+      (a.url || '').toLowerCase().includes('video-downloads.googleusercontent.com') ||
+      (a.resolvedDirectUrl || '').toLowerCase().includes('video-downloads.googleusercontent.com')
+        ? 1
+        : 0;
+    const noRangeB =
+      b.supportsByteRange === false ||
+      (b.url || '').toLowerCase().includes('video-downloads.googleusercontent.com') ||
+      (b.resolvedDirectUrl || '').toLowerCase().includes('video-downloads.googleusercontent.com')
+        ? 1
+        : 0;
+    if (noRangeA !== noRangeB) return noRangeA - noRangeB;
 
     // 4. Priority to Multi-Audio (2) -> Dual-Audio (1) -> Single-Audio (0) within each Provider + Quality group
     const audioA = a.audioScore ?? (a.isMultiAudio ? 1 : 0);
@@ -1975,6 +2001,7 @@ export interface MediaProbeResponse {
   videoCodec: string;
   audioTracks: ProbedAudioTrack[];
   unreachable?: boolean;
+  supportsByteRange?: boolean;
 }
 
 const clientProbeCache = new Map<
@@ -2156,6 +2183,7 @@ export interface ServerHealthMetric {
   ok: boolean;
   unreachable: boolean;
   isHttps: boolean;
+  supportsByteRange?: boolean;
   resolvedUrl?: string;
   ttfbMs: number;
   speedMbps: number;
@@ -2228,6 +2256,7 @@ export function applyCachedServerHealth(
         responsivenessScore: m.responsivenessScore || s.responsivenessScore,
         serverStatusBadge: m.statusBadge || s.serverStatusBadge,
         unreachable: isSlowTimeout ? false : Boolean(m.unreachable),
+        supportsByteRange: m.supportsByteRange ?? s.supportsByteRange,
         resolvedDirectUrl: m.resolvedUrl || s.resolvedDirectUrl || s.url,
       };
     })
@@ -2427,6 +2456,7 @@ export async function rankStreamsByResponsiveness(
           responsivenessScore: m.responsivenessScore,
           serverStatusBadge: m.statusBadge,
           unreachable: isSlowTimeout ? false : Boolean(m.unreachable),
+          supportsByteRange: m.supportsByteRange ?? s.supportsByteRange,
           resolvedDirectUrl: m.resolvedUrl || s.url,
         };
       })

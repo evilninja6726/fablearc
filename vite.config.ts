@@ -444,18 +444,19 @@ const LANGUAGE_NAMES: Record<string, string> = {
 
 const resolvedUrlCache = new Map<
   string,
-  { url: string; unreachable: boolean; expiresAt: number }
+  { url: string; unreachable: boolean; supportsByteRange: boolean; expiresAt: number }
 >();
 
 export interface UnwrappedStreamTarget {
   url: string;
   unreachable: boolean;
+  supportsByteRange: boolean;
 }
 
 /**
  * Follows redirects up to 5 hops and unwraps intermediate link-generator pages
  * (such as HubCloud `cryptonewz.online/dl.php?link=https://video-downloads.googleusercontent.com/...`)
- * into the underlying direct media stream URL.
+ * into the underlying direct media stream URL, while verifying `206 Partial Content` byte-range seekability.
  * Validates every hop against `isSafePublicUrl` to block 302 redirect SSRF attacks.
  */
 export async function unwrapMediaStreamUrlWithStatus(
@@ -468,12 +469,17 @@ export async function unwrapMediaStreamUrlWithStatus(
 
   const cached = resolvedUrlCache.get(initialUrl);
   if (cached && cached.expiresAt > Date.now()) {
-    return { url: cached.url, unreachable: cached.unreachable };
+    return {
+      url: cached.url,
+      unreachable: cached.unreachable,
+      supportsByteRange: cached.supportsByteRange,
+    };
   }
 
   let current = initialUrl;
   let reachedReachableTarget = false;
   let unreachable = false;
+  let supportsByteRange = true;
   for (let hop = 0; hop < 5; hop++) {
     if (!isSafePublicUrl(current, false)) {
       throw new Error('Blocked unsafe redirect target');
@@ -507,12 +513,20 @@ export async function unwrapMediaStreamUrlWithStatus(
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), hopTimeoutMs);
+      const isPixelDrainHost = current.toLowerCase().includes('pixeldrain.');
       const resp = await fetch(current, {
         method: 'GET',
         headers: {
           'User-Agent':
             'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
           Range: 'bytes=0-1',
+          ...(isPixelDrainHost
+            ? {
+                'Sec-Fetch-Dest': 'video',
+                'Sec-Fetch-Mode': 'no-cors',
+                'Sec-Fetch-Site': 'cross-site',
+              }
+            : {}),
         },
         redirect: 'manual',
         signal: controller.signal,
@@ -539,7 +553,7 @@ export async function unwrapMediaStreamUrlWithStatus(
           if (!parsedNext.pathname.toLowerCase().includes('/extract/')) {
             current = embedded;
             reachedReachableTarget = true;
-            break;
+            continue;
           }
         }
         current = nextUrl;
@@ -553,12 +567,17 @@ export async function unwrapMediaStreamUrlWithStatus(
         continue;
       }
       const respCt = (resp.headers.get('content-type') || '').toLowerCase();
+      const contentRange = resp.headers.get('content-range') || '';
+      const isM3u8Target =
+        respCt.includes('mpegurl') || /\.m3u8(\?|$)|\/hls\/|\/playlist\//i.test(current);
       if (resp.status >= 200 && resp.status < 300) {
         if (respCt.includes('text/html')) {
           unreachable = true;
         } else {
           reachedReachableTarget = true;
           unreachable = false;
+          supportsByteRange =
+            isM3u8Target || resp.status === 206 || Boolean(contentRange);
         }
       } else if (
         resp.status >= 400 &&
@@ -589,10 +608,11 @@ export async function unwrapMediaStreamUrlWithStatus(
     resolvedUrlCache.set(initialUrl, {
       url: current,
       unreachable,
+      supportsByteRange,
       expiresAt: Date.now() + 5 * 60 * 1000,
     });
   }
-  return { url: current, unreachable };
+  return { url: current, unreachable, supportsByteRange };
 }
 
 export async function unwrapMediaStreamUrl(initialUrl: string): Promise<string> {
@@ -996,6 +1016,7 @@ export interface MediaProbeResult {
   videoCodec: string;
   audioTracks: ProbedAudioTrack[];
   unreachable?: boolean;
+  supportsByteRange?: boolean;
 }
 
 function parseFfmpegProbeOutput(stderr: string, resolvedUrl: string): MediaProbeResult {
@@ -1714,7 +1735,7 @@ export function registerStreamzApiMiddlewares(
         data = cachedProbe;
         cacheStatus = 'HIT-L1';
       } else {
-        const unwrapped = await unwrapMediaStreamUrlWithStatus(rawStreamUrl, 3200);
+        const unwrapped = await unwrapMediaStreamUrlWithStatus(rawStreamUrl, 4800);
         const resolvedUrl = unwrapped.url;
         if (unwrapped.unreachable) {
           data = {
@@ -1723,6 +1744,7 @@ export function registerStreamzApiMiddlewares(
             videoCodec: 'none',
             audioTracks: [],
             unreachable: true,
+            supportsByteRange: unwrapped.supportsByteRange,
           };
           cacheStatus = 'MISS-UNREACHABLE';
           globalCache.setSync(probeCacheKey, data, 300);
@@ -1754,6 +1776,7 @@ export function registerStreamzApiMiddlewares(
               resolvedEarly = true;
               clearTimeout(killTimer);
               const parsed = parseFfmpegProbeOutput(stderr, resolvedUrl);
+              parsed.supportsByteRange = unwrapped.supportsByteRange;
               if (
                 parsed.durationSec === 0 &&
                 parsed.audioTracks.length === 0 &&
@@ -1855,6 +1878,7 @@ export function registerStreamzApiMiddlewares(
             ok: boolean;
             unreachable: boolean;
             isHttps: boolean;
+            supportsByteRange?: boolean;
             resolvedUrl: string;
             ttfbMs: number;
             speedMbps: number;
@@ -1870,7 +1894,7 @@ export function registerStreamzApiMiddlewares(
             const unwrapStart = Date.now();
             const unwrapped = await unwrapMediaStreamUrlWithStatus(
               rawUrl,
-              isPingOnly ? 2600 : 2800,
+              isPingOnly ? 3600 : 4800,
             );
             const unwrapMs = Math.max(8, Date.now() - unwrapStart);
             const resolvedUrl = unwrapped.url;
@@ -1882,6 +1906,7 @@ export function registerStreamzApiMiddlewares(
                 ok: false,
                 unreachable: true,
                 isHttps,
+                supportsByteRange: false,
                 resolvedUrl,
                 ttfbMs: 9999,
                 speedMbps: 0,
@@ -1897,15 +1922,22 @@ export function registerStreamzApiMiddlewares(
             // For non-HLS direct files in pingOnly mode, reuse the unwrap result immediately without a 2nd TCP/TLS round-trip.
             const isLikelyHls = /\.m3u8(\?|$)|\/hls\/|\/playlist\//i.test(resolvedUrl);
             if (isPingOnly && !isLikelyHls) {
+              const rangeOk = unwrapped.supportsByteRange !== false;
               const latencyScore = Math.round(900 - Math.min(850, unwrapMs * 0.22));
               const httpsBonus = isHttps ? 200 : -350;
-              const responsivenessScore = Math.round(latencyScore + httpsBonus);
-              const statusBadge = !isHttps ? 'HTTP Only' : `${unwrapMs}ms`;
+              const rangePenalty = rangeOk ? 0 : -1100;
+              const responsivenessScore = Math.round(latencyScore + httpsBonus + rangePenalty);
+              const statusBadge = !isHttps
+                ? 'HTTP Only'
+                : !rangeOk
+                  ? 'No Seek · 200'
+                  : `${unwrapMs}ms`;
               const fastPingRes = {
                 id,
-                ok: isHttps,
+                ok: isHttps && rangeOk,
                 unreachable: false,
                 isHttps,
+                supportsByteRange: rangeOk,
                 resolvedUrl,
                 ttfbMs: unwrapMs,
                 speedMbps: 12,
@@ -1918,17 +1950,25 @@ export function registerStreamzApiMiddlewares(
 
             const targetByteRange = isPingOnly ? 'bytes=0-1023' : 'bytes=0-32767';
             const minTargetBytes = isPingOnly ? 1 : 32768;
-            const timeoutMs = isPingOnly ? 1600 : 2000;
+            const timeoutMs = isPingOnly ? 2200 : 4800;
 
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
             const fetchStart = Date.now();
+            const isPixelDrainCdn = resolvedUrl.toLowerCase().includes('pixeldrain.');
             const resp = await fetch(resolvedUrl, {
               method: 'GET',
               headers: {
                 'User-Agent':
                   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
                 Range: targetByteRange,
+                ...(isPixelDrainCdn
+                  ? {
+                      'Sec-Fetch-Dest': 'video',
+                      'Sec-Fetch-Mode': 'no-cors',
+                      'Sec-Fetch-Site': 'cross-site',
+                    }
+                  : {}),
               },
               redirect: 'follow',
               signal: controller.signal,
@@ -2132,22 +2172,34 @@ export function registerStreamzApiMiddlewares(
                   : headroomRatio < 0.85
                     ? -160
                     : 0;
+            const isHlsPlaylist =
+              isLikelyHls ||
+              contentType.includes('mpegurl') ||
+              firstChunkText.trimStart().startsWith('#EXTM3U');
+            const supportsByteRange =
+              isHlsPlaylist ||
+              resp.status === 206 ||
+              Boolean(resp.headers.get('content-range'));
             const httpsBonus = isHttps ? 200 : -350;
+            const rangePenalty = supportsByteRange ? 0 : -1100;
             const responsivenessScore = Math.round(
-              latencyScore + throughputBonus + zeroBufferAdjustment + httpsBonus,
+              latencyScore + throughputBonus + zeroBufferAdjustment + httpsBonus + rangePenalty,
             );
 
             const statusBadge = !isHttps
               ? 'HTTP Only'
-              : !isPingOnly && ttfbMs <= 1100 && headroomRatio >= 1.1
-                ? `⚡ ${ttfbMs}ms`
-                : `${ttfbMs}ms`;
+              : !supportsByteRange
+                ? 'No Seek · 200'
+                : !isPingOnly && ttfbMs <= 1100 && headroomRatio >= 1.1
+                  ? `⚡ ${ttfbMs}ms`
+                  : `${ttfbMs}ms`;
 
             const okRes = {
               id,
-              ok: isHttps,
+              ok: isHttps && supportsByteRange,
               unreachable: false,
               isHttps,
+              supportsByteRange,
               resolvedUrl,
               ttfbMs,
               speedMbps,
