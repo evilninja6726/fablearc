@@ -163,6 +163,8 @@ export function isDiscordOrPromoSpam(text: string): boolean {
     lower.includes('telegram') ||
     lower.includes('donation needed') ||
     lower.includes('pengu.uk/donate') ||
+    lower.includes('#donate') ||
+    lower.includes('fuel the voyage') ||
     lower.includes('support the project') ||
     lower.includes('you must sign in') ||
     lower.includes('you must login') ||
@@ -417,11 +419,11 @@ export function sortStreamsByDecreasingQuality(
     const scoreB = b.qualityScore ?? 0;
     if (scoreB !== scoreA) return scoreB - scoreA;
 
-    // 2. Group by Provider within each Quality Tier (Option B: PenguPlay -> HdHub -> CNCVerse -> PlavioHD -> 111477 -> WebStreamr -> Torrentio -> TorrentsDB -> Other)
+    // 2. Group by Provider within each Quality Tier (Option B: PenguPlay -> HdHub -> CNCVerse -> PlavioHD -> Abyssus -> 111477 -> WebStreamr -> Other)
     const provRankA = getStreamProviderGroupRank(a);
     const provRankB = getStreamProviderGroupRank(b);
     if (provRankA !== provRankB) return provRankA - provRankB;
-    if (provRankA >= 10) {
+    if (provRankA >= 9) {
       const catCmp = getStreamProviderCategory(a).localeCompare(
         getStreamProviderCategory(b),
       );
@@ -1095,18 +1097,15 @@ export function isDirectCorsFastPathUrl(url: string): boolean {
     ) {
       return false;
     }
-    // Public CORS-enabled catalog, metadata, subtitle & stream addons (including CNCVerse Bridge, Torrentio, HDHub4u, OpenSubtitles & AIOLists)
+    // Public CORS-enabled catalog, metadata, subtitle & stream addons (including CNCVerse Bridge, Abyssus, PlavioHD, HDHub4u, OpenSubtitles & AIOLists)
     // resolve directly from the browser with 0 Bytes of Render bandwidth and bypass datacenter IP blocks!
     if (
       host === 'v3-cinemeta.strem.io' ||
       host === 'cncverse.dpdns.org' ||
+      host === 'a.abyssus.dpdns.org' ||
       host.endsWith('.dpdns.org') ||
       host === 'hd.plavio.site' ||
       host.endsWith('.plavio.site') ||
-      host === 'torrentio.strem.fun' ||
-      host.endsWith('.strem.fun') ||
-      host === 'torrentsdb.com' ||
-      host.endsWith('.torrentsdb.com') ||
       host === 'hdhub.thevolecitor.qzz.io' ||
       host === 'opensubtitlesv3-pro.dexter21767.com' ||
       host === 'opensubtitles-v3.strem.io' ||
@@ -1539,17 +1538,14 @@ export function getStreamProviderCategory(
   if (idLower.includes('plavio') || nameLower.includes('plavio')) {
     return 'PlavioHD';
   }
+  if (idLower.includes('abyssus') || nameLower.includes('abyssus')) {
+    return 'Abyssus';
+  }
   if (idLower.includes('111477') || nameLower.includes('111477')) {
     return '111477';
   }
   if (idLower.includes('webstreamr') || nameLower.includes('webstreamr')) {
     return 'WebStreamr';
-  }
-  if (idLower.includes('torrentsdb') || nameLower.includes('torrentsdb')) {
-    return 'TorrentsDB';
-  }
-  if (idLower.includes('torrentio') || nameLower.includes('torrentio')) {
-    return 'Torrentio';
   }
   if (idLower.includes('pwoi7q4u220fz') || nameLower.includes('hindi & indian ott')) {
     return 'CNCVerse · Hindi & Indian OTT';
@@ -1565,7 +1561,7 @@ export function getStreamProviderCategory(
 
 /**
  * Deterministic provider grouping order inside each quality tier ("All" list, Option B):
- * PenguPlay -> HdHub -> CNCVerse (Hindi -> English -> Anime) -> PlavioHD -> 111477 -> WebStreamr -> Torrentio -> TorrentsDB -> Other
+ * PenguPlay -> HdHub -> CNCVerse (Hindi -> English -> Anime) -> PlavioHD -> Abyssus -> 111477 -> WebStreamr -> Other
  */
 export function getStreamProviderGroupRank(
   stream: Pick<StremioStreamItem, 'addonId' | 'addonName'>,
@@ -1584,16 +1580,14 @@ export function getStreamProviderGroupRank(
       return 4;
     case 'PlavioHD':
       return 5;
-    case '111477':
+    case 'Abyssus':
       return 6;
-    case 'WebStreamr':
+    case '111477':
       return 7;
-    case 'Torrentio':
+    case 'WebStreamr':
       return 8;
-    case 'TorrentsDB':
-      return 9;
     default:
-      return 10;
+      return 9;
   }
 }
 
@@ -1823,63 +1817,6 @@ export async function fetchStreamsFromAddons(
                 ...qualityInfo,
               });
             }
-          } else if (
-            typeof raw.infoHash === 'string' &&
-            /^[a-fA-F0-9]{40}$/.test(raw.infoHash.trim())
-          ) {
-            const cleanHash = raw.infoHash.trim().toLowerCase();
-            const fileIdx =
-              typeof raw.fileIdx === 'number' && Number.isFinite(raw.fileIdx)
-                ? Math.max(0, Math.floor(raw.fileIdx))
-                : undefined;
-            const dedupeKey = `btih:${cleanHash}:${fileIdx ?? 0}`;
-            if (seenAddonUrls.has(dedupeKey)) {
-              return;
-            }
-            seenAddonUrls.add(dedupeKey);
-
-            const combinedMeta = `${name} ${title} ${extraDesc}`;
-            const seederMatch = combinedMeta.match(/(?:👤|seeders?:?)\s*(\d+)/i);
-            const seeders = seederMatch ? parseInt(seederMatch[1]!, 10) : 0;
-
-            const extraTrackers: string[] = [];
-            if (Array.isArray(raw.sources)) {
-              for (const src of raw.sources) {
-                if (typeof src === 'string') {
-                  const candidate = src.startsWith('tracker:') ? src.slice(8).trim() : src.trim();
-                  if (/^(udp|wss?|https?):\/\//i.test(candidate)) {
-                    extraTrackers.push(candidate);
-                  }
-                }
-              }
-            }
-
-            const magnetUri = buildP2pMagnetUri(
-              cleanHash,
-              hintFilename || mediaItem?.name || name,
-              extraTrackers,
-            );
-            const normalizedProviderName = getStreamProviderCategory({
-              addonId: addon.manifest.id,
-              addonName: addon.manifest.name,
-            });
-
-            results.push({
-              id: `${addon.manifest.id}-${videoId}-magnet-${idx}`,
-              addonId: addon.manifest.id,
-              addonName: normalizedProviderName,
-              name,
-              title,
-              kind: 'magnet',
-              url: magnetUri,
-              infoHash: cleanHash,
-              fileIdx,
-              filename: hintFilename || undefined,
-              trackers: extraTrackers,
-              seeders,
-              serverStatusBadge: seeders > 0 ? `👤 ${seeders}` : 'P2P Swarm',
-              ...qualityInfo,
-            });
           } else if (typeof raw.externalUrl === 'string' && raw.externalUrl.trim()) {
             const extCheck = validateAddonOrStreamUrl(raw.externalUrl.trim(), {
               requireHttps: true,
@@ -2791,11 +2728,8 @@ export const DEFAULT_PENGUPLAY_MANIFEST_URL =
 export const DEFAULT_PLAVIO_MANIFEST_URL =
   'https://hd.plavio.site/u/57rBC7jiSl9i_RIiqJ7kBg/manifest.json';
 
-export const DEFAULT_TORRENTIO_HINDI_MANIFEST_URL =
-  'https://torrentio.strem.fun/language=hindi/manifest.json';
-
-export const DEFAULT_TORRENTSDB_HINDI_MANIFEST_URL =
-  'https://torrentsdb.com/eyJsYW5ndWFnZSI6WyJoaW5kaSJdfQ==/manifest.json';
+export const DEFAULT_ABYSSUS_MANIFEST_URL =
+  'https://a.abyssus.dpdns.org/manifest.json';
 
 /**
  * Automatically upgrades any legacy unauthenticated PenguPlay URL (`https://pengu.uk/manifest.json`)
@@ -2811,7 +2745,7 @@ export function upgradeLegacyDefaultAddonUrl(manifestUrl: string): string {
 
 /**
  * Default live Stremio addon manifest URLs installed automatically on startup.
- * Includes all user-requested default addons + PlavioHD + Torrentio (Hindi) + TorrentsDB (Hindi) + Cinemeta & OpenSubtitles v3.
+ * Includes all user-requested default addons + PlavioHD + Abyssus + Cinemeta & OpenSubtitles v3.
  */
 export const DEFAULT_BOOTSTRAP_MANIFEST_URLS: string[] = [
   // Streaming Catalogs addon commented out (code preserved):
@@ -2820,13 +2754,12 @@ export const DEFAULT_BOOTSTRAP_MANIFEST_URLS: string[] = [
   'https://cncverse.dpdns.org/u/p_2tztbugmd1ys/manifest.json',
   'https://cncverse.dpdns.org/u/p_khcby2w1jpgc/manifest.json',
   DEFAULT_PLAVIO_MANIFEST_URL,
+  DEFAULT_ABYSSUS_MANIFEST_URL,
   'https://aiometadata.elfhosted.com/stremio/manifest.json',
   'https://87d6a6ef6b58-webstreamrmbg.baby-beamup.club/manifest.json',
   DEFAULT_PENGUPLAY_MANIFEST_URL,
   'https://st.111477.xyz/config/aHR0cHM6Ly9hLjExMTQ3Ny54eXov/manifest.json',
   'https://hdhub.thevolecitor.qzz.io/eyJ0b3Jib3giOiJ1bnNldCIsInF1YWxpdGllcyI6IjIxNjBwLDEwODBwLDcyMHAiLCJzb3J0IjoiZGVzYyJ9/manifest.json',
-  DEFAULT_TORRENTIO_HINDI_MANIFEST_URL,
-  DEFAULT_TORRENTSDB_HINDI_MANIFEST_URL,
   'https://opensubtitlesv3-pro.dexter21767.com/manifest.json',
   'https://v3-cinemeta.strem.io/manifest.json',
   'https://opensubtitles-v3.strem.io/manifest.json',

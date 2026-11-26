@@ -756,7 +756,8 @@ describe('Strix-Style E2E & Security Audit Suite', () => {
 
     // 1. Verify FABLEARC branding across HTML title, top bar, login modal, and custom 3D film-strip 'F' SVG emblem
     expect(indexHtml).toContain('FABLEARC');
-    expect(indexHtml).toContain("frame-src 'self' https://webtor.io https://www.youtube-nocookie.com;");
+    expect(indexHtml).toContain("frame-src 'self' https://www.youtube-nocookie.com;");
+    expect(indexHtml).not.toContain('webtor.io');
     expect(appTsx).toContain('FABLEARC');
     expect(authGateTsx).toContain('FABLEARC');
     expect(logoEmblemTsx).toContain('aria-label="FABLEARC"');
@@ -1215,7 +1216,7 @@ describe('Strix-Style E2E & Security Audit Suite', () => {
     expect(cinemaPlayerTsx).toContain('canVideoSeekImmediatelyTo');
     expect(cinemaPlayerTsx).toContain('disabled={!prevEpisode}');
     expect(cinemaPlayerTsx).toContain('disabled={!nextEpisode}');
-    expect(cinemaPlayerTsx).toContain('setWebtorEmbedActive(false)');
     expect(appTsx).toContain("defaultHost.includes('plavio.site')");
+    expect(appTsx).toContain("!a.manifestUrl.includes('torrentsdb.com')");
   });
 });

@@ -330,7 +330,6 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [copiedMagnet, setCopiedMagnet] = useState(false);
-  const [webtorEmbedActive, setWebtorEmbedActive] = useState(false);
   const directVideoLoadedUrlRef = useRef<string | null>(null);
   const userPausedRef = useRef<boolean>(false);
   const audioUnlockedRef = useRef<boolean>(false);
@@ -1656,7 +1655,6 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
   useEffect(() => {
     const currentStream = activeStreamRef.current;
     setCopiedMagnet(false);
-    setWebtorEmbedActive(false);
     if (!currentStream || currentStream.kind !== 'magnet') return;
 
     let cancelled = false;
@@ -2958,7 +2956,6 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       setResolvedDirectUrl(null);
       setProbedStreamUrl(null);
       setUseFfmpegAudioEngine(false);
-      setWebtorEmbedActive(false);
       setHasFreezeFrame(false);
       setIsPlaying(false);
       setIsBuffering(true);
@@ -4000,30 +3997,9 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         )}
 
         {!loadingStreams &&
-          activeStream?.kind === 'magnet' &&
-          activeStream.url &&
-          webtorEmbedActive && (
-          <div
-            className="youtube-stage-embed"
-            onClick={(e) => e.stopPropagation()}
-            style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column' }}
-          >
-            <iframe
-              title={activeStream.title}
-              src={`https://webtor.io/show?magnet=${encodeURIComponent(activeStream.url)}`}
-              style={{ width: '100%', height: '100%', border: 'none' }}
-              referrerPolicy="no-referrer"
-              allow="autoplay; fullscreen; picture-in-picture"
-              allowFullScreen
-            />
-          </div>
-        )}
-
-        {!loadingStreams &&
           !activePopover &&
           activeStream?.kind === 'magnet' &&
-          activeStream.url &&
-          !webtorEmbedActive && (
+          activeStream.url && (
           <div className="pause-dossier-overlay" onClick={(e) => e.stopPropagation()}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 6 }}>
               <span className="multi-audio-badge">
@@ -4047,29 +4023,12 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
             <p className="pause-synopsis" style={{ maxWidth: 640 }}>
               {activeStream.filename || activeStream.title}
             </p>
-            <p
-              className="pause-synopsis"
-              style={{ fontSize: '0.82rem', opacity: 0.78, marginTop: 4, maxWidth: 640 }}
-            >
-              BitTorrent P2P stream ({activeStream.addonName} · 0 MB cloud bandwidth). Stream via
-              client-side P2P player, open in Stremio/Torrent client, or play an instant Direct
-              Server.
-            </p>
 
             <div className="hero-cta-row" style={{ marginTop: 14, flexWrap: 'wrap', gap: 10 }}>
-              <button
-                type="button"
-                className="primary-amber-btn"
-                onClick={() => setWebtorEmbedActive(true)}
-              >
-                <Play size={16} />
-                <span>Stream P2P in Browser</span>
-              </button>
-
               {streams.some((s) => s.kind === 'direct' && !s.unreachable) && (
                 <button
                   type="button"
-                  className="secondary-outline-btn"
+                  className="primary-amber-btn"
                   onClick={() => {
                     const fastestDirect =
                       streams.find((s) => s.kind === 'direct' && s.isTopResponsive && !s.unreachable) ||

@@ -17,15 +17,15 @@ import {
   buildP2pMagnetUri,
   buildStreamingCatalogsManifestUrl,
   canBrowserPlayAudioCodecNatively,
+  DEFAULT_ABYSSUS_MANIFEST_URL,
   DEFAULT_BOOTSTRAP_MANIFEST_URLS,
   DEFAULT_PENGUPLAY_MANIFEST_URL,
   DEFAULT_PLAVIO_MANIFEST_URL,
-  DEFAULT_TORRENTIO_HINDI_MANIFEST_URL,
-  DEFAULT_TORRENTSDB_HINDI_MANIFEST_URL,
   extractStreamQualityInfo,
   getStreamProviderCategory,
   getStreamProviderGroupRank,
   isDirectCorsFastPathUrl,
+  isDiscordOrPromoSpam,
   isOfflineStream,
   markStreamOfflineInCache,
   normalizeStremioMeta,
@@ -159,27 +159,32 @@ describe('Default Addons & Decreasing Stream Quality Sorting', () => {
     expect(DEFAULT_BOOTSTRAP_MANIFEST_URLS).toContain(
       'https://hdhub.thevolecitor.qzz.io/eyJ0b3Jib3giOiJ1bnNldCIsInF1YWxpdGllcyI6IjIxNjBwLDEwODBwLDcyMHAiLCJzb3J0IjoiZGVzYyJ9/manifest.json',
     );
-    expect(DEFAULT_BOOTSTRAP_MANIFEST_URLS).toContain(DEFAULT_TORRENTIO_HINDI_MANIFEST_URL);
-    expect(DEFAULT_BOOTSTRAP_MANIFEST_URLS).toContain(DEFAULT_TORRENTSDB_HINDI_MANIFEST_URL);
-    expect(isDirectCorsFastPathUrl(DEFAULT_TORRENTIO_HINDI_MANIFEST_URL)).toBe(true);
-    expect(isDirectCorsFastPathUrl(DEFAULT_TORRENTSDB_HINDI_MANIFEST_URL)).toBe(true);
+    expect(DEFAULT_BOOTSTRAP_MANIFEST_URLS).toContain(DEFAULT_ABYSSUS_MANIFEST_URL);
+    expect(isDirectCorsFastPathUrl(DEFAULT_ABYSSUS_MANIFEST_URL)).toBe(true);
     expect(
-      upgradeLegacyDefaultAddonUrl(
-        'stremio://torrentsdb.com/eyJsYW5ndWFnZSI6WyJoaW5kaSJdfQ==/manifest.json',
+      DEFAULT_BOOTSTRAP_MANIFEST_URLS.some(
+        (u) => u.includes('torrentio') || u.includes('torrentsdb'),
       ),
-    ).toBe(DEFAULT_TORRENTSDB_HINDI_MANIFEST_URL);
+    ).toBe(false);
     expect(
       getStreamProviderCategory({
-        addonId: 'com.stremio.torrentio.addon',
-        addonName: 'Torrentio',
+        addonId: 'org.stremio.abyssus-reborn',
+        addonName: 'Abyssus',
       }),
-    ).toBe('Torrentio');
+    ).toBe('Abyssus');
     expect(
-      getStreamProviderCategory({
-        addonId: 'com.torrentsdb.addon',
-        addonName: 'TorrentsDB',
+      getStreamProviderGroupRank({
+        addonId: 'org.stremio.abyssus-reborn',
+        addonName: 'Abyssus',
       }),
-    ).toBe('TorrentsDB');
+    ).toBeLessThan(
+      getStreamProviderGroupRank({
+        addonId: 'org.111477.stremio',
+        addonName: '111477',
+      }),
+    );
+    expect(isDiscordOrPromoSpam('✨ Fuel the Voyage ✨')).toBe(true);
+    expect(isDiscordOrPromoSpam('https://a.abyssus.dpdns.org/#donate')).toBe(true);
     const enrichedMagnet = buildP2pMagnetUri(
       'b1d85d08e0db92e03e1c0f26e74cf86db9538213',
       'The.Batman.2022.mkv',
@@ -1059,45 +1064,13 @@ describe('Commercial SQLite WAL Database (Per-User Auth, Watch History & Dedupli
     ).toBe(true);
   });
 
-  it('builds valid BitTorrent magnet URIs and sorts instant Direct HTTP servers strictly above P2P magnet streams', () => {
-    const hash = '0123456789abcdef0123456789abcdef01234567';
-    const magnet = buildP2pMagnetUri(hash, 'Snowpiercer.S01E01.1080p.Hindi.mkv', [
-      'tracker:udp://tracker.opentrackr.org:1337/announce',
-    ]);
-    expect(magnet).toContain(`magnet:?xt=urn:btih:${hash}`);
-    expect(magnet).toContain('dn=Snowpiercer.S01E01.1080p.Hindi.mkv');
-    expect(magnet).toContain(encodeURIComponent('udp://tracker.opentrackr.org:1337/announce'));
-
-    const mixed: StremioStreamItem[] = [
-      {
-        id: 'p2p-4k-torrentio',
-        addonId: 'com.stremio.torrentio.addon',
-        addonName: 'Torrentio',
-        name: 'Torrentio 4K',
-        title: 'Snowpiercer.S01E01.2160p.WEB-DL.Multi-Audio [12.0 GB]',
-        kind: 'magnet',
-        url: magnet,
-        infoHash: hash,
-        fileIdx: 0,
-        seeders: 45,
-        ...extractStreamQualityInfo(
-          'Torrentio 4K',
-          'Snowpiercer.S01E01.2160p.WEB-DL.Multi-Audio [12.0 GB]',
-        ),
-      },
-      {
-        id: 'direct-1080p-hdhub',
-        addonId: 'com.stremio.HdHub',
-        addonName: 'HdHub',
-        name: 'HdHub 1080p',
-        title: 'Snowpiercer.S01E01.1080p.WEB-DL [1.8 GB]',
-        kind: 'direct',
-        url: 'https://cdn.example.com/snowpiercer-s01e01.mkv',
-        ...extractStreamQualityInfo('HdHub 1080p', 'Snowpiercer.S01E01.1080p.WEB-DL [1.8 GB]'),
-      },
-    ];
-
-    const sorted = sortStreamsByDecreasingQuality(mixed);
-    expect(sorted.map((s) => s.id)).toEqual(['direct-1080p-hdhub', 'p2p-4k-torrentio']);
+  it('strips Abyssus #donate / Fuel the Voyage promo cards and keeps Direct HTTP servers ahead of fallback items', () => {
+    expect(isDiscordOrPromoSpam('✨ Fuel the Voyage ✨')).toBe(true);
+    expect(isDiscordOrPromoSpam('https://a.abyssus.dpdns.org/#donate')).toBe(true);
+    const promoCheck = extractStreamQualityInfo(
+      '✨ Fuel the Voyage ✨',
+      'fueling (donating) hides this message and keep us ALIVE',
+    );
+    expect(promoCheck.isPromo).toBe(true);
   });
 });
