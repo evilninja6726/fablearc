@@ -862,7 +862,11 @@ describe('Strix-Style E2E & Security Audit Suite', () => {
     expect(cinemaPlayerTsx).toContain('gesture-hud-pill');
     expect(cinemaPlayerTsx).toContain('brightness-slider');
 
-    // 4. Verify all Part 4 features (Auto-Play Next Episode, Mini/PiP Player, Hold-to-2x Speed, Screen Lock, Ambilight + Audio Boost, Watchlist Collections + 1-5★ Rating, Surprise Me Roulette, Screenshot & Scene Bookmarks)
+    // 4. Verify all Part 4 features (Auto-Play Next/Prev Episode, Mini/PiP Player, Hold-to-2x Speed, Screen Lock, Ambilight + Audio Boost, Watchlist Collections + 1-5★ Rating, Surprise Me Roulette, Screenshot & Scene Bookmarks)
+    expect(cinemaPlayerTsx).toContain('switchToEpisode');
+    expect(cinemaPlayerTsx).toContain('goToPreviousEpisode');
+    expect(cinemaPlayerTsx).toContain('<span>Prev Ep</span>');
+    expect(cinemaPlayerTsx).toContain('<span>Next Ep</span>');
     expect(cinemaPlayerTsx).toContain('advanceToNextEpisode');
     expect(cinemaPlayerTsx).toContain('next-episode-card-overlay');
     expect(cinemaPlayerTsx).toContain('mini-floating-player');

@@ -21,6 +21,7 @@ import {
   Play,
   RefreshCw,
   Rewind,
+  SkipBack,
   SkipForward,
   Sparkles,
   Sun,
@@ -353,6 +354,16 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     return media.imdbId || media.id;
   }, [media.id, media.imdbId, media.type, selectedEpisode]);
 
+  const initialTargetId = useMemo(
+    () =>
+      media.type === 'series' && (initialEpisode ?? media.videos[0])?.id
+        ? (initialEpisode ?? media.videos[0])!.id
+        : media.imdbId || media.id,
+    [initialEpisode, media.id, media.imdbId, media.type, media.videos],
+  );
+  const lastLoadedVideoIdRef = useRef<string>(initialTargetId);
+  const preferredEpisodeProviderRef = useRef<string | null>(null);
+
   const [streams, setStreams] = useState<StremioStreamItem[]>(() => {
     if (!initialStreams) return [];
     const hydrated = applyCachedServerHealth(initialStreams);
@@ -362,20 +373,35 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
   });
 
   useEffect(() => {
-    if (!initialStreams || initialStreams.length === 0) return;
+    if (!initialStreams || initialStreams.length === 0 || activeVideoId !== initialTargetId) {
+      return;
+    }
     setStreams((prev) => {
-      const incomingById = new Map(initialStreams.map((s) => [s.id, s]));
-      const merged = prev.length > 0
-        ? prev.map((p) => {
-            const updated = incomingById.get(p.id);
-            return updated && (updated.serverStatusBadge || updated.ttfbMs !== undefined)
-              ? { ...p, ...updated }
-              : p;
-          })
-        : initialStreams;
+      const incomingByUrl = new Map(
+        initialStreams.filter((s) => Boolean(s.url)).map((s) => [s.url!, s]),
+      );
+      const merged =
+        prev.length > 0
+          ? prev.map((p) => {
+              const updated = p.url ? incomingByUrl.get(p.url) : undefined;
+              return updated && (updated.serverStatusBadge || updated.ttfbMs !== undefined)
+                ? {
+                    ...p,
+                    ttfbMs: updated.ttfbMs ?? p.ttfbMs,
+                    speedMbps: updated.speedMbps ?? p.speedMbps,
+                    responsivenessScore: updated.responsivenessScore ?? p.responsivenessScore,
+                    serverStatusBadge: updated.serverStatusBadge ?? p.serverStatusBadge,
+                    isTopResponsive: updated.isTopResponsive ?? p.isTopResponsive,
+                    unreachable: updated.unreachable ?? p.unreachable,
+                    supportsByteRange: updated.supportsByteRange ?? p.supportsByteRange,
+                    resolvedDirectUrl: updated.resolvedDirectUrl ?? p.resolvedDirectUrl,
+                  }
+                : p;
+            })
+          : initialStreams;
       return applyCachedServerHealth(merged).filter((s) => !isOfflineStream(s));
     });
-  }, [initialStreams]);
+  }, [activeVideoId, initialStreams, initialTargetId]);
   const [loadingStreams, setLoadingStreams] = useState(false);
   const [loadingMoreProviders, setLoadingMoreProviders] = useState(false);
   const [activeStream, setActiveStream] = useState<StremioStreamItem | null>(() => {
@@ -836,11 +862,15 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
   // Fetch streams (sorted in decreasing order of quality) & subtitles when activeVideoId changes
   useEffect(() => {
     let cancelled = false;
+    const isInitialTargetEpisode = activeVideoId === initialTargetId;
+    const effectiveInitialStream = isInitialTargetEpisode ? initialStream : undefined;
 
-    const initialTargetId =
-      media.type === 'series' && (initialEpisode ?? media.videos[0])?.id
-        ? (initialEpisode ?? media.videos[0])!.id
-        : media.imdbId || media.id;
+    if (lastLoadedVideoIdRef.current !== activeVideoId) {
+      lastLoadedVideoIdRef.current = activeVideoId;
+      setStreams([]);
+      setActiveStream(null);
+      setLoadingStreams(true);
+    }
 
     // Ping at most the top 18 un-pinged direct streams after a 2s startup delay so background pings never compete with <video> startup
     const pingRemainingServersInPlace = async (baseList: StremioStreamItem[]) => {
@@ -902,17 +932,30 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     ): StremioStreamItem[] => {
       const cleanIncoming = incomingList.filter((s) => s.kind !== 'youtube');
       if (prevList.length === 0) return cleanIncoming;
-      const measuredById = new Map<string, StremioStreamItem>();
+      // Match strictly by stream URL so measured metrics NEVER overwrite a different episode's `url` or `title`!
+      const measuredByUrl = new Map<string, StremioStreamItem>();
       for (const p of prevList) {
-        if (p.serverStatusBadge || p.isTopResponsive || p.ttfbMs !== undefined) {
-          measuredById.set(p.id, p);
+        if (p.url && (p.serverStatusBadge || p.isTopResponsive || p.ttfbMs !== undefined)) {
+          measuredByUrl.set(p.url, p);
         }
       }
-      if (measuredById.size === 0) return cleanIncoming;
+      if (measuredByUrl.size === 0) return cleanIncoming;
       const merged = cleanIncoming
         .map((itemStream) => {
-          const measured = measuredById.get(itemStream.id);
-          return measured ? { ...itemStream, ...measured } : itemStream;
+          const measured = itemStream.url ? measuredByUrl.get(itemStream.url) : undefined;
+          if (!measured) return itemStream;
+          return {
+            ...itemStream,
+            ttfbMs: measured.ttfbMs ?? itemStream.ttfbMs,
+            speedMbps: measured.speedMbps ?? itemStream.speedMbps,
+            responsivenessScore:
+              measured.responsivenessScore ?? itemStream.responsivenessScore,
+            serverStatusBadge: measured.serverStatusBadge ?? itemStream.serverStatusBadge,
+            isTopResponsive: measured.isTopResponsive ?? itemStream.isTopResponsive,
+            unreachable: measured.unreachable ?? itemStream.unreachable,
+            supportsByteRange: measured.supportsByteRange ?? itemStream.supportsByteRange,
+            resolvedDirectUrl: measured.resolvedDirectUrl ?? itemStream.resolvedDirectUrl,
+          };
         })
         .filter((s) => !isOfflineStream(s));
       return sortStreamsByDecreasingQuality(merged);
@@ -920,27 +963,52 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
 
     const pickBestPlayableStream = (
       list: StremioStreamItem[],
-    ): StremioStreamItem | null =>
-      list.find(
-        (s) =>
-          s.kind === 'direct' &&
-          !s.isPromo &&
-          !s.unreachable &&
-          s.supportsByteRange !== false &&
-          Boolean(s.serverStatusBadge),
-      ) ??
-      list.find(
-        (s) =>
-          s.kind === 'direct' &&
-          !s.isPromo &&
-          !s.unreachable &&
-          s.supportsByteRange !== false,
-      ) ??
-      list.find((s) => s.kind === 'direct' && !s.isPromo && !s.unreachable) ??
-      list.find((s) => s.kind === 'direct' && !s.isPromo) ??
-      list.find((s) => s.kind === 'magnet' && !s.isPromo) ??
-      list.find((s) => s.kind !== 'youtube') ??
-      null;
+    ): StremioStreamItem | null => {
+      const preferredCat = preferredEpisodeProviderRef.current;
+      if (preferredCat) {
+        const sameProviderPick =
+          list.find(
+            (s) =>
+              s.kind === 'direct' &&
+              !s.isPromo &&
+              !s.unreachable &&
+              s.supportsByteRange !== false &&
+              getStreamProviderCategory(s) === preferredCat &&
+              Boolean(s.serverStatusBadge),
+          ) ??
+          list.find(
+            (s) =>
+              s.kind === 'direct' &&
+              !s.isPromo &&
+              !s.unreachable &&
+              s.supportsByteRange !== false &&
+              getStreamProviderCategory(s) === preferredCat,
+          );
+        if (sameProviderPick) return sameProviderPick;
+      }
+      return (
+        list.find(
+          (s) =>
+            s.kind === 'direct' &&
+            !s.isPromo &&
+            !s.unreachable &&
+            s.supportsByteRange !== false &&
+            Boolean(s.serverStatusBadge),
+        ) ??
+        list.find(
+          (s) =>
+            s.kind === 'direct' &&
+            !s.isPromo &&
+            !s.unreachable &&
+            s.supportsByteRange !== false,
+        ) ??
+        list.find((s) => s.kind === 'direct' && !s.isPromo && !s.unreachable) ??
+        list.find((s) => s.kind === 'direct' && !s.isPromo) ??
+        list.find((s) => s.kind === 'magnet' && !s.isPromo) ??
+        list.find((s) => s.kind !== 'youtube') ??
+        null
+      );
+    };
 
     const loadStreams = async () => {
       if (
@@ -991,7 +1059,9 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         // Instant Play (0ms pre-play benchmark gate, matching Nuvio Android):
         // Start playing the top sorted / selected stream immediately while benchmarking runs non-blocking in the background
         setLoadingStreams(false);
-        setActiveStream((prev) => prev ?? initialStream ?? pickBestPlayableStream(orderedInitial));
+        setActiveStream(
+          (prev) => prev ?? effectiveInitialStream ?? pickBestPlayableStream(orderedInitial),
+        );
         if (!hasRankedWinner) {
           rankStreamsByResponsiveness(orderedInitial)
             .then((ranked) => {
@@ -1020,7 +1090,9 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         if (!hasDirect) return;
         firstWaveStarted = true;
         setLoadingStreams(false);
-        setActiveStream((prev) => prev ?? initialStream ?? pickBestPlayableStream(waveList));
+        setActiveStream(
+          (prev) => prev ?? effectiveInitialStream ?? pickBestPlayableStream(waveList),
+        );
 
         // Benchmark first wave non-blocking in the background to annotate ping badges
         rankWithTimeout(waveList, 2500)
@@ -1062,13 +1134,15 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
 
         setStreams((prev) => mergeWithMeasuredMetrics(prev, sorted));
         setActiveStream((prev) => {
+          const prevInCurrentEpisode = prev ? sorted.some((s) => s.id === prev.id) : false;
           if (
             prev &&
+            prevInCurrentEpisode &&
             (userManuallySelectedStreamRef.current || hasStartedPlaybackRef.current || !prev.unreachable)
           ) {
             return prev;
           }
-          return initialStream ?? pickBestPlayableStream(sorted);
+          return effectiveInitialStream ?? pickBestPlayableStream(sorted);
         });
 
         rankStreamsByResponsiveness(sorted)
@@ -2767,49 +2841,158 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
     return () => window.clearInterval(id);
   }, [ambilightEnabled, isPlaying]);
 
-  // Compute Next Episode for Binge Auto-Play in TV Series
-  const nextEpisode = useMemo<StremioEpisodeVideo | null>(() => {
-    if (media.type !== 'series' || !selectedEpisode || media.videos.length <= 1) {
-      return null;
+  // Compute Sorted Episodes, Previous Episode, and Next Episode for TV Series Navigation & Binge Auto-Play
+  const sortedSeriesEpisodes = useMemo<StremioEpisodeVideo[]>(() => {
+    if (media.type !== 'series' || media.videos.length <= 1) {
+      return [];
     }
-    const sorted = [...media.videos].sort((a, b) =>
+    return [...media.videos].sort((a, b) =>
       a.season !== b.season ? a.season - b.season : a.episode - b.episode,
     );
-    const idx = sorted.findIndex((ep) => ep.id === selectedEpisode.id);
-    if (idx !== -1 && idx + 1 < sorted.length) {
-      return sorted[idx + 1] ?? null;
+  }, [media.type, media.videos]);
+
+  const prevEpisode = useMemo<StremioEpisodeVideo | null>(() => {
+    if (!selectedEpisode || sortedSeriesEpisodes.length <= 1) return null;
+    const idx = sortedSeriesEpisodes.findIndex((ep) => ep.id === selectedEpisode.id);
+    if (idx > 0) {
+      return sortedSeriesEpisodes[idx - 1] ?? null;
     }
     return null;
-  }, [media.type, media.videos, selectedEpisode]);
+  }, [selectedEpisode, sortedSeriesEpisodes]);
+
+  const nextEpisode = useMemo<StremioEpisodeVideo | null>(() => {
+    if (!selectedEpisode || sortedSeriesEpisodes.length <= 1) return null;
+    const idx = sortedSeriesEpisodes.findIndex((ep) => ep.id === selectedEpisode.id);
+    if (idx !== -1 && idx + 1 < sortedSeriesEpisodes.length) {
+      return sortedSeriesEpisodes[idx + 1] ?? null;
+    }
+    return null;
+  }, [selectedEpisode, sortedSeriesEpisodes]);
 
   useEffect(() => {
     setNextEpisodeDismissed(false);
   }, [selectedEpisode?.id]);
 
+  const switchToEpisode = useCallback(
+    (targetEp: StremioEpisodeVideo, toastPrefix: string) => {
+      if (selectedEpisode?.id === targetEp.id) {
+        setActivePopover(null);
+        return;
+      }
+
+      // Persist final watch progress of the outgoing episode before tearing down playback
+      const outgoingPos = Math.max(
+        videoRef.current?.currentTime ?? 0,
+        intendedPositionSecRef.current,
+        currentTimeRef.current,
+      );
+      if (selectedEpisode && outgoingPos > 2) {
+        onProgressRef.current(
+          {
+            mediaId: media.id,
+            mediaName: media.name,
+            mediaType: media.type,
+            poster: media.poster,
+            background: media.background,
+            episodeId: selectedEpisode.id,
+            episodeLabel: `S${selectedEpisode.season}:E${selectedEpisode.episode} ${selectedEpisode.name}`,
+            positionSec: outgoingPos,
+            durationSec: effectiveDurationSec || videoRef.current?.duration || 0,
+            updatedAtIso: new Date().toISOString(),
+          },
+          true,
+        );
+      }
+
+      // Remember the currently working provider (e.g. CNCVerse / PenguPlay / PlavioHD) for the new episode
+      if (activeStreamRef.current) {
+        preferredEpisodeProviderRef.current = getStreamProviderCategory(
+          activeStreamRef.current,
+        );
+      }
+
+      clearPendingTransitionTimers();
+      if (hlsRef.current) {
+        hlsRef.current.destroy();
+        hlsRef.current = null;
+      }
+      if (videoRef.current) {
+        videoRef.current.pause();
+        videoRef.current.removeAttribute('src');
+        videoRef.current.load();
+      }
+      if (audioRef.current) {
+        audioRef.current.pause();
+        audioRef.current.removeAttribute('src');
+        audioRef.current.load();
+      }
+
+      directVideoLoadedUrlRef.current = null;
+      failedStreamIdsRef.current.clear();
+      userManuallySelectedStreamRef.current = false;
+      userClickedQualityRowRef.current = false;
+      lastAutoAudioStreamIdRef.current = '';
+      userPausedRef.current = false;
+      intendedPositionSecRef.current = 0;
+      pendingDeferredSeekRef.current = null;
+      pendingDeferredSeekSetAtMsRef.current = 0;
+      lastDeferredSeekAttemptMsRef.current = 0;
+      deferredSeekAssignedRef.current = false;
+      isSeekingSplitRef.current = false;
+      isSourceTransitioningRef.current = true;
+      isRecoveringFromStallRef.current = false;
+      isAudioHotSwappingRef.current = false;
+      recentStallEventsRef.current = [];
+      streamStartOffsetRef.current = 0;
+      currentTimeRef.current = 0;
+
+      lastLoadedVideoIdRef.current = targetEp.id;
+      setStreams([]);
+      setActiveStream(null);
+      setLoadingStreams(true);
+      setProbedAudioTracks([]);
+      setProbedDurationSec(0);
+      setNativeDurationSec(0);
+      setResolvedDirectUrl(null);
+      setProbedStreamUrl(null);
+      setUseFfmpegAudioEngine(false);
+      setHasFreezeFrame(false);
+      setIsPlaying(false);
+      setIsBuffering(true);
+      setHasStartedPlayback(false);
+      setStreamStartOffsetSec(0);
+      setCurrentTimeSec(0);
+      resetFailoverCountdown();
+      setSelectedEpisode(targetEp);
+      setEpisodeSeasonFilter(targetEp.season);
+      setNextEpisodeDismissed(false);
+      setActivePopover(null);
+      setFailoverToast(
+        `${toastPrefix}: S${targetEp.season}:E${targetEp.episode} — ${targetEp.name}`,
+      );
+    },
+    [
+      clearPendingTransitionTimers,
+      effectiveDurationSec,
+      media.background,
+      media.id,
+      media.name,
+      media.poster,
+      media.type,
+      resetFailoverCountdown,
+      selectedEpisode,
+    ],
+  );
+
+  const goToPreviousEpisode = useCallback(() => {
+    if (!prevEpisode) return;
+    switchToEpisode(prevEpisode, 'Playing Previous Episode');
+  }, [prevEpisode, switchToEpisode]);
+
   const advanceToNextEpisode = useCallback(() => {
     if (!nextEpisode) return;
-    clearPendingTransitionTimers();
-    setSelectedEpisode(nextEpisode);
-    setEpisodeSeasonFilter(nextEpisode.season);
-    intendedPositionSecRef.current = 0;
-    pendingDeferredSeekRef.current = null;
-    pendingDeferredSeekSetAtMsRef.current = 0;
-    deferredSeekAssignedRef.current = false;
-    isSeekingSplitRef.current = false;
-    isSourceTransitioningRef.current = true;
-    isRecoveringFromStallRef.current = false;
-    isAudioHotSwappingRef.current = false;
-    recentStallEventsRef.current = [];
-    streamStartOffsetRef.current = 0;
-    currentTimeRef.current = 0;
-    setStreamStartOffsetSec(0);
-    setCurrentTimeSec(0);
-    setHasStartedPlayback(false);
-    setNextEpisodeDismissed(false);
-    setFailoverToast(
-      `Playing Next Episode: S${nextEpisode.season}:E${nextEpisode.episode} — ${nextEpisode.name}`,
-    );
-  }, [clearPendingTransitionTimers, nextEpisode]);
+    switchToEpisode(nextEpisode, 'Playing Next Episode');
+  }, [nextEpisode, switchToEpisode]);
 
   const remainingEpisodeSec =
     effectiveDurationSec > 60 && currentTimeSec > 10
@@ -4556,23 +4739,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                           type="button"
                           className={`popover-option-row ${isCurrent ? 'selected' : ''}`}
                           onClick={() => {
-                            clearPendingTransitionTimers();
-                            intendedPositionSecRef.current = 0;
-                            pendingDeferredSeekRef.current = null;
-                            pendingDeferredSeekSetAtMsRef.current = 0;
-                            deferredSeekAssignedRef.current = false;
-                            isSeekingSplitRef.current = false;
-                            isSourceTransitioningRef.current = true;
-                            isRecoveringFromStallRef.current = false;
-                            isAudioHotSwappingRef.current = false;
-                            recentStallEventsRef.current = [];
-                            streamStartOffsetRef.current = 0;
-                            currentTimeRef.current = 0;
-                            setSelectedEpisode(ep);
-                            setStreamStartOffsetSec(0);
-                            setCurrentTimeSec(0);
-                            setHasStartedPlayback(false);
-                            setActivePopover(null);
+                            switchToEpisode(ep, 'Switched Episode');
                           }}
                         >
                           <div className="popover-option-main">
@@ -4777,6 +4944,19 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
               <Zap size={14} />
               <span className="mono">{audioBoostPct}%</span>
             </button>
+
+            {/* Previous Episode Quick Skip Button (when watching a TV Series with a previous episode) */}
+            {prevEpisode && (
+              <button
+                type="button"
+                className="bottom-dropdown-btn"
+                onClick={goToPreviousEpisode}
+                title={`Play Previous Episode: S${prevEpisode.season}:E${prevEpisode.episode} — ${prevEpisode.name}`}
+              >
+                <SkipBack size={14} />
+                <span>Prev Ep</span>
+              </button>
+            )}
 
             {/* Next Episode Quick Skip Button (when watching a TV Series with a next episode) */}
             {nextEpisode && (

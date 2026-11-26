@@ -1798,7 +1798,7 @@ export async function fetchStreamsFromAddons(
                 addonName: addon.manifest.name,
               });
               results.push({
-                id: `${addon.manifest.id}-direct-${idx}`,
+                id: `${addon.manifest.id}-${videoId}-direct-${idx}`,
                 addonId: addon.manifest.id,
                 addonName: normalizedProviderName,
                 name,
@@ -1818,7 +1818,7 @@ export async function fetchStreamsFromAddons(
             });
             if (extCheck.allowed && extCheck.normalizedUrl) {
               results.push({
-                id: `${addon.manifest.id}-ext-${idx}`,
+                id: `${addon.manifest.id}-${videoId}-ext-${idx}`,
                 addonId: addon.manifest.id,
                 addonName: addon.manifest.name,
                 name,
@@ -2664,7 +2664,7 @@ export async function fetchSubtitlesFromAddons(
             : `${lang.toUpperCase()} #${idx + 1}`;
 
         tracks.push({
-          id: `${addon.manifest.id}-sub-${sub.id ?? idx}`,
+          id: `${addon.manifest.id}-${videoId}-sub-${sub.id ?? idx}`,
           addonId: addon.manifest.id,
           addonName: addon.manifest.name,
           lang,
