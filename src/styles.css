@@ -2690,10 +2690,16 @@ select {
   transition: border-color 150ms ease, background-color 150ms ease;
 }
 
-.bottom-dropdown-btn:hover {
+.bottom-dropdown-btn:hover:not(:disabled) {
   border-color: rgba(255, 255, 255, 0.38);
   background: rgba(255, 255, 255, 0.12);
   color: #ffffff;
+}
+
+.bottom-dropdown-btn:disabled {
+  opacity: 0.38;
+  cursor: not-allowed;
+  pointer-events: none;
 }
 
 .bottom-dropdown-btn.active {
@@ -4687,7 +4693,7 @@ select {
   color: #f8fafc;
 }
 
-[data-theme='light'] .player-modal-backdrop .bottom-dropdown-btn:hover {
+[data-theme='light'] .player-modal-backdrop .bottom-dropdown-btn:hover:not(:disabled) {
   background: rgba(255, 255, 255, 0.14);
   border-color: rgba(255, 255, 255, 0.42);
   color: #ffffff;

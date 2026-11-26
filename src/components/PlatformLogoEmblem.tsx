@@ -505,6 +505,46 @@ export const AddonSvgEmblem: React.FC<AddonSvgEmblemProps> = ({
       );
     }
 
+    if (combined.includes('torrentsdb')) {
+      // TorrentsDB Hex-Vault Badge
+      return (
+        <>
+          <rect x="8.5" y="10.5" width="23" height="19" rx="5" fill="rgba(59,130,246,0.2)" stroke="#60A5FA" strokeWidth="1.6" />
+          <text
+            x="20"
+            y="23.5"
+            textAnchor="middle"
+            fill="#DBEAFE"
+            fontFamily="JetBrains Mono, monospace"
+            fontWeight="800"
+            fontSize="9.5"
+          >
+            TDB
+          </text>
+        </>
+      );
+    }
+
+    if (combined.includes('torrentio')) {
+      // Torrentio Swarm Ring Emblem
+      return (
+        <>
+          <circle cx="20" cy="20" r="10.5" fill="rgba(244,63,94,0.18)" stroke="#FB7185" strokeWidth="1.7" />
+          <text
+            x="20"
+            y="23.5"
+            textAnchor="middle"
+            fill="#FFE4E6"
+            fontFamily="Plus Jakarta Sans, Inter, sans-serif"
+            fontWeight="800"
+            fontSize="10.5"
+          >
+            TR
+          </text>
+        </>
+      );
+    }
+
     if (combined.includes('111477')) {
       // Vault Numeric Monogram Badge
       return (

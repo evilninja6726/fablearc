@@ -330,6 +330,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [copiedMagnet, setCopiedMagnet] = useState(false);
+  const [webtorEmbedActive, setWebtorEmbedActive] = useState(false);
   const directVideoLoadedUrlRef = useRef<string | null>(null);
   const userPausedRef = useRef<boolean>(false);
   const audioUnlockedRef = useRef<boolean>(false);
@@ -1655,6 +1656,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
   useEffect(() => {
     const currentStream = activeStreamRef.current;
     setCopiedMagnet(false);
+    setWebtorEmbedActive(false);
     if (!currentStream || currentStream.kind !== 'magnet') return;
 
     let cancelled = false;
@@ -2956,6 +2958,7 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
       setResolvedDirectUrl(null);
       setProbedStreamUrl(null);
       setUseFfmpegAudioEngine(false);
+      setWebtorEmbedActive(false);
       setHasFreezeFrame(false);
       setIsPlaying(false);
       setIsBuffering(true);
@@ -3989,7 +3992,28 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
               title={activeStream.title}
               src={`https://www.youtube-nocookie.com/embed/${encodeURIComponent(activeStream.ytId)}?autoplay=1&rel=0&modestbranding=1`}
               style={{ width: '100%', height: '100%', border: 'none' }}
+              referrerPolicy="no-referrer"
               allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+              allowFullScreen
+            />
+          </div>
+        )}
+
+        {!loadingStreams &&
+          activeStream?.kind === 'magnet' &&
+          activeStream.url &&
+          webtorEmbedActive && (
+          <div
+            className="youtube-stage-embed"
+            onClick={(e) => e.stopPropagation()}
+            style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column' }}
+          >
+            <iframe
+              title={activeStream.title}
+              src={`https://webtor.io/show?magnet=${encodeURIComponent(activeStream.url)}`}
+              style={{ width: '100%', height: '100%', border: 'none' }}
+              referrerPolicy="no-referrer"
+              allow="autoplay; fullscreen; picture-in-picture"
               allowFullScreen
             />
           </div>
@@ -3998,7 +4022,8 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
         {!loadingStreams &&
           !activePopover &&
           activeStream?.kind === 'magnet' &&
-          activeStream.url && (
+          activeStream.url &&
+          !webtorEmbedActive && (
           <div className="pause-dossier-overlay" onClick={(e) => e.stopPropagation()}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 6 }}>
               <span className="multi-audio-badge">
@@ -4026,15 +4051,25 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
               className="pause-synopsis"
               style={{ fontSize: '0.82rem', opacity: 0.78, marginTop: 4, maxWidth: 640 }}
             >
-              BitTorrent P2P stream ({activeStream.addonName}). Needs a P2P-to-HTTPS bridge or Debrid
-              resolver to play directly in the browser player.
+              BitTorrent P2P stream ({activeStream.addonName} · 0 MB cloud bandwidth). Stream via
+              client-side P2P player, open in Stremio/Torrent client, or play an instant Direct
+              Server.
             </p>
 
             <div className="hero-cta-row" style={{ marginTop: 14, flexWrap: 'wrap', gap: 10 }}>
+              <button
+                type="button"
+                className="primary-amber-btn"
+                onClick={() => setWebtorEmbedActive(true)}
+              >
+                <Play size={16} />
+                <span>Stream P2P in Browser</span>
+              </button>
+
               {streams.some((s) => s.kind === 'direct' && !s.unreachable) && (
                 <button
                   type="button"
-                  className="primary-amber-btn"
+                  className="secondary-outline-btn"
                   onClick={() => {
                     const fastestDirect =
                       streams.find((s) => s.kind === 'direct' && s.isTopResponsive && !s.unreachable) ||
@@ -4048,6 +4083,27 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
                   <span>Play Direct Server</span>
                 </button>
               )}
+
+              <a
+                href={activeStream.url}
+                className="secondary-outline-btn"
+                style={{ textDecoration: 'none' }}
+              >
+                <ExternalLink size={16} />
+                <span>Open Magnet</span>
+              </a>
+
+              <button
+                type="button"
+                className="secondary-outline-btn"
+                onClick={() => {
+                  navigator.clipboard?.writeText(activeStream.url || '').catch(() => {});
+                  setCopiedMagnet(true);
+                }}
+              >
+                {copiedMagnet ? <Check size={16} /> : <Copy size={16} />}
+                <span>{copiedMagnet ? 'Copied Magnet' : 'Copy Magnet'}</span>
+              </button>
 
               <button
                 type="button"
@@ -4945,30 +5001,39 @@ export const CinemaPlayerModal: React.FC<CinemaPlayerModalProps> = ({
               <span className="mono">{audioBoostPct}%</span>
             </button>
 
-            {/* Previous Episode Quick Skip Button (when watching a TV Series with a previous episode) */}
-            {prevEpisode && (
-              <button
-                type="button"
-                className="bottom-dropdown-btn"
-                onClick={goToPreviousEpisode}
-                title={`Play Previous Episode: S${prevEpisode.season}:E${prevEpisode.episode} — ${prevEpisode.name}`}
-              >
-                <SkipBack size={14} />
-                <span>Prev Ep</span>
-              </button>
-            )}
+            {/* Fixed-Slot Prev Ep & Next Ep Buttons: always rendered side-by-side on TV Series so Next Ep never shifts under the cursor! */}
+            {media.type === 'series' && sortedSeriesEpisodes.length > 1 && (
+              <>
+                <button
+                  type="button"
+                  className="bottom-dropdown-btn"
+                  onClick={goToPreviousEpisode}
+                  disabled={!prevEpisode}
+                  title={
+                    prevEpisode
+                      ? `Play Previous Episode: S${prevEpisode.season}:E${prevEpisode.episode} — ${prevEpisode.name}`
+                      : 'First Episode'
+                  }
+                >
+                  <SkipBack size={14} />
+                  <span>Prev Ep</span>
+                </button>
 
-            {/* Next Episode Quick Skip Button (when watching a TV Series with a next episode) */}
-            {nextEpisode && (
-              <button
-                type="button"
-                className="bottom-dropdown-btn"
-                onClick={advanceToNextEpisode}
-                title={`Play Next Episode: S${nextEpisode.season}:E${nextEpisode.episode} — ${nextEpisode.name}`}
-              >
-                <SkipForward size={14} />
-                <span>Next Ep</span>
-              </button>
+                <button
+                  type="button"
+                  className="bottom-dropdown-btn"
+                  onClick={advanceToNextEpisode}
+                  disabled={!nextEpisode}
+                  title={
+                    nextEpisode
+                      ? `Play Next Episode: S${nextEpisode.season}:E${nextEpisode.episode} — ${nextEpisode.name}`
+                      : 'Last Episode'
+                  }
+                >
+                  <SkipForward size={14} />
+                  <span>Next Ep</span>
+                </button>
+              </>
             )}
           </div>
 
