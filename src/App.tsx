@@ -58,6 +58,7 @@ import {
   StremioMediaItem,
   StremioStreamItem,
   stripDiscordText,
+  stripStreamOnlyProviderCatalogs,
   upgradeLegacyDefaultAddonUrl,
 } from './addons/stremioProtocol';
 import {
@@ -523,10 +524,14 @@ export const App: React.FC = () => {
               // Streaming Catalogs addon disabled/commented out for now:
               a.manifest.id !== 'pw.ers.netflix-catalog',
           )
-          .map((a) => ({
-            ...a,
-            manifestUrl: upgradeLegacyDefaultAddonUrl(a.manifestUrl),
-          }));
+          .map((a) => {
+            const nextUrl = upgradeLegacyDefaultAddonUrl(a.manifestUrl);
+            return {
+              ...a,
+              manifestUrl: nextUrl,
+              manifest: stripStreamOnlyProviderCatalogs(a.manifest, nextUrl),
+            };
+          });
         if (cleaned.length > 0) {
           return cleaned;
         }
@@ -929,12 +934,16 @@ export const App: React.FC = () => {
       // 3. Load user's isolated Providers (if user has saved providers in DB; otherwise reset to bootstrap defaults for new user)
       if (state.providers && state.providers.length > 0) {
         const restoredAddons: InstalledAddon[] = state.providers
-          .map((p) => ({
-            manifestUrl: upgradeLegacyDefaultAddonUrl(p.manifestUrl),
-            enabled: p.enabled,
-            manifest: p.manifest as unknown as InstalledAddon['manifest'],
-            lastCheckedIso: p.lastCheckedIso,
-          }))
+          .map((p) => {
+            const nextUrl = upgradeLegacyDefaultAddonUrl(p.manifestUrl);
+            const rawManifest = p.manifest as unknown as InstalledAddon['manifest'];
+            return {
+              manifestUrl: nextUrl,
+              enabled: p.enabled,
+              manifest: stripStreamOnlyProviderCatalogs(rawManifest, nextUrl),
+              lastCheckedIso: p.lastCheckedIso,
+            };
+          })
           // Streaming Catalogs & raw P2P Torrentio / TorrentsDB addons excluded:
           .filter(
             (a) =>
@@ -1472,7 +1481,14 @@ export const App: React.FC = () => {
       }> = [];
 
       for (const addon of addons) {
-        if (!addon.enabled || addon.manifest.id === 'com.linvo.cinemeta') continue;
+        if (
+          !addon.enabled ||
+          addon.manifest.id === 'com.linvo.cinemeta' ||
+          addon.manifest.id === 'community.desiflix.serials' ||
+          addon.manifestUrl.includes('desitvhub.eu.org')
+        ) {
+          continue;
+        }
         for (const cat of addon.manifest.catalogs) {
           if (
             (cat.type === 'movie' || cat.type === 'series') &&

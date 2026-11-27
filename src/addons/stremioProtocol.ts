@@ -1247,6 +1247,38 @@ async function cachedJsonFetch<T = unknown>(
  * Strictly declarative JSON-only Stremio Addon manifest fetcher.
  * Automatically falls back from `/stremio/manifest.json` to `/manifest.json` when ElfHosted/community endpoints return 404 on `/stremio/manifest.json`.
  */
+/**
+ * Strips `catalog` and `meta` resources from providers configured strictly as stream-only sources
+ * (such as `DesiFlix`), preventing duplicate search entries or homepage catalog shelves while keeping
+ * all `stream` capabilities intact.
+ */
+export function stripStreamOnlyProviderCatalogs(
+  manifest: StremioAddonManifest,
+  manifestUrl?: string,
+): StremioAddonManifest {
+  const idLower = String(manifest.id || '').toLowerCase();
+  const urlLower = String(manifestUrl || '').toLowerCase();
+  const isStreamOnlyOverride =
+    idLower === 'community.desiflix.serials' ||
+    idLower.includes('desiflix') ||
+    urlLower.includes('desitvhub.eu.org');
+  if (!isStreamOnlyOverride) {
+    return manifest;
+  }
+  const streamOnlyResources = Array.isArray(manifest.resources)
+    ? manifest.resources.filter((res) =>
+        typeof res === 'string'
+          ? res === 'stream'
+          : Boolean(res && typeof res === 'object' && res.name === 'stream'),
+      )
+    : ['stream'];
+  return {
+    ...manifest,
+    resources: streamOnlyResources.length > 0 ? streamOnlyResources : ['stream'],
+    catalogs: [],
+  };
+}
+
 export async function fetchStremioManifest(rawInput: string): Promise<{
   manifestUrl: string;
   manifest: StremioAddonManifest;
@@ -1356,33 +1388,35 @@ export async function fetchStremioManifest(rawInput: string): Promise<{
     resolvedManifestName = 'PlavioHD';
   }
 
+  const rawManifest: StremioAddonManifest = {
+    id: resolvedManifestId,
+    version: typeof data.version === 'string' ? data.version : '1.0.0',
+    name: resolvedManifestName,
+    description:
+      typeof data.description === 'string' && stripDiscordText(data.description)
+        ? stripDiscordText(data.description)
+        : 'Declarative Stremio JSON addon.',
+    logo: typeof data.logo === 'string' ? data.logo : undefined,
+    background: typeof data.background === 'string' ? data.background : undefined,
+    resources: Array.isArray(data.resources)
+      ? (data.resources as Array<string | StremioResourceDescriptor>)
+      : ['catalog'],
+    types: Array.isArray(data.types)
+      ? data.types.filter((t): t is string => typeof t === 'string')
+      : ['movie', 'series'],
+    idPrefixes: Array.isArray(data.idPrefixes)
+      ? data.idPrefixes.filter((p): p is string => typeof p === 'string')
+      : undefined,
+    catalogs,
+    behaviorHints:
+      data.behaviorHints && typeof data.behaviorHints === 'object'
+        ? (data.behaviorHints as StremioAddonManifest['behaviorHints'])
+        : undefined,
+  };
+
   return {
     manifestUrl: activeManifestUrl,
-    manifest: {
-      id: resolvedManifestId,
-      version: typeof data.version === 'string' ? data.version : '1.0.0',
-      name: resolvedManifestName,
-      description:
-        typeof data.description === 'string' && stripDiscordText(data.description)
-          ? stripDiscordText(data.description)
-          : 'Declarative Stremio JSON addon.',
-      logo: typeof data.logo === 'string' ? data.logo : undefined,
-      background: typeof data.background === 'string' ? data.background : undefined,
-      resources: Array.isArray(data.resources)
-        ? (data.resources as Array<string | StremioResourceDescriptor>)
-        : ['catalog'],
-      types: Array.isArray(data.types)
-        ? data.types.filter((t): t is string => typeof t === 'string')
-        : ['movie', 'series'],
-      idPrefixes: Array.isArray(data.idPrefixes)
-        ? data.idPrefixes.filter((p): p is string => typeof p === 'string')
-        : undefined,
-      catalogs,
-      behaviorHints:
-        data.behaviorHints && typeof data.behaviorHints === 'object'
-          ? (data.behaviorHints as StremioAddonManifest['behaviorHints'])
-          : undefined,
-    },
+    manifest: stripStreamOnlyProviderCatalogs(rawManifest, activeManifestUrl),
   };
 }
 

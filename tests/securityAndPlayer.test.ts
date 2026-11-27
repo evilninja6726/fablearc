@@ -39,6 +39,7 @@ import {
   StremioAddonManifest,
   StremioMediaItem,
   StremioStreamItem,
+  stripStreamOnlyProviderCatalogs,
   upgradeLegacyDefaultAddonUrl,
 } from '../src/addons/stremioProtocol';
 import {
@@ -191,6 +192,27 @@ describe('Default Addons & Decreasing Stream Quality Sorting', () => {
         addonName: 'DesiFlix',
       }),
     ).toBe('DesiFlix');
+    const strippedDesiFlix = stripStreamOnlyProviderCatalogs(
+      {
+        id: 'community.desiflix.serials',
+        version: '2.0.0',
+        name: 'DesiFlix',
+        description: 'Indian Movies and Series',
+        resources: [
+          'catalog',
+          { name: 'meta', types: ['movie', 'series'], idPrefixes: ['dsx:', 'tt'] },
+          { name: 'stream', types: ['movie', 'series'], idPrefixes: ['dsx:', 'tt'] },
+        ],
+        types: ['movie', 'series'],
+        idPrefixes: ['dsx:', 'tt', 'tmdb:'],
+        catalogs: [{ type: 'series', id: 'dsx-web', name: 'Web Series - DesiFlix' }],
+      },
+      DEFAULT_DESIFLIX_MANIFEST_URL,
+    );
+    expect(strippedDesiFlix.catalogs).toEqual([]);
+    expect(addonSupportsResource(strippedDesiFlix, 'catalog')).toBe(false);
+    expect(addonSupportsResource(strippedDesiFlix, 'meta')).toBe(false);
+    expect(addonSupportsResource(strippedDesiFlix, 'stream', 'series', 'tt6156584:1:1')).toBe(true);
     expect(
       DEFAULT_BOOTSTRAP_MANIFEST_URLS.some(
         (u) => u.includes('torrentio') || u.includes('torrentsdb'),
