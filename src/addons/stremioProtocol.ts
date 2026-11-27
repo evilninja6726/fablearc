@@ -419,11 +419,11 @@ export function sortStreamsByDecreasingQuality(
     const scoreB = b.qualityScore ?? 0;
     if (scoreB !== scoreA) return scoreB - scoreA;
 
-    // 2. Group by Provider within each Quality Tier (Option B: PenguPlay -> HdHub -> CNCVerse -> PlavioHD -> Abyssus -> 111477 -> WebStreamr -> Other)
+    // 2. Group by Provider within each Quality Tier (Option B: PenguPlay -> HdHub -> CNCVerse -> PlavioHD -> Abyssus -> DesiFlix -> 111477 -> WebStreamr -> Other)
     const provRankA = getStreamProviderGroupRank(a);
     const provRankB = getStreamProviderGroupRank(b);
     if (provRankA !== provRankB) return provRankA - provRankB;
-    if (provRankA >= 9) {
+    if (provRankA >= 10) {
       const catCmp = getStreamProviderCategory(a).localeCompare(
         getStreamProviderCategory(b),
       );
@@ -804,7 +804,10 @@ export async function resolveAddonInputUrl(rawInput: string): Promise<string> {
 }
 
 export function normalizeManifestUrl(rawUrl: string): string {
-  const trimmed = rawUrl.trim().replace(/^stremio:\/\//i, 'https://');
+  const trimmed = rawUrl
+    .trim()
+    .replace(/^stremio:\/\//i, 'https://')
+    .replace(/^http:\/\/manifest\.desitvhub\.eu\.org(?=\/|$)/i, 'https://manifest.desitvhub.eu.org');
   if (trimmed.endsWith('/manifest.json')) {
     return trimmed;
   }
@@ -1097,13 +1100,15 @@ export function isDirectCorsFastPathUrl(url: string): boolean {
     ) {
       return false;
     }
-    // Public CORS-enabled catalog, metadata, subtitle & stream addons (including CNCVerse Bridge, Abyssus, PlavioHD, HDHub4u, OpenSubtitles & AIOLists)
+    // Public CORS-enabled catalog, metadata, subtitle & stream addons (including CNCVerse Bridge, Abyssus, DesiFlix, PlavioHD, HDHub4u, OpenSubtitles & AIOLists)
     // resolve directly from the browser with 0 Bytes of Render bandwidth and bypass datacenter IP blocks!
     if (
       host === 'v3-cinemeta.strem.io' ||
       host === 'cncverse.dpdns.org' ||
       host === 'a.abyssus.dpdns.org' ||
       host.endsWith('.dpdns.org') ||
+      host === 'manifest.desitvhub.eu.org' ||
+      host.endsWith('.desitvhub.eu.org') ||
       host === 'hd.plavio.site' ||
       host.endsWith('.plavio.site') ||
       host === 'hdhub.thevolecitor.qzz.io' ||
@@ -1541,6 +1546,9 @@ export function getStreamProviderCategory(
   if (idLower.includes('abyssus') || nameLower.includes('abyssus')) {
     return 'Abyssus';
   }
+  if (idLower.includes('desiflix') || nameLower.includes('desiflix')) {
+    return 'DesiFlix';
+  }
   if (idLower.includes('111477') || nameLower.includes('111477')) {
     return '111477';
   }
@@ -1561,7 +1569,7 @@ export function getStreamProviderCategory(
 
 /**
  * Deterministic provider grouping order inside each quality tier ("All" list, Option B):
- * PenguPlay -> HdHub -> CNCVerse (Hindi -> English -> Anime) -> PlavioHD -> Abyssus -> 111477 -> WebStreamr -> Other
+ * PenguPlay -> HdHub -> CNCVerse (Hindi -> English -> Anime) -> PlavioHD -> Abyssus -> DesiFlix -> 111477 -> WebStreamr -> Other
  */
 export function getStreamProviderGroupRank(
   stream: Pick<StremioStreamItem, 'addonId' | 'addonName'>,
@@ -1582,12 +1590,14 @@ export function getStreamProviderGroupRank(
       return 5;
     case 'Abyssus':
       return 6;
-    case '111477':
+    case 'DesiFlix':
       return 7;
-    case 'WebStreamr':
+    case '111477':
       return 8;
-    default:
+    case 'WebStreamr':
       return 9;
+    default:
+      return 10;
   }
 }
 
@@ -2731,12 +2741,19 @@ export const DEFAULT_PLAVIO_MANIFEST_URL =
 export const DEFAULT_ABYSSUS_MANIFEST_URL =
   'https://a.abyssus.dpdns.org/manifest.json';
 
+export const DEFAULT_DESIFLIX_MANIFEST_URL =
+  'https://manifest.desitvhub.eu.org/manifest.json';
+
 /**
- * Automatically upgrades any legacy unauthenticated PenguPlay URL (`https://pengu.uk/manifest.json`)
- * or `stremio://` protocol URL stored in localStorage or SQLite DB to its normalized `https://` URL.
+ * Automatically upgrades any legacy unauthenticated PenguPlay URL (`https://pengu.uk/manifest.json`),
+ * `http://manifest.desitvhub.eu.org/...`, or `stremio://` protocol URL stored in localStorage or SQLite DB
+ * to its normalized `https://` URL.
  */
 export function upgradeLegacyDefaultAddonUrl(manifestUrl: string): string {
-  const trimmed = manifestUrl.trim().replace(/^stremio:\/\//i, 'https://');
+  const trimmed = manifestUrl
+    .trim()
+    .replace(/^stremio:\/\//i, 'https://')
+    .replace(/^http:\/\/manifest\.desitvhub\.eu\.org(?=\/|$)/i, 'https://manifest.desitvhub.eu.org');
   if (/^https?:\/\/pengu\.uk\/manifest\.json$/i.test(trimmed)) {
     return DEFAULT_PENGUPLAY_MANIFEST_URL;
   }
@@ -2745,7 +2762,7 @@ export function upgradeLegacyDefaultAddonUrl(manifestUrl: string): string {
 
 /**
  * Default live Stremio addon manifest URLs installed automatically on startup.
- * Includes all user-requested default addons + PlavioHD + Abyssus + Cinemeta & OpenSubtitles v3.
+ * Includes all user-requested default addons + PlavioHD + Abyssus + DesiFlix + Cinemeta & OpenSubtitles v3.
  */
 export const DEFAULT_BOOTSTRAP_MANIFEST_URLS: string[] = [
   // Streaming Catalogs addon commented out (code preserved):
@@ -2755,6 +2772,7 @@ export const DEFAULT_BOOTSTRAP_MANIFEST_URLS: string[] = [
   'https://cncverse.dpdns.org/u/p_khcby2w1jpgc/manifest.json',
   DEFAULT_PLAVIO_MANIFEST_URL,
   DEFAULT_ABYSSUS_MANIFEST_URL,
+  DEFAULT_DESIFLIX_MANIFEST_URL,
   'https://aiometadata.elfhosted.com/stremio/manifest.json',
   'https://87d6a6ef6b58-webstreamrmbg.baby-beamup.club/manifest.json',
   DEFAULT_PENGUPLAY_MANIFEST_URL,

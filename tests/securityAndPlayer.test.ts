@@ -19,6 +19,7 @@ import {
   canBrowserPlayAudioCodecNatively,
   DEFAULT_ABYSSUS_MANIFEST_URL,
   DEFAULT_BOOTSTRAP_MANIFEST_URLS,
+  DEFAULT_DESIFLIX_MANIFEST_URL,
   DEFAULT_PENGUPLAY_MANIFEST_URL,
   DEFAULT_PLAVIO_MANIFEST_URL,
   extractStreamQualityInfo,
@@ -28,6 +29,7 @@ import {
   isDiscordOrPromoSpam,
   isOfflineStream,
   markStreamOfflineInCache,
+  normalizeManifestUrl,
   normalizeStremioMeta,
   parseStreamingCatalogsConfig,
   ProbedAudioTrack,
@@ -160,7 +162,21 @@ describe('Default Addons & Decreasing Stream Quality Sorting', () => {
       'https://hdhub.thevolecitor.qzz.io/eyJ0b3Jib3giOiJ1bnNldCIsInF1YWxpdGllcyI6IjIxNjBwLDEwODBwLDcyMHAiLCJzb3J0IjoiZGVzYyJ9/manifest.json',
     );
     expect(DEFAULT_BOOTSTRAP_MANIFEST_URLS).toContain(DEFAULT_ABYSSUS_MANIFEST_URL);
+    expect(DEFAULT_BOOTSTRAP_MANIFEST_URLS).toContain(DEFAULT_DESIFLIX_MANIFEST_URL);
     expect(isDirectCorsFastPathUrl(DEFAULT_ABYSSUS_MANIFEST_URL)).toBe(true);
+    expect(isDirectCorsFastPathUrl(DEFAULT_DESIFLIX_MANIFEST_URL)).toBe(true);
+    expect(
+      normalizeManifestUrl('http://manifest.desitvhub.eu.org/manifest.json'),
+    ).toBe(DEFAULT_DESIFLIX_MANIFEST_URL);
+    expect(
+      upgradeLegacyDefaultAddonUrl('http://manifest.desitvhub.eu.org/manifest.json'),
+    ).toBe(DEFAULT_DESIFLIX_MANIFEST_URL);
+    expect(
+      getStreamProviderCategory({
+        addonId: 'community.desiflix.serials',
+        addonName: 'DesiFlix',
+      }),
+    ).toBe('DesiFlix');
     expect(
       DEFAULT_BOOTSTRAP_MANIFEST_URLS.some(
         (u) => u.includes('torrentio') || u.includes('torrentsdb'),

@@ -525,6 +525,26 @@ export const AddonSvgEmblem: React.FC<AddonSvgEmblemProps> = ({
       );
     }
 
+    if (combined.includes('desiflix')) {
+      // DesiFlix Saffron Cinema Emblem
+      return (
+        <>
+          <rect x="8.5" y="10.5" width="23" height="19" rx="5" fill="rgba(249,115,22,0.22)" stroke="#FB923C" strokeWidth="1.6" />
+          <text
+            x="20"
+            y="23.5"
+            textAnchor="middle"
+            fill="#FFEDD5"
+            fontFamily="JetBrains Mono, monospace"
+            fontWeight="800"
+            fontSize="9.5"
+          >
+            DFX
+          </text>
+        </>
+      );
+    }
+
     if (combined.includes('111477')) {
       // Vault Numeric Monogram Badge
       return (
