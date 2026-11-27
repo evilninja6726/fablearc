@@ -1218,5 +1218,6 @@ describe('Strix-Style E2E & Security Audit Suite', () => {
     expect(cinemaPlayerTsx).toContain('disabled={!nextEpisode}');
     expect(appTsx).toContain("defaultHost.includes('plavio.site')");
     expect(appTsx).toContain("!a.manifestUrl.includes('torrentsdb.com')");
+    expect(appTsx).toContain("a.manifest.id !== 'community.desiflix.serials'");
   });
 });

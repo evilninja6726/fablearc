@@ -1195,11 +1195,13 @@ export const App: React.FC = () => {
     };
   }, [addons.length, authToken, currentUser]);
 
-  // Load all catalogs from enabled addons
+  // Load all catalogs from enabled addons (excluding stream-only providers like DesiFlix from homepage shelves)
   const loadAllAddonCatalogs = useCallback(async () => {
     const enabledCatalogAddons = addons.filter(
       (a) =>
         a.enabled &&
+        a.manifest.id !== 'community.desiflix.serials' &&
+        !a.manifestUrl.includes('desitvhub.eu.org') &&
         addonSupportsResource(a.manifest, 'catalog') &&
         Array.isArray(a.manifest.catalogs) &&
         a.manifest.catalogs.length > 0,
