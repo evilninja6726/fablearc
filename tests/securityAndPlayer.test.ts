@@ -20,6 +20,7 @@ import {
   DEFAULT_ABYSSUS_MANIFEST_URL,
   DEFAULT_BOOTSTRAP_MANIFEST_URLS,
   DEFAULT_DESIFLIX_MANIFEST_URL,
+  DEFAULT_ONECLICKSTREAM_MANIFEST_URL,
   DEFAULT_PENGUPLAY_MANIFEST_URL,
   DEFAULT_PLAVIO_MANIFEST_URL,
   extractStreamQualityInfo,
@@ -163,8 +164,21 @@ describe('Default Addons & Decreasing Stream Quality Sorting', () => {
     );
     expect(DEFAULT_BOOTSTRAP_MANIFEST_URLS).toContain(DEFAULT_ABYSSUS_MANIFEST_URL);
     expect(DEFAULT_BOOTSTRAP_MANIFEST_URLS).toContain(DEFAULT_DESIFLIX_MANIFEST_URL);
+    expect(DEFAULT_BOOTSTRAP_MANIFEST_URLS).toContain(DEFAULT_ONECLICKSTREAM_MANIFEST_URL);
     expect(isDirectCorsFastPathUrl(DEFAULT_ABYSSUS_MANIFEST_URL)).toBe(true);
     expect(isDirectCorsFastPathUrl(DEFAULT_DESIFLIX_MANIFEST_URL)).toBe(true);
+    expect(isDirectCorsFastPathUrl(DEFAULT_ONECLICKSTREAM_MANIFEST_URL)).toBe(true);
+    expect(
+      isDirectCorsFastPathUrl(
+        'https://1clickstream.vercel.app/region=IN1/stream/movie/tt0816692.json',
+      ),
+    ).toBe(true);
+    expect(
+      getStreamProviderCategory({
+        addonId: 'org.1clickstream.streams_eab53389',
+        addonName: '1ClickStream | Direct HTTP Streams (IN1 Region)',
+      }),
+    ).toBe('1ClickStream');
     expect(
       normalizeManifestUrl('http://manifest.desitvhub.eu.org/manifest.json'),
     ).toBe(DEFAULT_DESIFLIX_MANIFEST_URL);

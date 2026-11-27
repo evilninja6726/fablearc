@@ -545,6 +545,26 @@ export const AddonSvgEmblem: React.FC<AddonSvgEmblemProps> = ({
       );
     }
 
+    if (combined.includes('1clickstream')) {
+      // 1ClickStream Cyan Lightning Emblem
+      return (
+        <>
+          <rect x="8.5" y="10.5" width="23" height="19" rx="5" fill="rgba(6,182,212,0.22)" stroke="#22D3EE" strokeWidth="1.6" />
+          <text
+            x="20"
+            y="23.5"
+            textAnchor="middle"
+            fill="#CFFAFE"
+            fontFamily="JetBrains Mono, monospace"
+            fontWeight="800"
+            fontSize="9.5"
+          >
+            1CS
+          </text>
+        </>
+      );
+    }
+
     if (combined.includes('111477')) {
       // Vault Numeric Monogram Badge
       return (

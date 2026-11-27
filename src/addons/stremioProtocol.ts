@@ -419,11 +419,11 @@ export function sortStreamsByDecreasingQuality(
     const scoreB = b.qualityScore ?? 0;
     if (scoreB !== scoreA) return scoreB - scoreA;
 
-    // 2. Group by Provider within each Quality Tier (Option B: PenguPlay -> HdHub -> CNCVerse -> PlavioHD -> Abyssus -> DesiFlix -> 111477 -> WebStreamr -> Other)
+    // 2. Group by Provider within each Quality Tier (Option B: PenguPlay -> HdHub -> CNCVerse -> PlavioHD -> Abyssus -> DesiFlix -> 1ClickStream -> 111477 -> WebStreamr -> Other)
     const provRankA = getStreamProviderGroupRank(a);
     const provRankB = getStreamProviderGroupRank(b);
     if (provRankA !== provRankB) return provRankA - provRankB;
-    if (provRankA >= 10) {
+    if (provRankA >= 11) {
       const catCmp = getStreamProviderCategory(a).localeCompare(
         getStreamProviderCategory(b),
       );
@@ -1109,6 +1109,7 @@ export function isDirectCorsFastPathUrl(url: string): boolean {
       host.endsWith('.dpdns.org') ||
       host === 'manifest.desitvhub.eu.org' ||
       host.endsWith('.desitvhub.eu.org') ||
+      host === '1clickstream.vercel.app' ||
       host === 'hd.plavio.site' ||
       host.endsWith('.plavio.site') ||
       host === 'hdhub.thevolecitor.qzz.io' ||
@@ -1549,6 +1550,9 @@ export function getStreamProviderCategory(
   if (idLower.includes('desiflix') || nameLower.includes('desiflix')) {
     return 'DesiFlix';
   }
+  if (idLower.includes('1clickstream') || nameLower.includes('1clickstream')) {
+    return '1ClickStream';
+  }
   if (idLower.includes('111477') || nameLower.includes('111477')) {
     return '111477';
   }
@@ -1569,7 +1573,7 @@ export function getStreamProviderCategory(
 
 /**
  * Deterministic provider grouping order inside each quality tier ("All" list, Option B):
- * PenguPlay -> HdHub -> CNCVerse (Hindi -> English -> Anime) -> PlavioHD -> Abyssus -> DesiFlix -> 111477 -> WebStreamr -> Other
+ * PenguPlay -> HdHub -> CNCVerse (Hindi -> English -> Anime) -> PlavioHD -> Abyssus -> DesiFlix -> 1ClickStream -> 111477 -> WebStreamr -> Other
  */
 export function getStreamProviderGroupRank(
   stream: Pick<StremioStreamItem, 'addonId' | 'addonName'>,
@@ -1592,12 +1596,14 @@ export function getStreamProviderGroupRank(
       return 6;
     case 'DesiFlix':
       return 7;
-    case '111477':
+    case '1ClickStream':
       return 8;
-    case 'WebStreamr':
+    case '111477':
       return 9;
-    default:
+    case 'WebStreamr':
       return 10;
+    default:
+      return 11;
   }
 }
 
@@ -2744,6 +2750,9 @@ export const DEFAULT_ABYSSUS_MANIFEST_URL =
 export const DEFAULT_DESIFLIX_MANIFEST_URL =
   'https://manifest.desitvhub.eu.org/manifest.json';
 
+export const DEFAULT_ONECLICKSTREAM_MANIFEST_URL =
+  'https://1clickstream.vercel.app/region=IN1/manifest.json';
+
 /**
  * Automatically upgrades any legacy unauthenticated PenguPlay URL (`https://pengu.uk/manifest.json`),
  * `http://manifest.desitvhub.eu.org/...`, or `stremio://` protocol URL stored in localStorage or SQLite DB
@@ -2762,7 +2771,7 @@ export function upgradeLegacyDefaultAddonUrl(manifestUrl: string): string {
 
 /**
  * Default live Stremio addon manifest URLs installed automatically on startup.
- * Includes all user-requested default addons + PlavioHD + Abyssus + DesiFlix + Cinemeta & OpenSubtitles v3.
+ * Includes all user-requested default addons + PlavioHD + Abyssus + DesiFlix + 1ClickStream + Cinemeta & OpenSubtitles v3.
  */
 export const DEFAULT_BOOTSTRAP_MANIFEST_URLS: string[] = [
   // Streaming Catalogs addon commented out (code preserved):
@@ -2773,6 +2782,7 @@ export const DEFAULT_BOOTSTRAP_MANIFEST_URLS: string[] = [
   DEFAULT_PLAVIO_MANIFEST_URL,
   DEFAULT_ABYSSUS_MANIFEST_URL,
   DEFAULT_DESIFLIX_MANIFEST_URL,
+  DEFAULT_ONECLICKSTREAM_MANIFEST_URL,
   'https://aiometadata.elfhosted.com/stremio/manifest.json',
   'https://87d6a6ef6b58-webstreamrmbg.baby-beamup.club/manifest.json',
   DEFAULT_PENGUPLAY_MANIFEST_URL,
